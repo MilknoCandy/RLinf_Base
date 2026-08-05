@@ -1067,7 +1067,7 @@ create_and_sync_conda_venv() {
     local CONDA_ENV_NAME=${CONDA_NAME:-starvla_env}  # Name of the conda environment
     # check if conda is created
     local env_exist
-    env_exist=$(conda env list | grep -c "^${CONDA_ENV_NAME} ")
+    env_exist=$(conda env list | grep -cE "^${CONDA_ENV_NAME}[[:space:]]")
 
     if [[ "$env_exist" -ge 1 ]]; then
         echo "Found existing conda env: ${CONDA_ENV_NAME}, checking Python version..."
@@ -1089,7 +1089,6 @@ EOF
 
         else
             echo "Reusing existing conda env at ${CONDA_ENV_NAME} with Python ${active_python_mm}.x"
-            install_uv
         fi
     else
         echo "Creating new conda env: ${CONDA_ENV_NAME} with Python ${PYTHON_VERSION}..."
@@ -1098,7 +1097,7 @@ EOF
     fi
     # uv sync --active $NO_INSTALL_RLINF_CMD
     # Sync the conda environment with the pyproject.toml dependencies
-    # TODO: not implemented yet
+    pip install -r $SCRIP_DIR/requirements.txt
 }
 
 install_flash_attn() {
