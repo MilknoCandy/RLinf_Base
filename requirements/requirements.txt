@@ -1,0 +1,26 @@
+accelerate
+datasets
+debugpy
+einops
+gsutil
+huggingface_hub
+hydra-core
+icmplib
+liger_kernel; sys_platform == 'linux' and platform_machine == 'x86_64'
+ninja
+numpy
+nvitop
+pip
+pre-commit
+pybind11
+pytest
+ray[default]>=2.47.0
+ruff
+scipy
+setuptools
+sortedcontainers
+swanlab>=0.6.11
+tensorboard
+torch>=2.5.0
+torchdata
+wandb<0.25.1
