@@ -1,0 +1,10 @@
+sapien==3.0.1
+nvidia-nvcomp-cu12
+robosuite==1.4.1
+bddl
+easydict
+cloudpickle
+gym
+tensorflow_graphics
+draccus
+rich

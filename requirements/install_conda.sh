@@ -1009,35 +1009,6 @@ apply_torch_override() {
     echo "[install.sh] Original pyproject.toml will be restored on exit."
 }
 
-install_uv() {
-    # Ensure uv is installed
-    if ! command -v uv &> /dev/null; then
-        echo "uv command not found. Installing uv..."
-        # Check if pip is available
-        if ! command -v pip &> /dev/null; then
-            echo "pip command not found. Please install pip first." >&2
-            exit 1
-        fi
-        pip_failed=0
-        pip install uv || pip_failed=1
-        if [ $pip_failed -eq 1 ]; then
-            echo "Cannot install uv via pip. Installing uv using installer script..."
-            if ! command -v wget &> /dev/null; then
-                echo "wget command not found. Please install wget first." >&2
-                exit 1
-            fi
-            
-            # If uv already exists in ~/.local/bin, use it
-            if [ -f ~/.local/bin/uv ]; then
-                echo "uv already exists in ~/.local/bin. Using it..."
-            else
-                wget -qO- https://astral.sh/uv/install.sh | sh
-            fi
-            export PATH="$HOME/.local/bin:$PATH"
-        fi
-    fi
-}
-
 setup_mirror() {
     if [ "$USE_MIRRORS" -eq 1 ]; then
         export USE_MIRRORS
@@ -1066,10 +1037,7 @@ create_and_sync_conda_venv() {
     # 2. conda venv creation and validation
     local CONDA_ENV_NAME=${CONDA_NAME:-starvla_env}  # Name of the conda environment
     # check if conda is created
-    local env_exist
-    env_exist=$(conda env list | grep -cE "^${CONDA_ENV_NAME}[[:space:]]")
-
-    if [[ "$env_exist" -ge 1 ]]; then
+    if conda env list | grep -c "^${CONDA_ENV_NAME}"; then
         echo "Found existing conda env: ${CONDA_ENV_NAME}, checking Python version..."
         conda activate "${CONDA_ENV_NAME}"
 
@@ -1097,7 +1065,7 @@ EOF
     fi
     # uv sync --active $NO_INSTALL_RLINF_CMD
     # Sync the conda environment with the pyproject.toml dependencies
-    pip install -r $SCRIP_DIR/requirements.txt
+    pip install -r $SCRIPT_DIR/requirements.txt
 }
 
 install_flash_attn() {
@@ -1385,7 +1353,7 @@ EOF
 
 install_common_embodied_deps() {
     pip install -r $SCRIPT_DIR/embodied/envs/requirements.txt
-    pip install -r $SCRIPT_DIR/embodied/envs/common.txt
+    pip install -r $SCRIPT_DIR/embodied/envs/common_conda.txt
     if [ "$NO_ROOT" -eq 0 ]; then
         bash $SCRIPT_DIR/sys_deps.sh "$PLATFORM"
     fi
@@ -1561,10 +1529,10 @@ install_openpi_model() {
             popd >/dev/null
             ;;
         maniskill_libero|libero)
-            create_and_sync_venv
+            create_and_sync_conda_venv
             install_common_embodied_deps
             install_${ENV_NAME}_env
-            uv pip install "rlinf-openpi==0.1.1"
+            pip install "rlinf-openpi==0.1.1"
             install_flash_attn
             ;;
         metaworld)
@@ -1643,7 +1611,7 @@ install_openpi_model() {
 
     # Enforce RLinf-compatible runtime pins to avoid known breakages.
     # openpi/orbax require jax.experimental.layout.DeviceLocalLayout (removed in jax>=0.7.0).
-    uv pip install -r "$SCRIPT_DIR/embodied/models/openpi.txt"
+    pip install -r "$SCRIPT_DIR/embodied/models/openpi.txt"
 
     # Replace transformers models with OpenPI's modified versions
     local py_major_minor
@@ -2837,4 +2805,6 @@ which python
 $MINICONDA_PATH/bin/conda init bash
 source "$MINICONDA_PATH/etc/profile.d/conda.sh"
 export LD_LIBRARY_PATH="$MINICONDA_PATH/lib:$LD_LIBRARY_PATH"
+# set starvla path to local dir
+export STARVLA_PATH=/path/to/starvla_dir
 main "$@"
