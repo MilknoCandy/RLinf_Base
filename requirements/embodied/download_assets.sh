@@ -107,6 +107,8 @@ PYEOF
 		echo "[download_assets] SAPIEN PhysX assets already exist at $PHYSX_DIR, skipping download."
 	else
 		mkdir -p "$PHYSX_DIR"
+		# when you don't have root to install wget, use this
+		# retry_cmd curl -fsSL -o "$PHYSX_DIR/linux-so.zip" "${GITHUB_PREFIX}https://github.com/sapien-sim/physx-precompiled/releases/download/${PHYSX_VERSION}/linux-so.zip"
 		retry_cmd wget -O "$PHYSX_DIR/linux-so.zip" "${GITHUB_PREFIX}https://github.com/sapien-sim/physx-precompiled/releases/download/${PHYSX_VERSION}/linux-so.zip"
 		unzip "$PHYSX_DIR/linux-so.zip" -d "$PHYSX_DIR" && rm "$PHYSX_DIR/linux-so.zip"
 	fi
