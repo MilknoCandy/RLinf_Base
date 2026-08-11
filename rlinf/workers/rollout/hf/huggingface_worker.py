@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+﻿# Copyright 2025 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -482,6 +482,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.OPENPI_PYTORCH,
             SupportedModel.EVO1,
             SupportedModel.MLP_POLICY,
+            SupportedModel.RLT_MLP_POLICY,
             SupportedModel.GR00T,
             SupportedModel.GR00T_N1D6,
             SupportedModel.GR00T_N1D7,
@@ -499,6 +500,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.CNN_POLICY,
             SupportedModel.FLOW_POLICY,
             SupportedModel.MLP_POLICY,
+            SupportedModel.RLT_MLP_POLICY,
         ]:
             kwargs["return_obs"] = not hasattr(self.hf_model, "q_head")
 
@@ -1004,3 +1006,4 @@ class MultiStepRolloutWorker(Worker):
     def set_global_step(self, global_step: int):
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+
