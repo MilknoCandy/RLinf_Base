@@ -15,7 +15,7 @@
 import copy
 from typing import Any
 
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import OmegaConf, open_dict
 
 
 def build_expert_model_config(
@@ -40,14 +40,12 @@ def build_expert_model_config(
         for key, value in expert_cfg.items():
             if (
                 key in expert_model_config
-                and isinstance(expert_model_config[key], DictConfig)
-                and isinstance(value, DictConfig)
+                and OmegaConf.is_config(expert_model_config[key])
+                and OmegaConf.is_config(value)
             ):
-                # Deep-merge nested configs: expert_model.openpi.use_rlt
-                # overrides rlt_feature_model.openpi.use_rlt while keeping
-                # config_name, num_images_in_input, etc.
                 expert_model_config[key] = OmegaConf.merge(
-                    expert_model_config[key], value
+                    expert_model_config[key],
+                    value,
                 )
             else:
                 expert_model_config[key] = value
