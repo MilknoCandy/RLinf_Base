@@ -27,6 +27,7 @@ class SupportedEnvType(Enum):
     LIBERO = "libero"
     ROBOTWIN = "robotwin"
     ISAACLAB = "isaaclab"
+    ISAACLAB_RLT = "isaaclab_rlt"
     METAWORLD = "metaworld"
     BEHAVIOR = "behavior"
     CALVIN = "calvin"
@@ -71,6 +72,24 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.maniskill.maniskill_rlt_env import ManiskillRLTEnv
 
         return ManiskillRLTEnv
+    elif env_type == SupportedEnvType.ISAACLAB_RLT:
+        if env_cfg is None:
+            raise ValueError(
+                "env_cfg is required for isaaclab_rlt environment type. "
+                "Please provide env_cfg.init_params.id to select the task."
+            )
+        supported_task_ids = {
+            "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0",
+        }
+        if env_cfg.init_params.id not in supported_task_ids:
+            raise ValueError(
+                "isaaclab_rlt currently supports only "
+                "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0, got "
+                f"{env_cfg.init_params.id!r}."
+            )
+        from rlinf.envs.isaaclab.isaaclab_rlt_env import IsaaclabRLTEnv
+
+        return IsaaclabRLTEnv
     elif env_type == SupportedEnvType.LIBERO:
         from rlinf.envs.libero.libero_env import LiberoEnv
 

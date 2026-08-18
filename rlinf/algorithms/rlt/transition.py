@@ -29,10 +29,11 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
     if train_env_cfg is None:
         return False
     try:
-        return (
-            SupportedEnvType(train_env_cfg.get("env_type", ""))
-            == SupportedEnvType.MANISKILL_RLT
-        )
+        env_type = SupportedEnvType(train_env_cfg.get("env_type", ""))
+        return env_type in {
+            SupportedEnvType.MANISKILL_RLT,
+            SupportedEnvType.ISAACLAB_RLT,
+        }
     except ValueError:
         return False
 

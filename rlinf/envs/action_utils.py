@@ -382,6 +382,11 @@ def prepare_actions(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.ISAACLAB_RLT:
+        chunk_actions = prepare_actions_for_isaaclab(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+        )
     elif env_type == SupportedEnvType.ROBOCASA365:
         chunk_actions = prepare_actions_for_robocasa(
             raw_chunk_actions=raw_chunk_actions,
