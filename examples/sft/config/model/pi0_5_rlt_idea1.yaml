@@ -1,0 +1,49 @@
+﻿model_type: "rlt_idea1"
+
+# Model-shape template only. Filesystem paths (model_path and openpi_data)
+# live in the experiment config, so this template stays path-free and reusable.
+
+# Weight dtype for SFT: fp32. The fp32 weights are the FSDP optimizer master;
+# FSDP MixedPrecision casts params to bf16 only for compute.
+precision: fp32
+
+# LoRA is not used, but the shared model factory reads these keys.
+is_lora: False
+lora_rank: 32
+
+# Action and chunk settings. `num_action_chunks` is the Pi0 action_horizon.
+num_action_chunks: 32
+action_dim: 23
+use_proprio: True
+
+# Flow-matching denoising steps.
+num_steps: 5
+
+# No value head in the SFT model.
+add_value_head: False
+
+# rlt_idea1 model-shape parameters. get_model builds Pi0Config from
+# num_action_chunks (action_horizon) + the rlt_idea1.* shape fields below.
+rlt_idea1:
+  # Concrete rlt_idea1 variant: sft (Stage1) or eval (Stage2 feature model).
+  task: sft
+  # openpi TrainConfig key selecting the shared transform pipeline and the
+  # SFT dataloader registry.
+  config_name: "pi05_behavior"
+  # Pi0 model shape: padded action dim, LLM/expert variants, prompt budget.
+  model_action_dim: 32
+  paligemma_variant: "gemma_2b"
+  action_expert_variant: "gemma_300m"
+  max_token_len: 200
+  discrete_state_input: False
+  # RLT Idea1 knobs. Enable in the experiment config.
+  use_rlt: False
+  rlt_alpha: 1.0
+  rlt_input_dim: 2048
+  rlt_embed_dim: 2048
+  rlt_prefix_seq_len: 768
+  rlt_num_layers: 2
+  rlt_num_heads: 8
+  rlt_mlp_ratio: 4.0
+  rlt_image_only: True
+  rlt_use_mask: False
