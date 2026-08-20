@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import queue
 
 import torch
@@ -896,6 +897,11 @@ class AsyncRLTACFSDPPolicy(
         self.rlt_schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
         self.use_rlt_schedule = bool(self.rlt_schedule_cfg.get("enable", False))
 
+    async def recv_rollout_trajectories(self, input_channel):
+        await AsyncEmbodiedSACFSDPPolicy.recv_rollout_trajectories(
+            self, input_channel
+        )
+
     def _drain_received_trajectories(self, max_trajectories: int | None = None):
         if getattr(self, "_recv_queue", None) is None:
             return
@@ -916,7 +922,71 @@ class AsyncRLTACFSDPPolicy(
         self._update_rollout_ingest_counters(added, completed)
 
     async def run_training(self):
-        mean_metric_dict = await super().run_training()
+        self._drain_received_trajectories()
+
+        if not self.use_rlt_schedule:
+            # RLTACReplayMixin also defines a synchronous run_training(), so
+            # super() would resolve to the sync implementation. Call the async
+            # SAC training path explicitly to keep this coroutine awaitable.
+            mean_metric_dict = await AsyncEmbodiedSACFSDPPolicy.run_training(self)
+        else:
+            if self.cfg.actor.get("enable_offload", False):
+                self.load_param_and_grad(self.device)
+                self.load_optimizer(self.device)
+
+            updates_to_run, schedule_metrics = self._rlt_updates_to_run()
+            if updates_to_run <= 0:
+                mean_metric_dict = self.process_train_metrics(schedule_metrics)
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                torch.cuda.empty_cache()
+            else:
+                assert (
+                    self.cfg.actor.global_batch_size
+                    % (self.cfg.actor.micro_batch_size * self._world_size)
+                    == 0
+                )
+                self.gradient_accumulation = (
+                    self.cfg.actor.global_batch_size
+                    // self.cfg.actor.micro_batch_size
+                    // self._world_size
+                )
+
+                self.model.train()
+                metrics = {}
+                critic_updates_run = 0
+                actor_updates_run = 0
+                for _ in range(updates_to_run):
+                    await asyncio.sleep(0)
+                    update_actor = (
+                        int(self.update_step) % int(self.critic_actor_ratio) == 0
+                    )
+                    metrics_data = self.update_one_epoch(train_actor=True)
+                    append_to_dict(metrics, metrics_data)
+                    self.update_step += 1
+                    critic_updates_run += 1
+                    actor_updates_run += int(update_actor)
+
+                schedule_metrics["rlt/critic_updates_run"] = float(
+                    critic_updates_run
+                )
+                schedule_metrics["rlt/actor_updates_run"] = float(actor_updates_run)
+                self.pending_update_budget = max(
+                    int(self.pending_update_budget) - critic_updates_run,
+                    0,
+                )
+                schedule_metrics["rlt/pending_update_budget"] = float(
+                    self.pending_update_budget
+                )
+                append_to_dict(metrics, schedule_metrics)
+                mean_metric_dict = self.process_train_metrics(metrics)
+                self.transitions_since_train = 0
+                self.episodes_since_train = 0
+
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                torch.cuda.empty_cache()
+
         replay_metrics = getattr(self, "_last_replay_metrics", {})
         if replay_metrics:
             mean_metric_dict = {**mean_metric_dict, **replay_metrics}
