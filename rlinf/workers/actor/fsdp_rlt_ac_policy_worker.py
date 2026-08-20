@@ -889,9 +889,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         return mean_metric_dict
 
 
-class AsyncRLTACFSDPPolicy(
-    RLTACLossMixin, RLTACReplayMixin, AsyncEmbodiedSACFSDPPolicy
-):
+class AsyncRLTACFSDPPolicy(RLTACFSDPPolicy, AsyncEmbodiedSACFSDPPolicy):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.rlt_schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
