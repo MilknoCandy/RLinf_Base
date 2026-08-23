@@ -66,6 +66,9 @@ actor:
       rlt_mlp_ratio: 4.0
       rlt_image_only: True
       rlt_use_mask: True
+      freeze_vlm: False
+      rlt_latent_dim: 512
+      rlt_z_norm: True
 
     openpi_data:
       repo_id: "maniskill_peginsertionside_joint"
@@ -91,7 +94,7 @@ actor:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
     use_orig_params: False
-    gradient_checkpointing: False
+    gradient_checkpointing: True
     mixed_precision:
       param_dtype: bf16
       reduce_dtype: fp32

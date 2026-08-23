@@ -65,7 +65,12 @@ class RltIdea1ActionModel(OpenPiPytorchActionModel):
                 num_layers=self.rlt_cfg.rlt_num_layers,
                 num_heads=self.rlt_cfg.rlt_num_heads,
                 mlp_ratio=self.rlt_cfg.rlt_mlp_ratio,
+                latent_dim=self.rlt_cfg.rlt_latent_dim,
+                z_norm=self.rlt_cfg.rlt_z_norm,
+                z_l2_weight=self.rlt_cfg.rlt_z_l2_weight,
             ).to(dtype=next(self.model.parameters()).dtype)
+            if self.rlt_cfg.freeze_vlm:
+                self.model.requires_grad_(False)
 
         self._mark_fsdp_wrap_names()
 

@@ -273,6 +273,8 @@ rollout:
       rlt_mlp_ratio: 4.0
       rlt_image_only: True
       rlt_use_mask: True
+      rlt_latent_dim: 512
+      rlt_z_norm: True
 
   # Optional ManiSkill expert takeover model. Enable it with
   # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
@@ -323,7 +325,7 @@ actor:
     action_dim: 8
     num_action_chunks: 10
     ref_num_action_chunks: 10
-    z_dim: 2048
+    z_dim: 512
     proprio_dim: 9
     add_value_head: False
     add_q_head: True

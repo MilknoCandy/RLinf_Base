@@ -162,7 +162,7 @@ class RltIdea1SFTModel(RltIdea1ActionModel):
 
         # z_rl is the hidden state at the learnable token position, which is
         # the last prefix position after the append.
-        z_rl = prefix_out[:, -1:, :].detach().squeeze(1)  # [B, input_dim]
+        z_rl = prefix_out[:, -1:, :].squeeze(1)  # [B, input_dim]
 
         # Reconstruction target excludes the learnable token.
         decoder_target = prefix_out[:, :-1, :].detach()

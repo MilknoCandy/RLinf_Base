@@ -52,11 +52,16 @@ class RltIdea1Decoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout_rate: float = 0.0,
+        latent_dim: int = 512,
+        z_norm: bool = True,
+        z_l2_weight: float = 0.0,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
+        self.latent_dim = int(latent_dim)
         self.prefix_seq_len = int(prefix_seq_len)
+        self.z_l2_weight = float(z_l2_weight)
 
         # Injected token must match the VLM prefix hidden width.
         self.rl_token_embed = nn.Parameter(
@@ -67,6 +72,26 @@ class RltIdea1Decoder(nn.Module):
         self.z_proj = (
             nn.Linear(self.input_dim, self.embed_dim)
             if self.input_dim != self.embed_dim
+            else nn.Identity()
+        )
+
+        # Bottleneck: decoder token width -> compressed RL latent.
+        self.z_compress = (
+            nn.Linear(self.embed_dim, self.latent_dim, bias=False)
+            if self.embed_dim != self.latent_dim
+            else nn.Identity()
+        )
+        self.z_expand = (
+            nn.Linear(self.latent_dim, self.embed_dim, bias=False)
+            if self.latent_dim != self.embed_dim
+            else nn.Identity()
+        )
+        # Per-sample standardization of the compressed latent. This keeps the
+        # Stage2 feature bounded and decorrelated across the latent axes
+        # without learnable scale/shift drift.
+        self.z_out_norm = (
+            nn.LayerNorm(self.latent_dim, elementwise_affine=False)
+            if z_norm
             else nn.Identity()
         )
 
@@ -82,7 +107,7 @@ class RltIdea1Decoder(nn.Module):
 
     @property
     def z_dim(self) -> int:
-        return self.embed_dim
+        return self.latent_dim
 
     def get_rl_token(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -95,16 +120,19 @@ class RltIdea1Decoder(nn.Module):
         )
 
     def encode_z(self, z_rl_raw: torch.Tensor) -> torch.Tensor:
-        """Project the VLM token output to the decoder token width.
+        """Compress the VLM token output to the normalized RL latent.
 
         Args:
             z_rl_raw: ``[B, input_dim]`` hidden state at the learnable token
                 position in the VLM output.
 
         Returns:
-            ``[B, embed_dim]`` feature consumed by the decoder and Stage2.
+            ``[B, latent_dim]`` feature consumed by Stage2. The decoder gets
+            an expanded copy produced by :meth:`loss`.
         """
-        return self.z_proj(z_rl_raw)
+        projected = self.z_proj(z_rl_raw)
+        latent = self.z_compress(projected)
+        return self.z_out_norm(latent)
 
     def loss(
         self,
@@ -123,8 +151,8 @@ class RltIdea1Decoder(nn.Module):
         Returns:
             ``(mse, {"mse": mse, "z_rl": projected_z_rl})``.
         """
-        projected = self.encode_z(z_rl)  # [B, embed_dim]
-        rl_tokens = projected.unsqueeze(1)  # [B, 1, embed_dim]
+        latent = self.encode_z(z_rl)  # [B, latent_dim]
+        rl_tokens = self.z_expand(latent).unsqueeze(1)  # [B, 1, embed_dim]
         reconstructed = self.decoder(rl_tokens, prefix_embs, mask)
 
         target = prefix_embs.detach().to(dtype=torch.float32)
@@ -143,7 +171,16 @@ class RltIdea1Decoder(nn.Module):
         else:
             mse = sq_error.mean()
 
-        return mse, {"mse": mse, "z_rl": projected}
+        metrics = {"mse": mse, "z_rl": latent}
+        if self.z_l2_weight > 0.0:
+            latent_f32 = latent.to(dtype=torch.float32)
+            z_l2 = torch.mean(torch.square(latent_f32))
+            loss = mse + self.z_l2_weight * z_l2
+            metrics["z_l2"] = z_l2
+        else:
+            loss = mse
+
+        return loss, metrics
 
     def forward(
         self,

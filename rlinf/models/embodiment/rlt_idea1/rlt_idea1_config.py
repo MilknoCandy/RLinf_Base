@@ -45,6 +45,15 @@ class RltIdea1Config:
     rlt_mlp_ratio: float = 4.0
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
+    # Route B: keep the VLM trainable and use a joint
+    # ``rlt_loss + rlt_alpha * vla_loss`` objective.
+    freeze_vlm: bool = False
+    # The learnable-token output is compressed into this low-dimensional,
+    # normalized latent before it is (a) expanded for reconstruction and
+    # (b) handed to the Stage2 RL head as ``z_rl``.
+    rlt_latent_dim: int = 512
+    rlt_z_norm: bool = True
+    rlt_z_l2_weight: float = 0.0
 
 
 def build_rlt_idea1_config(model_cfg: Any) -> RltIdea1Config:
@@ -66,4 +75,12 @@ def build_rlt_idea1_config(model_cfg: Any) -> RltIdea1Config:
             OmegaConf.select(model_cfg, "rlt_image_only", default=True)
         ),
         rlt_use_mask=bool(OmegaConf.select(model_cfg, "rlt_use_mask", default=False)),
+        freeze_vlm=bool(OmegaConf.select(model_cfg, "freeze_vlm", default=False)),
+        rlt_latent_dim=int(
+            OmegaConf.select(model_cfg, "rlt_latent_dim", default=512)
+        ),
+        rlt_z_norm=bool(OmegaConf.select(model_cfg, "rlt_z_norm", default=True)),
+        rlt_z_l2_weight=float(
+            OmegaConf.select(model_cfg, "rlt_z_l2_weight", default=0.0)
+        ),
     )

@@ -159,7 +159,7 @@ class RltIdea3SFTModel(RltIdea3ActionModel, RltIdea1SFTModel):
         )
         loss = torch.mean(torch.square(v_t - u_t), dim=-1)
 
-        z_rl = prefix_out[:, -1:, :].detach().squeeze(1)
+        z_rl = prefix_out[:, -1:, :].squeeze(1)
 
         decoder_target = prefix_out[:, :-1, :].detach()
         decoder_mask = prefix_mask[:, :-1]
