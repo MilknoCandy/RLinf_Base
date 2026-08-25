@@ -49,9 +49,12 @@ class OpenPiIdea1ActionModel(OpenPi0ForRLActionPrediction):
         # RLTTokenTransformer whenever config.use_rlt is set. Idea1 replaces it
         # with a decoder-only token-injection module, so suppress that unused
         # allocation first and restore the flag right after.
-        config.use_rlt = False
+        # OpenPi0Config is a frozen dataclass, so mutate its __dict__ the
+        # same way the official openpi factory does instead of using
+        # attribute assignment (which raises FrozenInstanceError).
+        config.__dict__["use_rlt"] = False
         super().__init__(config)
-        self.config.use_rlt = bool(self.rlt_cfg.use_rlt)
+        self.config.__dict__["use_rlt"] = bool(self.rlt_cfg.use_rlt)
 
         if self.rlt_cfg.use_rlt:
             # Decoder-only module used by the token-injection ideas.
