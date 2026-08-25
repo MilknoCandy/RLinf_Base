@@ -87,6 +87,17 @@ def _build_openpi_idea_model(cfg: Any, torch_dtype, model_cls):
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
 
+    # openpi's SigLIP vision tower uses float32 grids inside grid_sample
+    # (position-embedding interpolation). When the tower is bf16, CUDA
+    # grid_sample raises "expected BFloat16 but found Float". Keep the
+    # tower fp32; embed_prefix casts its output to the backbone dtype.
+    paligemma_model = getattr(model.paligemma_with_expert.paligemma, "model", None)
+    vision_tower = getattr(paligemma_model, "vision_tower", None)
+    if vision_tower is None:
+        vision_tower = getattr(model.paligemma_with_expert.paligemma, "vision_tower", None)
+    if vision_tower is not None:
+        vision_tower.to(dtype=torch.float32)
+
     data_config = actor_train_config.data.create(
         actor_train_config.assets_dirs, actor_model_config
     )
