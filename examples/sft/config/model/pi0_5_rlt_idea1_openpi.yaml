@@ -42,6 +42,5 @@ openpi:
   rlt_image_only: False
   rlt_use_mask: True
   freeze_vlm: False
-  rlt_latent_dim: 512
   rlt_z_norm: True
   rlt_z_l2_weight: 0.0

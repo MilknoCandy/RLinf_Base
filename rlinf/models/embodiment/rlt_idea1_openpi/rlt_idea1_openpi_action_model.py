@@ -18,8 +18,8 @@ Unlike :mod:`rlinf.models.embodiment.rlt_idea1` (which is built on the
 ``openpi_rlinf`` Pi0 reimplementation), this module subclasses the official
 OpenPI wrapper :class:`OpenPi0ForRLActionPrediction`. A learnable token is
 appended to the VLM prefix, and the hidden state at that token position is the
-compressed RL feature ``z_rl``. The prefix is reconstructed by the shared
-:class:`RltIdea1Decoder`.
+RL feature ``z_rl``. The prefix is reconstructed by the shared
+:class:`RltIdea1OpenPiDecoder`.
 """
 
 from __future__ import annotations
@@ -36,7 +36,9 @@ from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0ForRLActionPrediction,
 )
 from rlinf.models.embodiment.rlt_idea1.rlt_idea1_config import RltIdea1Config
-from rlinf.models.embodiment.rlt_idea1.rlt_idea1_decoder import RltIdea1Decoder
+from rlinf.models.embodiment.rlt_idea1_openpi.rlt_idea1_openpi_decoder import (
+    RltIdea1OpenPiDecoder,
+)
 from rlinf.utils.pytree import register_pytree_dataclasses
 
 
@@ -58,14 +60,13 @@ class OpenPiIdea1ActionModel(OpenPi0ForRLActionPrediction):
 
         if self.rlt_cfg.use_rlt:
             # Decoder-only module used by the token-injection ideas.
-            self.rlt_module = RltIdea1Decoder(
+            self.rlt_module = RltIdea1OpenPiDecoder(
                 input_dim=self.rlt_cfg.rlt_input_dim,
                 embed_dim=self.rlt_cfg.rlt_embed_dim,
                 prefix_seq_len=self.rlt_cfg.rlt_prefix_seq_len,
                 num_layers=self.rlt_cfg.rlt_num_layers,
                 num_heads=self.rlt_cfg.rlt_num_heads,
                 mlp_ratio=self.rlt_cfg.rlt_mlp_ratio,
-                latent_dim=self.rlt_cfg.rlt_latent_dim,
                 z_norm=self.rlt_cfg.rlt_z_norm,
                 z_l2_weight=self.rlt_cfg.rlt_z_l2_weight,
             ).to(dtype=torch.bfloat16)
