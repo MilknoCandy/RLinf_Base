@@ -153,6 +153,9 @@ class OpenPiIdea1ActionModel(OpenPi0ForRLActionPrediction):
         decoder_target = decoder_target.to(
             device=rlt_param.device, dtype=rlt_param.dtype
         )
+        # The VLM prefix output is float32 while the decoder weights are
+        # bf16; cast z_rl explicitly (gradients still flow through the cast).
+        z_rl = z_rl.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = decoder_mask if self.rlt_cfg.rlt_use_mask else None
         return self.rlt_module(z_rl, decoder_target, rlt_mask)
 
@@ -353,7 +356,10 @@ class OpenPiIdea1ActionModel(OpenPi0ForRLActionPrediction):
             self._build_rlt_prefix_cache(observation, train=False)
         )
 
-        z_rl_raw = prefix_output[:, -1, :]
+        rlt_param = next(self.rlt_module.parameters())
+        z_rl_raw = prefix_output[:, -1, :].to(
+            device=rlt_param.device, dtype=rlt_param.dtype
+        )
         z_rl = self.rlt_module.encode_z(z_rl_raw).to(dtype=torch.float32)
 
         outputs = self._sample_actions_with_prefix_cache(
