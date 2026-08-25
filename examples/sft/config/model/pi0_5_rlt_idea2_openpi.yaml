@@ -1,0 +1,44 @@
+model_type: "rlt_idea2_openpi"
+
+model_path: "/path/to/model/openpi"
+precision: null
+
+num_action_chunks: 10
+action_dim: 8
+
+is_lora: False
+lora_rank: 32
+
+use_proprio: True
+num_steps: 5
+add_value_head: False
+
+openpi:
+  config_name: "pi05_rlt_maniskill_joint"
+  num_images_in_input: 2
+  noise_level: 0.5
+  action_chunk: ${actor.model.num_action_chunks}
+  action_horizon: 10
+  action_env_dim: ${actor.model.action_dim}
+  num_steps: ${actor.model.num_steps}
+  train_expert_only: False
+  noise_method: "flow_sde"
+  add_value_head: ${actor.model.add_value_head}
+  value_after_vlm: False
+  value_vlm_mode: "mean_token"
+  detach_critic_input: True
+  # RLT Idea2 (RL token attends only to image tokens).
+  use_rlt: True
+  rlt_alpha: 1.0
+  rlt_input_dim: 2048
+  rlt_embed_dim: 2048
+  rlt_prefix_seq_len: 1024
+  rlt_num_layers: 2
+  rlt_num_heads: 8
+  rlt_mlp_ratio: 4.0
+  rlt_image_only: True
+  rlt_use_mask: True
+  freeze_vlm: False
+  rlt_latent_dim: 512
+  rlt_z_norm: True
+  rlt_z_l2_weight: 0.0
