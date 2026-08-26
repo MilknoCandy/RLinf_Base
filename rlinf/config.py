@@ -88,6 +88,7 @@ SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
 SupportedModel.MOLMOACT2 = SupportedModel.register("molmoact2", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
 SupportedModel.OPENPI_RLINF = SupportedModel.register("openpi_rlinf", force=True)
+SupportedModel.OPENPI_RLT_PROBE = SupportedModel.register("openpi_rlt_probe", force=True)
 SupportedModel.RLT_IDEA1 = SupportedModel.register("rlt_idea1", force=True)
 SupportedModel.RLT_IDEA2 = SupportedModel.register("rlt_idea2", force=True)
 SupportedModel.RLT_IDEA3 = SupportedModel.register("rlt_idea3", force=True)
@@ -138,6 +139,7 @@ EMBODIED_MODEL = set(
         SupportedModel.OPENVLA_OFT,
         SupportedModel.OPENPI,
         SupportedModel.OPENPI_RLINF,
+        SupportedModel.OPENPI_RLT_PROBE,
         SupportedModel.RLT_IDEA1,
         SupportedModel.RLT_IDEA2,
         SupportedModel.RLT_IDEA3,

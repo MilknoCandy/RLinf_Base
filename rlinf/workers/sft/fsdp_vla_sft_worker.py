@@ -38,7 +38,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_openpi_rlinf_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
-        elif model_type == SupportedModel.OPENPI:
+        elif model_type in (
+            SupportedModel.OPENPI,
+            SupportedModel.OPENPI_RLT_PROBE,
+        ):
             from rlinf.data.datasets.openpi_rlinf import (
                 build_official_openpi_sft_dataloader,
             )
@@ -176,6 +179,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         if model_type in (
             SupportedModel.OPENPI_RLINF,
             SupportedModel.OPENPI,
+            SupportedModel.OPENPI_RLT_PROBE,
             SupportedModel.RLT_IDEA1,
             SupportedModel.RLT_IDEA2,
             SupportedModel.RLT_IDEA3,

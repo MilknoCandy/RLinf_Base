@@ -71,6 +71,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_openpi_rlt_probe(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.openpi_rlt_probe import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_rlt_idea1(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.rlt_idea1 import get_model
 
@@ -218,6 +223,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.OPENPI_RLINF.value,
         _build_openpi_rlinf,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.OPENPI_RLT_PROBE.value,
+        _build_openpi_rlt_probe,
         category="embodied",
         force=True,
     )
