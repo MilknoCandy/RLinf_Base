@@ -76,10 +76,13 @@ class OpenPiProbeForRLActionPrediction(OpenPi0ForRLActionPrediction):
         if rlt_mode == "token" and not (
             config.use_rlt and hasattr(self, "rlt_module")
         ):
-            raise ValueError(
+            self.logger.warning(
                 "rlt_mode='token' requires a Stage 1 RLT checkpoint "
-                "(openpi.use_rlt=True and an rlt_module)."
+                "(openpi.use_rlt=True and an rlt_module); this model was built "
+                "without an RLT module (for example rollout.expert_model), so "
+                "falling back to rlt_mode='none' (mean-pool VLM features)."
             )
+            rlt_mode = "none"
 
         self.feature_source = feature_source
         self.rlt_mode = rlt_mode

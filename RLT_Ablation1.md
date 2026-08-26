@@ -149,3 +149,7 @@ MODEL_PATH=/path/to/stage1/actor \
   投影到 `rlt_embed_dim`（2048）；该投影在 rollout 中冻结且随机初始化，比较 `action`
   结果时需注意这一点。
 - 不要把数据集里的真实动作标签当作 `z_rl`，否则会造成标签泄漏。
+- `rollout.expert_model` 必须显式写 `model_type`（示例里是 `openpi`）。`build_expert_model_config`
+  会把 `rlt_feature_model` 深合并进 `expert_model`，若不写 `model_type` 会继承成
+  `openpi_rlt_probe`。即使如此，probe 在 `use_rlt: False` 时会自动退回 `rlt_mode: none`
+  并告警，不会崩溃；expert 模型走 `predict_action_batch`，不使用 `z_rl`。
