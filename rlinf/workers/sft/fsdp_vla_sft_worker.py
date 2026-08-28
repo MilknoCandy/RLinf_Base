@@ -49,35 +49,6 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_official_openpi_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
-        elif model_type in (
-            SupportedModel.RLT_IDEA1_OPENPI,
-            SupportedModel.RLT_IDEA2_OPENPI,
-            SupportedModel.RLT_IDEA3_OPENPI,
-        ):
-            from rlinf.data.datasets.openpi_rlinf import (
-                build_official_openpi_sft_dataloader,
-            )
-
-            return build_official_openpi_sft_dataloader(
-                self.cfg, self._world_size, self._rank, data_paths, eval_dataset
-            )
-        elif model_type in (
-            SupportedModel.RLT_IDEA1,
-            SupportedModel.RLT_IDEA2,
-            SupportedModel.RLT_IDEA3,
-        ):
-            from rlinf.models.embodiment.rlt_idea1.sft_dataloader import (
-                build_rlt_idea_sft_dataloader,
-            )
-
-            return build_rlt_idea_sft_dataloader(
-                self.cfg,
-                self._world_size,
-                self._rank,
-                data_paths,
-                eval_dataset,
-                model_key=model_type.value,
-            )
         elif model_type == SupportedModel.LINGBOTVLA:
             from rlinf.models.embodiment.lingbotvla.sft_builder import (
                 build_lingbot_sft_dataloader,
@@ -180,19 +151,8 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             SupportedModel.OPENPI_RLINF,
             SupportedModel.OPENPI,
             SupportedModel.OPENPI_RLT_PROBE,
-            SupportedModel.RLT_IDEA1,
-            SupportedModel.RLT_IDEA2,
-            SupportedModel.RLT_IDEA3,
-            SupportedModel.RLT_IDEA1_OPENPI,
-            SupportedModel.RLT_IDEA2_OPENPI,
-            SupportedModel.RLT_IDEA3_OPENPI,
         ):
-            if model_type in (
-                SupportedModel.OPENPI_RLINF,
-                SupportedModel.RLT_IDEA1,
-                SupportedModel.RLT_IDEA2,
-                SupportedModel.RLT_IDEA3,
-            ):
+            if model_type == SupportedModel.OPENPI_RLINF:
                 from rlinf.data.datasets.openpi_rlinf import (
                     get_official_openpi_sft_num_batches,
                     is_official_openpi_sft_dataloader,

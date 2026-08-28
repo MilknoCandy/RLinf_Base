@@ -76,36 +76,6 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
-    def _build_rlt_idea1(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_idea1 import get_model
-
-        return get_model(cfg, torch_dtype)
-
-    def _build_rlt_idea2(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_idea2 import get_model
-
-        return get_model(cfg, torch_dtype)
-
-    def _build_rlt_idea3(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_idea3 import get_model
-
-        return get_model(cfg, torch_dtype)
-
-    def _build_rlt_idea1_openpi(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_idea1_openpi import get_model
-
-        return get_model(cfg, torch_dtype)
-
-    def _build_rlt_idea2_openpi(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_idea2_openpi import get_model
-
-        return get_model(cfg, torch_dtype)
-
-    def _build_rlt_idea3_openpi(cfg: DictConfig, torch_dtype):
-        from rlinf.models.embodiment.rlt_idea3_openpi import get_model
-
-        return get_model(cfg, torch_dtype)
-
     def _build_dexbotic_pi(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.dexbotic_pi import get_model
 
@@ -229,42 +199,6 @@ def _register_builtin_models():
     register_model(
         SupportedModel.OPENPI_RLT_PROBE.value,
         _build_openpi_rlt_probe,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_IDEA1.value,
-        _build_rlt_idea1,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_IDEA2.value,
-        _build_rlt_idea2,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_IDEA3.value,
-        _build_rlt_idea3,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_IDEA1_OPENPI.value,
-        _build_rlt_idea1_openpi,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_IDEA2_OPENPI.value,
-        _build_rlt_idea2_openpi,
-        category="embodied",
-        force=True,
-    )
-    register_model(
-        SupportedModel.RLT_IDEA3_OPENPI.value,
-        _build_rlt_idea3_openpi,
         category="embodied",
         force=True,
     )
