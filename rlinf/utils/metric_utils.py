@@ -400,18 +400,21 @@ def compute_evaluate_metrics(eval_metrics_list):
             all_eval_metrics[env_info_key] = metric
 
     aggregated_eval_metrics = {}
-    for key in all_eval_metrics:
+    for key in list(all_eval_metrics):
         shards = [_normalize_metric_shard(s) for s in all_eval_metrics[key]]
         stacked = torch.concat(shards).float()
         if is_interact_delay_metric_key(key):
             aggregated_eval_metrics.update(compute_delay_stats(key, stacked))
             continue
 
-        aggregated_eval_metrics[key] = (
-            stacked.mean().detach().cpu().numpy()
-            if stacked.numel() > 0
-            else np.asarray(0.0, dtype=np.float64)
-        )
+        if stacked.numel() > 0:
+            aggregated_eval_metrics[key] = stacked.mean().detach().cpu().numpy()
+            aggregated_eval_metrics[f"{key}_std"] = (
+                stacked.std(unbiased=False).detach().cpu().numpy()
+            )
+        else:
+            aggregated_eval_metrics[key] = np.asarray(0.0, dtype=np.float64)
+            aggregated_eval_metrics[f"{key}_std"] = np.asarray(0.0, dtype=np.float64)
 
     # Add total trajectory count to metrics
     aggregated_eval_metrics["num_trajectories"] = sum(trajectory_counts)

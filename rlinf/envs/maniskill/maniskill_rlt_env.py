@@ -92,6 +92,15 @@ class ManiskillRLTEnv(ManiskillEnv):
         "peg_head_hole_abs_y",
         "peg_head_hole_abs_z",
     )
+    _RLT_EVAL_PEG_EPISODE_KEYS = (
+        "consecutive_grasp_once",
+        "prealign_once",
+        "partial_insert_once",
+        "peg_head_hole_x",
+        "peg_head_goal_yz_dist",
+        "peg_body_goal_yz_dist",
+        "tcp_peg_dist",
+    )
 
     _RLT_FULL_TASK = "full_task"
     _RLT_CRITICAL_PHASE = "critical_phase"
@@ -124,6 +133,7 @@ class ManiskillRLTEnv(ManiskillEnv):
         self.video_cfg = cfg.video_cfg
 
         self.cfg = cfg
+        self.policy_mode = str(getattr(cfg, "policy_mode", "train"))
         self._has_seeded_reset = False
         self.task_id = getattr(cfg.init_params, "id", None)
         self._is_peg_insertion_side = is_peg_insertion_side_env_id(self.task_id)
@@ -768,17 +778,47 @@ class ManiskillRLTEnv(ManiskillEnv):
         infos = super()._record_metrics(step_reward, infos)
         if not self.record_metrics or "episode" not in infos:
             return infos
-        for key in (
-            "entered_actor_phase_once",
-            "actor_switch_step",
-            "actor_switch_step_nonzero",
-        ):
-            if key in infos:
-                value = infos[key]
-                if isinstance(value, torch.Tensor):
-                    infos["episode"][key] = value.reshape(self.num_envs, -1)[
-                        :, -1
-                    ].clone()
+        # last version
+        # for key in (
+        #     "entered_actor_phase_once",
+        #     "actor_switch_step",
+        #     "actor_switch_step_nonzero",
+        # ):
+        #     if key in infos:
+        #         value = infos[key]
+        #         if isinstance(value, torch.Tensor):
+        #             infos["episode"][key] = value.reshape(self.num_envs, -1)[
+        #                 :, -1
+        #             ].clone()
+        # return infos
+        self._copy_scalar_info_to_episode(
+            infos,
+            (
+                "entered_actor_phase_once",
+                "actor_switch_step",
+                "actor_switch_step_nonzero",
+            ),
+        )
+
+        if self.policy_mode == "eval":
+            self._copy_scalar_info_to_episode(infos, self._RLT_EVAL_PEG_EPISODE_KEYS)
+            if "success" in infos:
+                success = infos["success"]
+                if isinstance(success, torch.Tensor):
+                    infos["episode"]["success_at_end"] = success.reshape(
+                        self.num_envs, -1
+                    )[:, -1].clone()
+
+        return infos
+
+    def _copy_scalar_info_to_episode(self, infos, keys):
+        """Copy per-env scalar infos into infos['episode'] for eval logging."""
+        for key in keys:
+            if key not in infos:
+                continue
+            value = infos[key]
+            if isinstance(value, torch.Tensor):
+                infos["episode"][key] = value.reshape(self.num_envs, -1)[:, -1].clone()
         return infos
 
     def _attach_rlt_switch_info(self, infos):
