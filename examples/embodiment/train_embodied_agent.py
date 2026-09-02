@@ -61,9 +61,20 @@ def main(cfg) -> None:
             raise ValueError(
                 "runner.use_training_pipeline=True is not supported for rlt_ac."
             )
-        from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+        from rlinf.algorithms.rlt_lh.transition import (
+            use_lh_simulator_transition_replay,
+        )
 
-        actor_worker_cls = RLTACFSDPPolicy
+        if use_lh_simulator_transition_replay(cfg):
+            from rlinf.workers.actor.fsdp_rlt_lh_ac_policy_worker import (
+                RLTLHACFSDPPolicy,
+            )
+
+            actor_worker_cls = RLTLHACFSDPPolicy
+        else:
+            from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+
+            actor_worker_cls = RLTACFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         if use_training_pipeline:
             raise ValueError(

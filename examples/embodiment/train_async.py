@@ -55,10 +55,24 @@ def main(cfg) -> None:
         actor_worker_cls = AsyncEmbodiedSACFSDPPolicy
     elif cfg.algorithm.loss_type == "rlt_ac":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
-        from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import AsyncRLTACFSDPPolicy
+        from rlinf.algorithms.rlt_lh.transition import (
+            use_lh_simulator_transition_replay,
+        )
+
+        if use_lh_simulator_transition_replay(cfg):
+            from rlinf.workers.actor.fsdp_rlt_lh_ac_policy_worker import (
+                AsyncRLTLHACFSDPPolicy,
+            )
+
+            actor_worker_cls = AsyncRLTLHACFSDPPolicy
+        else:
+            from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
+                AsyncRLTACFSDPPolicy,
+            )
+
+            actor_worker_cls = AsyncRLTACFSDPPolicy
 
         runner_cls = AsyncEmbodiedRunner
-        actor_worker_cls = AsyncRLTACFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (

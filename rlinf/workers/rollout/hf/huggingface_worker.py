@@ -28,6 +28,11 @@ from rlinf.algorithms.rlt import (
     build_rlt_route,
     predict_rlt_actions,
 )
+from rlinf.algorithms.rlt_lh import (
+    history_summary_dim,
+    predict_rlt_lh_actions,
+    use_lh_simulator_transition_replay,
+)
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
@@ -81,6 +86,29 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self.enable_rlt_lh = (
+            use_lh_simulator_transition_replay(self.cfg)
+            and self.algorithm_cfg.get("loss_type") == "rlt_ac"
+        )
+        rlt_lh_window_cfg = (
+            train_env_cfg if train_env_cfg is not None else eval_env_cfg
+        )
+        self.rlt_lh_window = int(
+            rlt_lh_window_cfg.get("rlt_history_window", 8)
+            if rlt_lh_window_cfg is not None
+            else 8
+        )
+        history_input_dim = self.model_cfg.get("history_input_dim", None)
+        self.rlt_lh_summary_dim = (
+            int(history_input_dim)
+            if history_input_dim is not None
+            else history_summary_dim(
+                z_dim=self.model_cfg.get("z_dim", 0),
+                proprio_dim=self.model_cfg.get("proprio_dim", 0),
+                action_dim=self.model_cfg.action_dim,
+                num_action_chunks=self.model_cfg.num_action_chunks,
+            )
+        )
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -553,6 +581,20 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
+    def _ensure_rlt_lh_history(self, env_obs: dict[str, Any]) -> dict[str, Any]:
+        if env_obs is None or env_obs.get("history") is not None:
+            return env_obs
+        batch_size = self._infer_env_batch_size(env_obs)
+        history = torch.zeros(
+            batch_size,
+            self.rlt_lh_window,
+            self.rlt_lh_summary_dim,
+            dtype=torch.float32,
+        )
+        env_obs = dict(env_obs)
+        env_obs["history"] = history
+        return env_obs
+
     def _predict_rollout_actions(
         self,
         env_obs: dict[str, Any],
@@ -562,6 +604,20 @@ class MultiStepRolloutWorker(Worker):
         intervene_requested: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
+            if self.enable_rlt_lh:
+                env_obs = self._ensure_rlt_lh_history(env_obs)
+                return predict_rlt_lh_actions(
+                    policy_model=self.hf_model,
+                    feature_model=self.rlt_feature_model,
+                    env_obs=env_obs,
+                    final_obs=final_obs,
+                    mode=mode,
+                    version=self.version,
+                    rlt_switch_flags=rlt_switch_flags,
+                    intervene_requested=intervene_requested,
+                    expert_model=self.expert_model,
+                    cfg=self.cfg,
+                )
             return predict_rlt_actions(
                 policy_model=self.hf_model,
                 feature_model=self.rlt_feature_model,
@@ -800,7 +856,7 @@ class MultiStepRolloutWorker(Worker):
                     timeout_time=0.02,
                     recv_queue_size=self.rollout_queue_size,
                 )
-                actions, _ = self._predict_rollout_actions(
+                actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     mode="eval",
                     final_obs=env_output.get("final_obs", None),
@@ -809,11 +865,21 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
+                eval_payload: Any = actions
+                if self.enable_rlt_lh:
+                    eval_payload = self._build_rollout_result(
+                        actions,
+                        result,
+                        final_obs=env_output.get("final_obs", None),
+                    )
                 self.send_to_recorded_batch_routes(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,
-                    data=actions,
+                    data=eval_payload,
                     tag="rollout_results",
+                    split_fn=(
+                        self._split_rollout_result if self.enable_rlt_lh else None
+                    ),
                     split_sizes=split_sizes,
                 )
         else:
@@ -834,7 +900,7 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
-                        actions, _ = self._predict_rollout_actions(
+                        actions, result = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
                             final_obs=env_output.get("final_obs", None),
@@ -843,14 +909,26 @@ class MultiStepRolloutWorker(Worker):
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
+                        eval_payload: Any = actions
+                        if self.enable_rlt_lh:
+                            eval_payload = self._build_rollout_result(
+                                actions,
+                                result,
+                                final_obs=env_output.get("final_obs", None),
+                            )
                         self.send_to(
                             group_name=self.cfg.env.group_name,
                             channel=output_channel,
-                            data=actions,
+                            data=eval_payload,
                             tag="eval_rollout_results",
                             route_key=stage_id,
                             async_op=True,
                             batch_size=self.eval_batch_size,
+                            split_fn=(
+                                self._split_rollout_result
+                                if self.enable_rlt_lh
+                                else None
+                            ),
                         )
 
             if self.enable_offload:

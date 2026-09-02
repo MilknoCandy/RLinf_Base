@@ -23,6 +23,15 @@ from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
+from rlinf.algorithms.rlt_lh import (
+    RLTHistoryBuffer,
+    build_history_summary,
+    extract_rlt_lh_phase,
+    extract_rlt_lh_subtask_success,
+    history_summary_dim,
+    update_rlt_lh_transitions,
+    use_lh_simulator_transition_replay,
+)
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedLerobotRolloutResult,
@@ -173,6 +182,59 @@ class EnvWorker(Worker):
             ]
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
 
+        self.enable_rlt_lh = self.enable_rlt and use_lh_simulator_transition_replay(
+            self.cfg
+        )
+        rlt_lh_window_cfg = (
+            train_env_cfg if train_env_cfg is not None else eval_env_cfg
+        )
+        self.rlt_lh_window = int(
+            rlt_lh_window_cfg.get("rlt_history_window", 8)
+            if rlt_lh_window_cfg is not None
+            else 8
+        )
+        history_input_dim = self.model_cfg.get("history_input_dim", None)
+        self.rlt_lh_summary_dim = (
+            int(history_input_dim)
+            if history_input_dim is not None
+            else history_summary_dim(
+                z_dim=self.model_cfg.get("z_dim", 0),
+                proprio_dim=self.model_cfg.get("proprio_dim", 0),
+                action_dim=self.model_cfg.action_dim,
+                num_action_chunks=self.model_cfg.num_action_chunks,
+            )
+        )
+        self.rlt_lh_history_buffers: list[RLTHistoryBuffer] = []
+        self.eval_rlt_lh_history_buffers: list[RLTHistoryBuffer] = []
+        self.rlt_lh_prev_phase: list[torch.Tensor] = []
+        self.eval_rlt_lh_prev_phase: list[torch.Tensor] = []
+        if self.enable_rlt_lh and self.enable_train:
+            self.rlt_lh_history_buffers = [
+                RLTHistoryBuffer(
+                    num_envs=self.train_num_envs_per_stage,
+                    window=self.rlt_lh_window,
+                    summary_dim=self.rlt_lh_summary_dim,
+                )
+                for _ in range(self.stage_num)
+            ]
+            self.rlt_lh_prev_phase = [
+                torch.zeros(self.train_num_envs_per_stage, 1, dtype=torch.float32)
+                for _ in range(self.stage_num)
+            ]
+        if self.enable_rlt_lh and self.enable_eval:
+            self.eval_rlt_lh_history_buffers = [
+                RLTHistoryBuffer(
+                    num_envs=self.eval_num_envs_per_stage,
+                    window=self.rlt_lh_window,
+                    summary_dim=self.rlt_lh_summary_dim,
+                )
+                for _ in range(self.stage_num)
+            ]
+            self.eval_rlt_lh_prev_phase = [
+                torch.zeros(self.eval_num_envs_per_stage, 1, dtype=torch.float32)
+                for _ in range(self.stage_num)
+            ]
+
         if self.env_decoupled_mode:
             # Init the batch_router for env decoupled mode
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
@@ -212,6 +274,109 @@ class EnvWorker(Worker):
             EmbodiedRolloutResult(max_episode_length=max_episode_length)
             for _ in range(self.stage_num)
         ]
+
+    def _rlt_lh_update_history(
+        self,
+        stage_id: int,
+        rollout_result: RolloutResult,
+        env_output: EnvOutput,
+        *,
+        eval_mode: bool = False,
+    ) -> None:
+        if not self.enable_rlt_lh:
+            return
+        buffers = (
+            self.eval_rlt_lh_history_buffers
+            if eval_mode
+            else self.rlt_lh_history_buffers
+        )
+        if stage_id >= len(buffers):
+            return
+
+        env_cfg = self.cfg.env.eval if eval_mode else self.cfg.env.train
+        env_type = str(env_cfg.get("env_type", ""))
+        forward_inputs = getattr(rollout_result, "forward_inputs", None) or {}
+        if not all(key in forward_inputs for key in ("z_rl", "proprio", "action")):
+            return
+
+        batch_size = forward_inputs["z_rl"].shape[0]
+        rewards = getattr(env_output, "rewards", None)
+        if rewards is None:
+            rewards = torch.zeros(
+                batch_size,
+                self.model_cfg.num_action_chunks,
+                dtype=torch.float32,
+            )
+
+        dones = getattr(env_output, "dones", None)
+        done_mask = (
+            torch.as_tensor(dones, dtype=torch.bool).reshape(batch_size, -1).any(dim=-1)
+            if dones is not None
+            else None
+        )
+
+        prev_phases = (
+            self.eval_rlt_lh_prev_phase if eval_mode else self.rlt_lh_prev_phase
+        )
+        prev_phase = (
+            prev_phases[stage_id]
+            if stage_id < len(prev_phases)
+            else torch.zeros(batch_size, 1, dtype=torch.float32)
+        )
+        phase_idx = extract_rlt_lh_phase(
+            env_type=env_type,
+            env_infos=getattr(env_output, "env_infos", None),
+            rlt_switch_flags=getattr(env_output, "rlt_switch_flags", None),
+            batch_size=batch_size,
+        )
+        if env_type == "calvin":
+            subtask_success = extract_rlt_lh_subtask_success(
+                env_type=env_type,
+                env_infos=getattr(env_output, "env_infos", None),
+                dones=dones,
+                batch_size=batch_size,
+                phase_idx=phase_idx,
+                prev_phase=prev_phase,
+            )
+        else:
+            subtask_success = extract_rlt_lh_subtask_success(
+                env_type=env_type,
+                env_infos=getattr(env_output, "env_infos", None),
+                dones=dones,
+                batch_size=batch_size,
+            )
+
+        summary = build_history_summary(
+            z_rl=forward_inputs["z_rl"],
+            proprio=forward_inputs["proprio"],
+            action=forward_inputs["action"],
+            reward=rewards,
+            phase_idx=phase_idx,
+            subtask_success=subtask_success,
+        )
+        buffers[stage_id].push(summary, done_mask=done_mask)
+        env_output.obs["history"] = buffers[stage_id].get().clone()
+
+        if stage_id < len(prev_phases):
+            phase_idx = phase_idx.reshape(batch_size, 1).to(
+                device=prev_phases[stage_id].device,
+                dtype=prev_phases[stage_id].dtype,
+            )
+            if done_mask is not None:
+                phase_idx = phase_idx.clone()
+                phase_idx[done_mask] = 0.0
+            prev_phases[stage_id] = phase_idx
+
+    @staticmethod
+    def _rlt_lh_attach_empty_history(
+        env_output: EnvOutput,
+        buffer: RLTHistoryBuffer,
+        prev_phase: torch.Tensor | None = None,
+    ) -> None:
+        buffer.reset()
+        env_output.obs["history"] = buffer.get().clone()
+        if prev_phase is not None:
+            prev_phase.zero_()
 
     def init_worker(self):
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -584,6 +749,7 @@ class EnvWorker(Worker):
             obs=extracted_obs,
             final_obs=final_obs,
             env_infos=infos if isinstance(infos, dict) else None,
+            dones=chunk_dones,
             rlt_switch_flags=rlt_switch_flags,
         )
         return env_output, env_info
@@ -900,6 +1066,16 @@ class EnvWorker(Worker):
                     intervene_actions=None,
                     intervene_flags=None,
                 )
+                if self.enable_rlt_lh and stage_id < len(self.rlt_lh_history_buffers):
+                    self._rlt_lh_attach_empty_history(
+                        env_output,
+                        self.rlt_lh_history_buffers[stage_id],
+                        (
+                            self.rlt_lh_prev_phase[stage_id]
+                            if stage_id < len(self.rlt_lh_prev_phase)
+                            else None
+                        ),
+                    )
                 env_outputs.append(env_output)
         else:
             dones = get_zero_dones()
@@ -916,6 +1092,16 @@ class EnvWorker(Worker):
                     intervene_actions=self.last_intervened_info_list[stage_id][0],
                     intervene_flags=self.last_intervened_info_list[stage_id][1],
                 )
+                if self.enable_rlt_lh and stage_id < len(self.rlt_lh_history_buffers):
+                    self._rlt_lh_attach_empty_history(
+                        env_output,
+                        self.rlt_lh_history_buffers[stage_id],
+                        (
+                            self.rlt_lh_prev_phase[stage_id]
+                            if stage_id < len(self.rlt_lh_prev_phase)
+                            else None
+                        ),
+                    )
                 env_outputs.append(env_output)
 
         return env_outputs
@@ -1105,17 +1291,30 @@ class EnvWorker(Worker):
                             rollout_result.intervene_flags
                         )
                     if self.enable_rlt and self.collect_transitions:
-                        update_rlt_transitions(
-                            stage_id,
-                            rlt_pending_obs,
-                            self.rollout_results,
-                            rollout_result,
-                            cache_current=True,
-                        )
+                        if self.enable_rlt_lh:
+                            update_rlt_lh_transitions(
+                                stage_id,
+                                rlt_pending_obs,
+                                self.rollout_results,
+                                rollout_result,
+                                cache_current=True,
+                            )
+                        else:
+                            update_rlt_transitions(
+                                stage_id,
+                                rlt_pending_obs,
+                                self.rollout_results,
+                                rollout_result,
+                                cache_current=True,
+                            )
 
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    if self.enable_rlt_lh:
+                        self._rlt_lh_update_history(
+                            stage_id, rollout_result, env_output
+                        )
                     stage_rollout = self.rollout_results[stage_id]
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
                         stage_rollout.append_chunk_episode_data(
@@ -1220,13 +1419,22 @@ class EnvWorker(Worker):
                 ):
                     self.assign_history_reward(stage_id, reward_model_output)
                 if self.enable_rlt and self.collect_transitions:
-                    update_rlt_transitions(
-                        stage_id,
-                        rlt_pending_obs,
-                        self.rollout_results,
-                        rollout_result,
-                        cache_current=False,
-                    )
+                    if self.enable_rlt_lh:
+                        update_rlt_lh_transitions(
+                            stage_id,
+                            rlt_pending_obs,
+                            self.rollout_results,
+                            rollout_result,
+                            cache_current=False,
+                        )
+                    else:
+                        update_rlt_transitions(
+                            stage_id,
+                            rlt_pending_obs,
+                            self.rollout_results,
+                            rollout_result,
+                            cache_current=False,
+                        )
 
             if self.use_training_pipeline and actor_channel is not None:
                 await self.send_rollout_trajectories_pipeline(
@@ -1297,6 +1505,18 @@ class EnvWorker(Worker):
                         ),
                         env_infos=infos if isinstance(infos, dict) else None,
                     )
+                    if self.enable_rlt_lh and stage_id < len(
+                        self.eval_rlt_lh_history_buffers
+                    ):
+                        self._rlt_lh_attach_empty_history(
+                            env_output,
+                            self.eval_rlt_lh_history_buffers[stage_id],
+                            (
+                                self.eval_rlt_lh_prev_phase[stage_id]
+                                if stage_id < len(self.eval_rlt_lh_prev_phase)
+                                else None
+                            ),
+                        )
                     env_batch = env_output.to_dict()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
@@ -1316,8 +1536,13 @@ class EnvWorker(Worker):
                         tag="eval_rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         batch_size=self.eval_batch_size,
+                        merge_fn=(
+                            RolloutResult.merge_rollout_results
+                            if self.enable_rlt_lh
+                            else None
+                        ),
                         infer_batch_size_fn=self._infer_rollout_batch_size
-                        if self.env_decoupled_mode
+                        if self.env_decoupled_mode or self.enable_rlt_lh
                         else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
@@ -1333,6 +1558,10 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
+                    if self.enable_rlt_lh:
+                        self._rlt_lh_update_history(
+                            stage_id, rollout_results, env_output, eval_mode=True
+                        )
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)

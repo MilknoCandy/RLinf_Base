@@ -117,6 +117,7 @@ class EnvOutput:
             if "task_descriptions" in obs and obs["task_descriptions"] is not None
             else None
         )
+        history = obs.get("history", None)
 
         return {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
@@ -124,6 +125,7 @@ class EnvOutput:
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
+            "history": history,
         }
 
     @staticmethod

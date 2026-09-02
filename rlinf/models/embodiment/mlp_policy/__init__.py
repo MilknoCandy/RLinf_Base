@@ -20,6 +20,9 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from rlinf.models.embodiment.mlp_policy.iql_mlp_policy import IQLMLPPolicy
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+    from rlinf.models.embodiment.mlp_policy.rlt_lh_mlp_policy import (
+        RLTLHMLPPolicy,
+    )
 
     iql_config = cfg.get("iql_config", None)
     if cfg.model_type == "rlt_mlp_policy":
@@ -34,6 +37,22 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+        )
+    elif cfg.model_type == "rlt_lh_mlp_policy":
+        model = RLTLHMLPPolicy(
+            z_dim=cfg.z_dim,
+            proprio_dim=cfg.proprio_dim,
+            action_dim=cfg.action_dim,
+            num_action_chunks=cfg.num_action_chunks,
+            ref_num_action_chunks=cfg.get(
+                "ref_num_action_chunks", cfg.num_action_chunks
+            ),
+            add_q_head=cfg.get("add_q_head", True),
+            q_head_type=cfg.get("q_head_type", "default"),
+            fixed_std=cfg.get("fixed_std", 0.002),
+            history_input_dim=cfg.get("history_input_dim", None),
+            history_hidden_dim=cfg.get("history_hidden_dim", 256),
+            history_num_layers=cfg.get("history_num_layers", 1),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(
