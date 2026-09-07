@@ -64,6 +64,12 @@ actor:
       rlt_image_only: True
       rlt_use_mask: False
 
+    openpi_data:
+      repo_id: "/path/to/InternData-Calvin_ABC"
+      # pi05_calvin uses prompt_from_task=True; prompts are read from the
+      # dataset/task annotations, so there is intentionally no default_prompt.
+      norm_stats_path: "/path/to/InternData-Calvin_ABC/norm_stats.json"
+
   optim:
     lr: 2.5e-5
     adam_beta1: 0.9

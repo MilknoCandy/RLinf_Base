@@ -163,7 +163,9 @@ rollout:
     lora_rank: 32
     openpi_data:
       repo_id: "/path/to/InternData-Calvin_ABC"
-      norm_stats_path: null
+      # CALVIN prompts come from env_obs["task_descriptions"], so no
+      # fixed default_prompt is needed here.
+      norm_stats_path: "/path/to/InternData-Calvin_ABC/norm_stats.json"
     openpi:
       config_name: "pi05_calvin"
       num_images_in_input: 2
