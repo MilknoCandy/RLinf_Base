@@ -33,6 +33,7 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
         return env_type in {
             SupportedEnvType.MANISKILL_RLT,
             SupportedEnvType.ISAACLAB_RLT,
+            SupportedEnvType.CALVIN_RLT,
         }
     except ValueError:
         return False

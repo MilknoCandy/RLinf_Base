@@ -31,6 +31,7 @@ class SupportedEnvType(Enum):
     METAWORLD = "metaworld"
     BEHAVIOR = "behavior"
     CALVIN = "calvin"
+    CALVIN_RLT = "calvin_rlt"
     ROBOCASA = "robocasa"
     ROBOCASA365 = "robocasa365"
     REALWORLD = "realworld"
@@ -125,6 +126,10 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.calvin.calvin_gym_env import CalvinEnv
 
         return CalvinEnv
+    elif env_type == SupportedEnvType.CALVIN_RLT:
+        from rlinf.envs.calvin.calvin_rlt_env import CalvinRLTEnv
+
+        return CalvinRLTEnv
     elif env_type == SupportedEnvType.ROBOCASA:
         from rlinf.envs.robocasa.robocasa_env import RobocasaEnv
 
