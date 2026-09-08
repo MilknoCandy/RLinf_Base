@@ -119,6 +119,15 @@ def _feature_stats(arr: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _as_list(value: Any) -> list[float]:
+    if isinstance(value, list):
+        return value
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        return [float(arr)]
+    return arr.tolist()
+
+
 def _make_record(
     episode_index: int,
     length: int,
@@ -164,10 +173,10 @@ def _build_from_stats(
             if not {"min", "max", "mean", "std"}.issubset(stats):
                 continue
             feature_stats[feature_key] = {
-                "min": stats["min"],
-                "max": stats["max"],
-                "mean": stats["mean"],
-                "std": stats["std"],
+                "min": _as_list(stats["min"]),
+                "max": _as_list(stats["max"]),
+                "mean": _as_list(stats["mean"]),
+                "std": _as_list(stats["std"]),
                 "count": length,
             }
         records.append(
