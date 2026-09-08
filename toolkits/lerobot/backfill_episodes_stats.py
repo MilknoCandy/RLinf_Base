@@ -30,9 +30,8 @@ decoding videos:
   python toolkits/lerobot/backfill_episodes_stats.py \
       --dataset-root /path/to/InternData-Calvin_ABC --mode from-data
 
-BEHAVIOR/RLinf's ``openpi_rlinf`` BEHAVIOR loader expects the same values nested
-under a single ``stats`` field. Use ``--stats-format nested-stats`` for that
-path.
+LeRobot v2.1 stores per-feature stats under a single ``stats`` field (the
+default). A flat legacy layout is available with ``--stats-format lerobot``.
 """
 
 from __future__ import annotations
@@ -115,7 +114,7 @@ def _feature_stats(arr: np.ndarray) -> dict[str, Any]:
         "max": np.max(arr, axis=0).tolist(),
         "mean": np.mean(arr, axis=0).tolist(),
         "std": np.std(arr, axis=0).tolist(),
-        "count": int(arr.shape[0]),
+        "count": [int(arr.shape[0])],
     }
 
 
@@ -177,7 +176,7 @@ def _build_from_stats(
                 "max": _as_list(stats["max"]),
                 "mean": _as_list(stats["mean"]),
                 "std": _as_list(stats["std"]),
-                "count": length,
+                "count": [length],
             }
         records.append(
             _make_record(episode_index, length, feature_stats, stats_format)
@@ -243,10 +242,10 @@ def main() -> None:
     parser.add_argument(
         "--stats-format",
         choices=("lerobot", "nested-stats"),
-        default="lerobot",
+        default="nested-stats",
         help=(
-            "lerobot writes feature stats at the top level; nested-stats writes "
-            "them under a single 'stats' key for RLinf's BEHAVIOR loader."
+            "nested-stats writes feature stats under a single 'stats' key "
+            "(LeRobot v2.1); lerobot writes a flat legacy layout."
         ),
     )
     parser.add_argument(
