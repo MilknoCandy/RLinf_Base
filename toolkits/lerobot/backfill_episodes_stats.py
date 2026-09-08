@@ -29,6 +29,10 @@ decoding videos:
   # Exact path, recomputes per-episode stats from data/*.parquet:
   python toolkits/lerobot/backfill_episodes_stats.py \
       --dataset-root /path/to/InternData-Calvin_ABC --mode from-data
+
+BEHAVIOR/RLinf's ``openpi_rlinf`` BEHAVIOR loader expects the same values nested
+under a single ``stats`` field. Use ``--stats-format nested-stats`` for that
+path.
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ from typing import Any
 
 import numpy as np
 import pyarrow.parquet as pq
+
+
+_RESERVED_KEYS = {"episode_index", "length", "frame_index", "timestamp", "task_index"}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -73,7 +80,8 @@ def _scalar_features(info: dict[str, Any]) -> list[str]:
     return [
         key
         for key, feature in features.items()
-        if str(feature.get("dtype", "")).lower() not in {"video", "image"}
+        if key not in _RESERVED_KEYS
+        and str(feature.get("dtype", "")).lower() not in {"video", "image"}
     ]
 
 
@@ -111,8 +119,28 @@ def _feature_stats(arr: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _make_record(
+    episode_index: int,
+    length: int,
+    feature_stats: dict[str, Any],
+    stats_format: str,
+) -> dict[str, Any]:
+    if stats_format == "nested-stats":
+        return {
+            "episode_index": episode_index,
+            "length": length,
+            "stats": feature_stats,
+        }
+    record: dict[str, Any] = {"episode_index": episode_index, "length": length}
+    record.update(feature_stats)
+    return record
+
+
 def _build_from_stats(
-    root: Path, info: dict[str, Any], episodes: list[dict[str, Any]]
+    root: Path,
+    info: dict[str, Any],
+    episodes: list[dict[str, Any]],
+    stats_format: str,
 ) -> list[dict[str, Any]]:
     stats_path = root / "meta" / "stats.json"
     if not stats_path.is_file():
@@ -126,26 +154,33 @@ def _build_from_stats(
     for episode in episodes:
         episode_index = int(episode["episode_index"])
         length = _episode_length(root, info, episode_index, episode)
-        record: dict[str, Any] = {"episode_index": episode_index, "length": length}
+        feature_stats: dict[str, Any] = {}
         for feature_key in scalar_features:
+            if feature_key in _RESERVED_KEYS:
+                continue
             stats = dataset_stats.get(feature_key)
             if not isinstance(stats, dict):
                 continue
             if not {"min", "max", "mean", "std"}.issubset(stats):
                 continue
-            record[feature_key] = {
+            feature_stats[feature_key] = {
                 "min": stats["min"],
                 "max": stats["max"],
                 "mean": stats["mean"],
                 "std": stats["std"],
                 "count": length,
             }
-        records.append(record)
+        records.append(
+            _make_record(episode_index, length, feature_stats, stats_format)
+        )
     return records
 
 
 def _build_from_data(
-    root: Path, info: dict[str, Any], episodes: list[dict[str, Any]]
+    root: Path,
+    info: dict[str, Any],
+    episodes: list[dict[str, Any]],
+    stats_format: str,
 ) -> list[dict[str, Any]]:
     scalar_features = _scalar_features(info)
     records: list[dict[str, Any]] = []
@@ -161,14 +196,20 @@ def _build_from_data(
         table = pq.read_table(parquet_path, columns=columns) if columns else None
         length = int(pq.ParquetFile(parquet_path).metadata.num_rows)
 
-        record: dict[str, Any] = {"episode_index": episode_index, "length": length}
+        feature_stats: dict[str, Any] = {}
         if table is None:
-            records.append(record)
+            records.append(
+                _make_record(episode_index, length, feature_stats, stats_format)
+            )
             continue
         for feature_key in columns:
+            if feature_key in _RESERVED_KEYS:
+                continue
             arr = _column_to_2d_array(table, feature_key)
-            record[feature_key] = _feature_stats(arr)
-        records.append(record)
+            feature_stats[feature_key] = _feature_stats(arr)
+        records.append(
+            _make_record(episode_index, length, feature_stats, stats_format)
+        )
 
     return records
 
@@ -191,6 +232,15 @@ def main() -> None:
         help="Optional limit on the number of episodes to backfill.",
     )
     parser.add_argument(
+        "--stats-format",
+        choices=("lerobot", "nested-stats"),
+        default="lerobot",
+        help=(
+            "lerobot writes feature stats at the top level; nested-stats writes "
+            "them under a single 'stats' key for RLinf's BEHAVIOR loader."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite an existing episodes_stats.jsonl.",
@@ -211,9 +261,9 @@ def main() -> None:
         mode = "from-stats" if (meta_dir / "stats.json").is_file() else "from-data"
 
     if mode == "from-stats":
-        records = _build_from_stats(root, info, episodes)
+        records = _build_from_stats(root, info, episodes, args.stats_format)
     else:
-        records = _build_from_data(root, info, episodes)
+        records = _build_from_data(root, info, episodes, args.stats_format)
 
     output_path = meta_dir / "episodes_stats.jsonl"
     if output_path.exists() and not args.force:
