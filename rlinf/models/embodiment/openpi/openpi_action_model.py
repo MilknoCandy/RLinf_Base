@@ -110,6 +110,7 @@ class OpenPi0Config(Pi0Config):
     rlt_mlp_ratio: float = 4.0
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
+    freeze_vla_for_rlt: bool = False
     state_indices: list[int] | None = None
 
 

@@ -40,7 +40,9 @@ actor:
 
   model:
     precision: null  # required by official openpi; do not change
-    model_path: "/path/to/pi05_base"
+    # Start from RLinf's official CALVIN ABC-D Pi0.5 SFT checkpoint instead of
+    # pi05_base, so the Stage-1 run only needs to learn the RLT token module.
+    model_path: "/path/to/model/RLinf-Pi05-CALVIN-ABC-D-SFT"  # https://huggingface.co/RLinf/RLinf-Pi05-CALVIN-ABC-D-SFT
     model_type: "openpi"  # intentionally not openpi_rlinf; official openpi pipeline
     num_action_chunks: 5
     action_dim: 7
@@ -54,7 +56,11 @@ actor:
       action_env_dim: ${actor.model.action_dim}
       num_steps: ${actor.model.num_steps}
       use_rlt: True
-      rlt_alpha: 1.0
+      # Freeze the already-SFT VLA backbone and train only rlt_module.*.
+      freeze_vla_for_rlt: True
+      # With the VLA frozen, the VLA loss is reported but contributes no
+      # gradient; set alpha to zero so the optimized objective is pure RLT.
+      rlt_alpha: 0.0
       rlt_input_dim: 2048
       rlt_embed_dim: 2048
       rlt_prefix_seq_len: 768

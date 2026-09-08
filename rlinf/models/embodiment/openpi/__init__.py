@@ -13,6 +13,7 @@
 # limitations under the License.
 # openpi model configs
 
+import logging
 import os
 import pathlib
 
@@ -88,6 +89,30 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         model.load_state_dict(all_state_dict, strict=False)
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+
+    # Optional RLT-only Stage 1 mode: start from an already fine-tuned VLA
+    # checkpoint and train only the freshly initialized RLT token transformer.
+    if getattr(cfg.openpi, "freeze_vla_for_rlt", False):
+        if not getattr(cfg.openpi, "use_rlt", False):
+            raise ValueError(
+                "openpi.freeze_vla_for_rlt=True requires openpi.use_rlt=True."
+            )
+        frozen_params = 0
+        trainable_params = 0
+        for name, param in model.named_parameters():
+            if name.startswith("rlt_module."):
+                param.requires_grad = True
+                trainable_params += param.numel()
+            else:
+                param.requires_grad = False
+                frozen_params += param.numel()
+        logging.getLogger(__name__).info(
+            "openpi RLT-only Stage 1: froze %d VLA params, keeping %d "
+            "trainable rlt_module params",
+            frozen_params,
+            trainable_params,
+        )
+
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats
