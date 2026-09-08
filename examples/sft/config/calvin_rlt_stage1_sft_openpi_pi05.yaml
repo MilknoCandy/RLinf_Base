@@ -92,7 +92,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    use_orig_params: False
+    use_orig_params: True  # required when freeze_vla_for_rlt mixes frozen/trainable tensors
     gradient_checkpointing: False  # openpi does not support gradient checkpointing
     mixed_precision:
       param_dtype: ${actor.model.precision}
