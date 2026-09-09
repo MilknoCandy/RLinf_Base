@@ -26,6 +26,13 @@ rlt_policy_switch:
   latch_until_done: True
   expert_takeover:
     enable: False
+    # CALVIN has no peg-hole geometry, so "stalled progress" is defined by
+    # subtask progress: current_task_idx stops advancing for several action
+    # chunks while the episode is still running. ``always_on`` and
+    # ``critical_phase`` are also supported for ablations.
+    trigger_mode: stalled_progress
+    gate:
+      stuck_chunks_before_takeover: 3
 
 video_cfg:
   save_video: False

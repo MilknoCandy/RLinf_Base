@@ -107,6 +107,16 @@ env:
     action_dim: 7
     num_action_chunks: 5
     ref_num_action_chunks: 5
+    rlt_policy_switch:
+      enable: True
+      task_mode: full_task
+      trigger_mode: always_on
+      latch_until_done: True
+      expert_takeover:
+        enable: True
+        trigger_mode: stalled_progress
+        gate:
+          stuck_chunks_before_takeover: 3
   eval:
     rollout_epoch: 1
     total_num_envs: 128
@@ -122,6 +132,16 @@ env:
     action_dim: 7
     num_action_chunks: 5
     ref_num_action_chunks: 5
+    rlt_policy_switch:
+      enable: True
+      task_mode: full_task
+      trigger_mode: always_on
+      latch_until_done: True
+      expert_takeover:
+        enable: False
+        trigger_mode: stalled_progress
+        gate:
+          stuck_chunks_before_takeover: 3
     video_cfg:
       save_video: True
       fps: 20
@@ -185,6 +205,33 @@ rollout:
       rlt_mlp_ratio: 4.0
       rlt_image_only: True
       rlt_use_mask: False
+
+  # Optional CALVIN expert takeover model. Enable it with
+  # env.train.rlt_policy_switch.expert_takeover.enable=True. Point this at a
+  # strong openpi pi05_calvin SFT checkpoint (optionally the same official SFT
+  # used in Stage 1); it predicts expert actions directly and does not use RLT
+  # tokens. openpi_data is inherited from rlt_feature_model by the expert
+  # config builder.
+  expert_model:
+    model_type: "openpi"
+    model_path: "/path/to/calvin_pi05_sft_strong/checkpoints/global_step_<step>/actor"
+    precision: bf16
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 5
+    add_value_head: False
+    is_lora: False
+    lora_rank: 32
+    openpi:
+      config_name: "pi05_calvin"
+      num_images_in_input: 2
+      action_chunk: 5
+      action_env_dim: 7
+      num_steps: 5
+      train_expert_only: False
+      add_value_head: False
+      detach_critic_input: True
+      use_rlt: False
 
   enable_torch_compile: False
   enable_cuda_graph: False
