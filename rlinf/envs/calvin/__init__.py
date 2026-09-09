@@ -15,12 +15,43 @@ import pathlib
 from pathlib import Path
 
 import calvin_env
+
+
+def _safe_get_git_commit_hash(path) -> str:
+    """Return a short commit hash without failing when the CALVIN checkout is
+    not a plain Git clone (shallow, editable install, detached HEAD, etc.).
+
+    ``calvin_env.envs.play_table_env`` calls ``get_git_commit_hash`` merely to
+    add a diagnostic suffix to a log line; it should never be able to crash
+    environment construction.
+    """
+    try:
+        import git
+
+        repo = git.Repo(str(path), search_parent_directories=True)
+        return repo.head.commit.hexsha[:7]
+    except Exception:
+        return "unknown"
+
+
+# ``PlayTableSimEnv`` does ``from calvin_env.utils.utils import
+# get_git_commit_hash``, so the module attribute must be replaced before that
+# class module is imported (it is imported lazily by ``hydra.instantiate``).
+try:
+    import calvin_env.utils.utils as calvin_utils
+
+    calvin_utils.get_git_commit_hash = _safe_get_git_commit_hash
+except Exception:
+    # If the utility module is unavailable, the real import will surface a
+    # clearer error later.
+    pass
+
+
 import hydra
 from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
 from omegaconf import OmegaConf
 
 from rlinf.envs.calvin.utils import get_sequences
-
 ENV_CFG_DIR = Path(__file__).parent / "calvin_cfg/"
 
 
