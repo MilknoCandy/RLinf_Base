@@ -188,7 +188,7 @@ rollout:
       norm_stats_path: "/path/to/InternData-Calvin_ABC/norm_stats.json"
     openpi:
       config_name: "pi05_calvin"
-      rlt_feature_source: "action"   # all | image | text | action
+      rlt_feature_source: "all"   # all | image | text | action
       rlt_mode: "token"            # token | none
       num_images_in_input: 2
       action_chunk: 5
@@ -201,12 +201,12 @@ rollout:
       rlt_alpha: 1.0
       rlt_input_dim: 2048
       rlt_embed_dim: 2048
-      rlt_prefix_seq_len: 768
+      rlt_prefix_seq_len: 1024
       rlt_num_layers: 2
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
-      rlt_image_only: True
-      rlt_use_mask: False
+      rlt_image_only: False
+      rlt_use_mask: True
 
   # Optional CALVIN expert takeover model. Enable it with
   # env.train.rlt_policy_switch.expert_takeover.enable=True. Point this at a

@@ -63,12 +63,12 @@ actor:
       rlt_alpha: 0.0
       rlt_input_dim: 2048
       rlt_embed_dim: 2048
-      rlt_prefix_seq_len: 768
+      rlt_prefix_seq_len: 1024
       rlt_num_layers: 2
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
-      rlt_image_only: True
-      rlt_use_mask: False
+      rlt_image_only: False
+      rlt_use_mask: True
 
     openpi_data:
       repo_id: "/path/to/InternData-Calvin_ABC"
