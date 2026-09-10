@@ -596,7 +596,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             isinstance(self.config.config_name, str)
             and "maniskill" in self.config.config_name.lower()
         ):
-            raw_proprio = torch.as_tensor(raw_proprio)
+            raw_proprio = torch.as_tensor(
+                raw_proprio,
+                device=observation.state.device,
+                dtype=observation.state.dtype,
+            )
             base_state_dim = (
                 len(self.config.state_indices)
                 if self.config.state_indices
