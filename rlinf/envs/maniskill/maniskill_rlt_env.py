@@ -166,6 +166,13 @@ class ManiskillRLTEnv(ManiskillEnv):
             self._init_metrics()
         self._init_persistent_done_state()
         self._init_rlt_switch()
+        self.history_len = int(getattr(cfg, "history_len", 0) or 0)
+        self._history_proprio: torch.Tensor | None = None
+        self._history_actions: torch.Tensor | None = None
+        self._history_pos: torch.Tensor | None = None
+        self._history_state_dim = 0
+        self._history_action_dim = 0
+        self._init_history()
 
     @property
     def instruction(self):
@@ -716,6 +723,106 @@ class ManiskillRLTEnv(ManiskillEnv):
         self._persistent_done_obs = None
         self._persistent_done_infos = None
 
+    # ------------------------------------------------------------------
+    # History injection
+    # ------------------------------------------------------------------
+    def _infer_history_state_dim(self) -> int:
+        if getattr(self.cfg, "wrap_obs_mode", "default") == RLT_OPENPI_JOINT_WRAP_MODE:
+            return 9
+        agent = getattr(self.env.unwrapped, "agent", None)
+        if agent is not None and hasattr(agent, "robot"):
+            qpos = agent.robot.get_qpos()
+            if qpos is not None and hasattr(qpos, "shape") and qpos.ndim >= 2:
+                return int(qpos.shape[-1])
+        return 9
+
+    def _infer_history_action_dim(self) -> int:
+        action_space = getattr(self.env.unwrapped, "single_action_space", None)
+        if action_space is not None and hasattr(action_space, "shape"):
+            shape = getattr(action_space, "shape", None)
+            if shape:
+                return int(shape[-1])
+        return int(getattr(self.cfg, "action_dim", 7))
+
+    def _init_history(self) -> None:
+        if self.history_len <= 0:
+            return
+        self._history_state_dim = self._infer_history_state_dim()
+        self._history_action_dim = self._infer_history_action_dim()
+        self._history_proprio = torch.zeros(
+            (self.num_envs, self.history_len, self._history_state_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._history_actions = torch.zeros(
+            (self.num_envs, self.history_len, self._history_action_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._history_pos = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+
+    def _reset_history(self, env_idx=None) -> None:
+        if self.history_len <= 0:
+            return
+        if env_idx is None:
+            self._history_proprio.zero_()
+            self._history_actions.zero_()
+            self._history_pos.zero_()
+            return
+
+        indices = torch.as_tensor(env_idx, device=self.device).long().reshape(-1)
+        if indices.numel() == 0:
+            return
+        self._history_proprio[indices].zero_()
+        self._history_actions[indices].zero_()
+        self._history_pos[indices] = 0
+
+    def _append_history(self, states, actions, dones=None) -> None:
+        if self.history_len <= 0:
+            return
+        states = torch.as_tensor(states, device=self.device, dtype=torch.float32)
+        actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        if states.ndim == 1:
+            states = states.unsqueeze(0).repeat(self.num_envs, 1)
+        else:
+            states = states.reshape(self.num_envs, -1)
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0).repeat(self.num_envs, 1)
+        else:
+            actions = actions.reshape(self.num_envs, -1)
+
+        state_dim = min(states.shape[1], self._history_state_dim)
+        action_dim = min(actions.shape[1], self._history_action_dim)
+        write_pos = self._history_pos
+        rows = torch.arange(self.num_envs, device=self.device)
+        self._history_proprio[rows, write_pos, :state_dim] = states[:, :state_dim]
+        self._history_actions[rows, write_pos, :action_dim] = actions[:, :action_dim]
+        self._history_pos = (write_pos + 1) % self.history_len
+
+        if dones is not None:
+            done = torch.as_tensor(dones, device=self.device, dtype=torch.bool)
+            if done.ndim == 0:
+                done = done.reshape(1).repeat(self.num_envs)
+            done = done.reshape(self.num_envs)
+            if done.any():
+                done_idx = torch.nonzero(done, as_tuple=False).reshape(-1)
+                self._reset_history(done_idx)
+
+    def _append_history_to_states(self, states):
+        if self.history_len <= 0:
+            return states
+        states = torch.as_tensor(states, device=self.device, dtype=torch.float32)
+        if states.ndim == 1:
+            states = states.unsqueeze(0).repeat(self.num_envs, 1)
+        else:
+            states = states.reshape(self.num_envs, -1)
+        history = torch.cat(
+            [self._history_proprio, self._history_actions], dim=-1
+        ).reshape(self.num_envs, -1)
+        return torch.cat([states, history], dim=-1)
+
     def _reset_persistent_done_state(self, env_idx=None):
         if not hasattr(self, "_persistent_done_mask"):
             self._init_persistent_done_state()
@@ -764,7 +871,7 @@ class ManiskillRLTEnv(ManiskillEnv):
                 raise ValueError(
                     "wrap_obs_mode='rlt_openpi_joint' requires ManiSkill obs_mode='rgb'."
                 )
-            return wrap_rlt_openpi_joint_obs(
+            obs = wrap_rlt_openpi_joint_obs(
                 raw_obs,
                 infos=infos,
                 task_descriptions=self.instruction,
@@ -772,7 +879,13 @@ class ManiskillRLTEnv(ManiskillEnv):
                 device=self.device,
                 is_peg_insertion_side=self._is_peg_insertion_side,
             )
-        return super()._wrap_obs(raw_obs, infos=infos)
+        else:
+            obs = super()._wrap_obs(raw_obs, infos=infos)
+
+        if self.history_len > 0 and isinstance(obs, dict) and "states" in obs:
+            obs = dict(obs)
+            obs["states"] = self._append_history_to_states(obs["states"])
+        return obs
 
     def _record_metrics(self, step_reward, infos):
         infos = super()._record_metrics(step_reward, infos)
@@ -855,6 +968,7 @@ class ManiskillRLTEnv(ManiskillEnv):
                     seed = self.seed
         if seed is not None:
             self._has_seeded_reset = True
+        self._reset_history(options.get("env_idx"))
         raw_obs, infos = self.env.reset(seed=seed, options=options)
         if "env_idx" in options:
             env_idx = options["env_idx"]
@@ -916,6 +1030,9 @@ class ManiskillRLTEnv(ManiskillEnv):
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
+        if self.history_len > 0 and isinstance(extracted_obs, dict) and "states" in extracted_obs:
+            current_states = extracted_obs["states"][..., : self._history_state_dim]
+            self._append_history(current_states, actions, dones)
         return extracted_obs, step_reward, terminations, truncations, infos
 
     def _snapshot_episode_state(self):
@@ -934,6 +1051,10 @@ class ManiskillRLTEnv(ManiskillEnv):
             state["peg_event_state"] = snapshot_peg_insertion_event_state(
                 self.peg_event_state
             )
+        if self.history_len > 0:
+            state["history_proprio"] = self._history_proprio.clone()
+            state["history_actions"] = self._history_actions.clone()
+            state["history_pos"] = self._history_pos.clone()
         return state
 
     def _restore_episode_state(self, state, mask):
@@ -948,6 +1069,10 @@ class ManiskillRLTEnv(ManiskillEnv):
                 state["peg_event_state"],
                 mask,
             )
+        if self.history_len > 0:
+            self._history_proprio[mask] = state["history_proprio"][mask]
+            self._history_actions[mask] = state["history_actions"][mask]
+            self._history_pos[mask] = state["history_pos"][mask]
 
     def _zero_frozen_actions(self, actions, mask):
         if not mask.any():
