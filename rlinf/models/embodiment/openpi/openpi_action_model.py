@@ -591,17 +591,30 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         ref_chunk = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"]
-        raw_proprio = self._select_configured_state(env_obs["states"])
+        raw_proprio = env_obs["states"]
         if (
             isinstance(self.config.config_name, str)
             and "maniskill" in self.config.config_name.lower()
         ):
-            state_dim = (
-                raw_proprio.shape[-1]
-                if hasattr(raw_proprio, "shape")
-                else np.asarray(raw_proprio).shape[-1]
+            raw_proprio = torch.as_tensor(raw_proprio)
+            base_state_dim = (
+                len(self.config.state_indices)
+                if self.config.state_indices
+                else raw_proprio.shape[-1]
             )
-            proprio = observation.state[..., :state_dim]
+            if raw_proprio.shape[-1] > base_state_dim:
+                # History-augmented observation: keep the normalized current
+                # state for the first ``base_state_dim`` channels and append
+                # the raw recent (state, action) history used by the RLT actor.
+                proprio = torch.cat(
+                    [
+                        observation.state[..., :base_state_dim],
+                        raw_proprio[..., base_state_dim:],
+                    ],
+                    dim=-1,
+                )
+            else:
+                proprio = observation.state[..., :base_state_dim]
         else:
             proprio = raw_proprio
         if not torch.is_tensor(proprio):
