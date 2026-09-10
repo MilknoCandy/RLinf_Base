@@ -14,7 +14,6 @@ use_fixed_reset_state_ids: False
 use_ordered_reset_state_ids: False
 
 is_eval: False
-history_len: 0
 
 max_steps_per_rollout_epoch: 480
 max_episode_steps: 480

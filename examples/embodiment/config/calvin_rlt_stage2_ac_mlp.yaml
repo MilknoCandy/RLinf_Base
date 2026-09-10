@@ -103,7 +103,6 @@ env:
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: False
-    history_len: 0
     action_dim: 7
     num_action_chunks: 5
     ref_num_action_chunks: 5
@@ -128,7 +127,6 @@ env:
     policy_mode: eval
     group_size: 1
     is_eval: True
-    history_len: 0
     action_dim: 7
     num_action_chunks: 5
     ref_num_action_chunks: 5

@@ -18,7 +18,11 @@ import numpy as np
 import torch
 
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
-from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
+from rlinf.algorithms.rlt.transition import (
+    RLT_OBS_KEYS,
+    RLT_STM_KEY,
+    RLT_TRANSITION_PREFIX,
+)
 
 
 def _append_rlt_transition_obs(
@@ -33,6 +37,11 @@ def _append_rlt_transition_obs(
         transition_obs = feature_model.extract_rlt_obs(final_obs)
     for key in RLT_OBS_KEYS:
         result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
+    if RLT_STM_KEY in rlt_obs:
+        stm_memory = rlt_obs[RLT_STM_KEY]
+        if final_obs is not None:
+            stm_memory = torch.zeros_like(stm_memory)
+        result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{RLT_STM_KEY}"] = stm_memory
 
 
 def predict_rlt_actions(
@@ -47,9 +56,19 @@ def predict_rlt_actions(
     rlt_switch_flags: torch.Tensor | None = None,
     intervene_requested: torch.Tensor | None = None,
     expert_model: Any | None = None,
+    rlt_stm: Any | None = None,
+    stm_context: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     with torch.no_grad():
         rlt_obs = feature_model.extract_rlt_obs(env_obs)
+        if rlt_stm is not None:
+            if stm_context is None:
+                rlt_stm.reset()
+            rlt_obs[RLT_STM_KEY] = rlt_stm.complete_and_retrieve(
+                rlt_obs["z_rl"],
+                stm_context.get("last_reward") if stm_context else None,
+                stm_context.get("last_done") if stm_context else None,
+            )
         actions, result = policy_model.predict_action_batch(
             env_obs=rlt_obs,
             mode=mode,
@@ -73,6 +92,13 @@ def predict_rlt_actions(
         )
         actions = route_output.actions
         result = route_output.result
+        if rlt_stm is not None:
+            actor_switch = result.get("forward_inputs", {}).get("actor_switch")
+            rlt_stm.remember_current(
+                rlt_obs["z_rl"],
+                route_output.actions,
+                actor_switch,
+            )
 
         _append_rlt_transition_obs(
             feature_model=feature_model,

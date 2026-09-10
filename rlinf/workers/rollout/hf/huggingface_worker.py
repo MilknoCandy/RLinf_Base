@@ -28,6 +28,7 @@ from rlinf.algorithms.rlt import (
     build_rlt_route,
     predict_rlt_actions,
 )
+from rlinf.algorithms.rlt.stm import RLTSTMFIFO
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -79,6 +80,14 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self.rlt_stm_cfg = OmegaConf.select(
+            cfg, "algorithm.rlt_stm", default=None
+        )
+        self.rlt_stm_enabled = bool(
+            OmegaConf.select(cfg, "algorithm.rlt_stm.enable", default=False)
+        )
+        self._rlt_stm_train = None
+        self._rlt_stm_eval = None
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -156,6 +165,22 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
+            if self.rlt_stm_enabled:
+                stm_capacity = int(self.rlt_stm_cfg.get("capacity", 4))
+                stm_z_dim = int(self.model_cfg.z_dim)
+                stm_action_dim = int(self.model_cfg.action_dim) * int(
+                    self.model_cfg.num_action_chunks
+                )
+                self._rlt_stm_train = RLTSTMFIFO(
+                    capacity=stm_capacity,
+                    z_dim=stm_z_dim,
+                    action_dim=stm_action_dim,
+                )
+                self._rlt_stm_eval = RLTSTMFIFO(
+                    capacity=stm_capacity,
+                    z_dim=stm_z_dim,
+                    action_dim=stm_action_dim,
+                )
 
         if self.cfg.rollout.get("expert_model", None) and not self.enable_opd:
             expert_model_config = build_expert_model_config(
@@ -561,8 +586,13 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None = None,
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
+        stm_context: dict[str, Any] | None = None,
+        apply_stm: bool = True,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
+            rlt_stm = None
+            if apply_stm and self.rlt_stm_enabled:
+                rlt_stm = self._rlt_stm_train if mode == "train" else self._rlt_stm_eval
             return predict_rlt_actions(
                 policy_model=self.hf_model,
                 feature_model=self.rlt_feature_model,
@@ -574,6 +604,8 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
+                rlt_stm=rlt_stm,
+                stm_context=stm_context,
             )
         return self.predict(env_obs, mode=mode)
 
@@ -620,7 +652,10 @@ class MultiStepRolloutWorker(Worker):
         ):
             return None
         with torch.no_grad():
-            actions, result = self._predict_rollout_actions(final_obs)
+            actions, result = self._predict_rollout_actions(
+                final_obs,
+                apply_stm=False,
+            )
             if "prev_values" in result and result["prev_values"] is not None:
                 final_values = result["prev_values"]
             else:
@@ -695,6 +730,7 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    stm_context=env_output.get("rlt_stm_context", None),
                 )
 
                 policy_output = self._build_policy_output(
@@ -728,6 +764,7 @@ class MultiStepRolloutWorker(Worker):
                 final_obs=env_output.get("final_obs", None),
                 rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                 intervene_requested=env_output.get("intervene_flags", None),
+                stm_context=env_output.get("rlt_stm_context", None),
             )
 
             if self.enable_opd:
@@ -807,6 +844,7 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    stm_context=env_output.get("rlt_stm_context", None),
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -841,6 +879,7 @@ class MultiStepRolloutWorker(Worker):
                             final_obs=env_output.get("final_obs", None),
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
+                            stm_context=env_output.get("rlt_stm_context", None),
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -922,6 +961,9 @@ class MultiStepRolloutWorker(Worker):
         intervene_flags_list = [
             obs_batch.get("intervene_flags", None) for obs_batch in obs_batches
         ]
+        rlt_stm_context_list = [
+            obs_batch.get("rlt_stm_context", None) for obs_batch in obs_batches
+        ]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -949,6 +991,29 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
+        merged_rlt_stm_context = None
+        if any(context is not None for context in rlt_stm_context_list):
+            ref_context = next(
+                context for context in rlt_stm_context_list if context is not None
+            )
+            merged_rlt_stm_context = {}
+            for key in ("last_reward", "last_done"):
+                ref_value = ref_context.get(key)
+                if ref_value is None:
+                    continue
+                filled_values = []
+                for obs_dict, context in zip(obs_dicts, rlt_stm_context_list):
+                    value = None if context is None else context.get(key)
+                    if value is None:
+                        batch_size = self._infer_env_batch_size(obs_dict)
+                        value = torch.zeros(
+                            batch_size,
+                            dtype=ref_value.dtype,
+                            device=ref_value.device,
+                        )
+                    filled_values.append(torch.as_tensor(value, device=ref_value.device))
+                merged_rlt_stm_context[key] = torch.cat(filled_values, dim=0)
+
         return {
             "obs": merged_obs,
             "final_obs": merged_final_obs,
@@ -958,6 +1023,7 @@ class MultiStepRolloutWorker(Worker):
             "intervene_flags": self._merge_optional_flag_tensors(
                 obs_dicts, intervene_flags_list
             ),
+            "rlt_stm_context": merged_rlt_stm_context,
         }
 
     def _split_policy_output(
@@ -1005,4 +1071,3 @@ class MultiStepRolloutWorker(Worker):
     def set_global_step(self, global_step: int):
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
-

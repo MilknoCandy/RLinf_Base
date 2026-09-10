@@ -81,6 +81,9 @@ class EnvWorker(Worker):
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
+        self.rlt_stm_enabled = self.enable_rlt and bool(
+            OmegaConf.select(self.cfg, "algorithm.rlt_stm.enable", default=False)
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -557,7 +560,7 @@ class EnvWorker(Worker):
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
-    ) -> tuple[EnvOutput, dict[str, Any]]:
+    ) -> tuple[EnvOutput, dict[str, Any], torch.Tensor, torch.Tensor]:
         """
         This function is used to evaluate the environment.
         """
@@ -573,7 +576,7 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
+        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.eval_env_list[stage_id].chunk_step(chunk_actions)
         )
         if isinstance(obs_list, (list, tuple)):
@@ -618,7 +621,7 @@ class EnvWorker(Worker):
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
         )
-        return env_output, env_info
+        return env_output, env_info, chunk_rewards, chunk_dones
 
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
@@ -952,7 +955,11 @@ class EnvWorker(Worker):
 
         return env_outputs
 
-    def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
+    def _build_rollout_input_data(
+        self,
+        env_batch: dict[str, Any],
+        rlt_stm_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         data = {
             "obs": env_batch["obs"],
             "final_obs": env_batch["final_obs"],
@@ -960,7 +967,46 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
+        if self.rlt_stm_enabled and rlt_stm_context is not None:
+            data["rlt_stm_context"] = rlt_stm_context
         return data
+
+    def _rlt_stm_chunk_reward(
+        self,
+        rewards: torch.Tensor | None,
+        num_envs: int,
+    ) -> torch.Tensor:
+        if rewards is None:
+            return torch.zeros(num_envs, dtype=torch.float32)
+        rewards = torch.as_tensor(rewards, dtype=torch.float32)
+        if rewards.ndim == 1:
+            rewards = rewards.reshape(num_envs, 1)
+        else:
+            rewards = rewards.reshape(num_envs, -1)
+        chunk_len = rewards.shape[-1]
+        discounts = torch.pow(
+            torch.as_tensor(self.cfg.algorithm.gamma, device=rewards.device),
+            torch.arange(chunk_len, device=rewards.device, dtype=rewards.dtype),
+        )
+        return (rewards * discounts).sum(dim=-1).detach().cpu()
+
+    def _build_rlt_stm_context(
+        self,
+        rewards: torch.Tensor | None,
+        dones: torch.Tensor | None,
+        num_envs: int,
+    ) -> dict[str, Any] | None:
+        if not self.rlt_stm_enabled:
+            return None
+        if dones is None:
+            last_done = torch.zeros(num_envs, dtype=torch.bool)
+        else:
+            dones = torch.as_tensor(dones, dtype=torch.bool)
+            last_done = dones.reshape(num_envs, -1).any(dim=-1).detach().cpu()
+        return {
+            "last_reward": self._rlt_stm_chunk_reward(rewards, num_envs),
+            "last_done": last_done,
+        }
 
     def _send_train_bootstrap(
         self,
@@ -1200,10 +1246,18 @@ class EnvWorker(Worker):
                         env_output.dones,
                     )
                     if not skip_rollout_send:
+                        rlt_stm_context = self._build_rlt_stm_context(
+                            rewards,
+                            env_output.dones,
+                            self.train_num_envs_per_stage,
+                        )
                         self.send_to(
                             group_name=self.cfg.rollout.group_name,
                             channel=rollout_channel,
-                            data=self._build_rollout_input_data(env_batch),
+                            data=self._build_rollout_input_data(
+                                env_batch,
+                                rlt_stm_context=rlt_stm_context,
+                            ),
                             mode="train",
                             tag="rollout_results",
                             route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1424,7 +1478,7 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
-                    env_output, env_info = self.env_evaluate_step(
+                    env_output, env_info, chunk_rewards, chunk_dones = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
 
@@ -1441,10 +1495,18 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
+                    rlt_stm_context = self._build_rlt_stm_context(
+                        chunk_rewards,
+                        chunk_dones,
+                        self.eval_num_envs_per_stage,
+                    )
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=self._build_rollout_input_data(
+                            env_batch,
+                            rlt_stm_context=rlt_stm_context,
+                        ),
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,

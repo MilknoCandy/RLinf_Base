@@ -21,11 +21,13 @@ from rlinf.algorithms.rlt.route import (
     SimulatorRLTRoute,
     build_rlt_route,
 )
+from rlinf.algorithms.rlt.stm import RLTSTMFIFO
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 
 __all__ = [
     "RLTRoute",
     "RLTRouteContext",
+    "RLTSTMFIFO",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
     "build_expert_model_config",
