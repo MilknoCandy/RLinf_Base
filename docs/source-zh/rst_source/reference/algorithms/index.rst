@@ -27,8 +27,6 @@
      - 面向离线 RL 的 Implicit Q-Learning。
    * - :doc:`Async PPO <async_ppo>`
      - 异步流水线化的 PPO。
-   * - :doc:`RLT + STM-FIFO <rlt_stm_fifo>`
-     - 带短期 RL-token 记忆的 RLT 第二阶段微调。
 
 .. toctree::
    :hidden:

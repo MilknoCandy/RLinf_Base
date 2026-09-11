@@ -28,8 +28,6 @@ notes for a supported RL algorithm.
      - Implicit Q-Learning for offline RL.
    * - :doc:`Async PPO <async_ppo>`
      - Asynchronous, pipelined PPO.
-   * - :doc:`RLT + STM-FIFO <rlt_stm_fifo>`
-     - RLT Stage-2 fine-tuning with a short-term RL-token memory.
 
 .. toctree::
    :hidden:
