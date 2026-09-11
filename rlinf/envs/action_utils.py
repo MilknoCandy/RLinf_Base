@@ -75,6 +75,7 @@ def prepare_actions_for_libero(
         SupportedModel.OPENVLA_OFT,
         SupportedModel.GR00T_N1D6,
         SupportedModel.GR00T_N1D7,
+        SupportedModel.COSMOS3,
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
@@ -173,7 +174,7 @@ def prepare_actions_for_robocasa(
 
     RoboCasa365 can override the env-side action schema via ``env.action_space``.
     The legacy RoboCasa path uses the named action-space mapping from
-    ``rlinf.envs.robocasa.utils``.
+    ``rlinf.envs.sim.robocasa.utils``.
     """
     action_space_cfg = {}
     if env_cfg is not None:
@@ -228,7 +229,7 @@ def prepare_actions_for_robocasa(
     # raw_chunk_actions shape: [num_chunks, 32]
     # Extract first action_dim (<=12) dimensions as valid action chunks
     # Then pad them to default actions to get (..., 12)-shaped action chunks for RobocasaEnv.step()
-    from rlinf.envs.robocasa.utils import (
+    from rlinf.envs.sim.robocasa.utils import (
         ROBOCASA_ALL_ACTION_DIM,
         ROBOCASA_DEFAULT_ACTION,
         get_action_ids,
@@ -405,7 +406,7 @@ def prepare_actions(
             action_dim=action_dim,
             action_space=policy,
         )
-    elif env_type == SupportedEnvType.REALWORLD:
+    elif env_type == SupportedEnvType.REAL:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.GENESIS:
         chunk_actions = prepare_actions_for_genesis(
@@ -428,6 +429,8 @@ def prepare_actions(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.DIFFUSION:
+        chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.POLARIS:
         chunk_actions = prepare_actions_for_polaris(
             raw_chunk_actions=raw_chunk_actions,
