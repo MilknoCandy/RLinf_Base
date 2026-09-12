@@ -1295,15 +1295,11 @@ class EnvWorker(Worker):
                         self.send_to(
                             group_name=self.cfg.rollout.group_name,
                             channel=rollout_channel,
-<<<<<<< HEAD
                             data=self._build_rollout_input_data(
                                 env_batch,
                                 rlt_stm_context=rlt_stm_context,
                             ),
-=======
-                            data=self._build_rollout_input_data(env_batch),
                             split_fn=self._obs_split_fn,
->>>>>>> be1b0a4ff04955c22a0f294f9149606392e0d4e5
                             mode="train",
                             tag="rollout_results",
                             route_key=stage_id if not self.env_decoupled_mode else None,
