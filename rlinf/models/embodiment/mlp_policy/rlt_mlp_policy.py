@@ -83,9 +83,15 @@ class RLTMLPPolicy(MLPPolicy):
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
+        dtype = self.backbone[0].weight.dtype
+        feature_keys = {"ref_chunk", "z_rl", "stm_memory", "proprio"}
         processed = {}
         for key, value in env_obs.items():
-            processed[key] = value.to(device) if torch.is_tensor(value) else value
+            if torch.is_tensor(value):
+                value = value.to(device=device)
+                if key in feature_keys and value.dtype != dtype:
+                    value = value.to(dtype=dtype)
+            processed[key] = value
         return processed
 
     @staticmethod
