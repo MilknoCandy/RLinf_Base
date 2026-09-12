@@ -992,7 +992,6 @@ class EnvWorker(Worker):
             data["rlt_stm_context"] = rlt_stm_context
         return data
 
-<<<<<<< HEAD
     def _rlt_stm_chunk_reward(
         self,
         rewards: torch.Tensor | None,
@@ -1029,7 +1028,7 @@ class EnvWorker(Worker):
             "last_reward": self._rlt_stm_chunk_reward(rewards, num_envs),
             "last_done": last_done,
         }
-=======
+    
     def _split_and_compress_obs(
         self, data: dict[str, Any], split_sizes: list[int]
     ) -> list[dict[str, Any]]:
@@ -1048,7 +1047,6 @@ class EnvWorker(Worker):
             compress_obs(shard, self.obs_compression_cfg)
             for shard in split_batch(data, split_sizes)
         ]
->>>>>>> be1b0a4ff04955c22a0f294f9149606392e0d4e5
 
     def _send_train_bootstrap(
         self,
