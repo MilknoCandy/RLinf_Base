@@ -94,6 +94,15 @@ class RLTMLPPolicy(MLPPolicy):
             processed[key] = value
         return processed
 
+    def _model_dtype(self) -> torch.dtype:
+        return self.backbone[0].weight.dtype
+
+    def _to_model_dtype(self, tensor: torch.Tensor) -> torch.Tensor:
+        dtype = self._model_dtype()
+        if tensor.dtype != dtype:
+            tensor = tensor.to(dtype=dtype)
+        return tensor
+
     @staticmethod
     def _flatten_batch(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() <= 2:
@@ -101,20 +110,24 @@ class RLTMLPPolicy(MLPPolicy):
         return tensor.reshape(tensor.shape[0], -1)
 
     def _get_z(self, obs: dict) -> torch.Tensor:
-        return self._flatten_batch(obs["z_rl"])
+        return self._to_model_dtype(self._flatten_batch(obs["z_rl"]))
 
     def _get_proprio(self, obs: dict) -> torch.Tensor:
-        return self._flatten_batch(obs["proprio"])
+        return self._to_model_dtype(self._flatten_batch(obs["proprio"]))
 
     def _get_stm_memory(self, obs: dict) -> torch.Tensor:
         if self.stm_memory_dim <= 0:
-            return torch.empty((obs["z_rl"].shape[0], 0), device=obs["z_rl"].device)
+            return torch.empty(
+                (obs["z_rl"].shape[0], 0),
+                device=obs["z_rl"].device,
+                dtype=self._model_dtype(),
+            )
         memory = obs.get("stm_memory")
         if memory is None:
             return torch.zeros(
                 (obs["z_rl"].shape[0], self.stm_memory_dim),
                 device=obs["z_rl"].device,
-                dtype=obs["z_rl"].dtype,
+                dtype=self._model_dtype(),
             )
         memory = self._flatten_batch(memory)
         if memory.shape[-1] != self.stm_memory_dim:
@@ -122,14 +135,15 @@ class RLTMLPPolicy(MLPPolicy):
                 "stm_memory shape does not match the configured "
                 f"stm_memory_dim={self.stm_memory_dim}, got {memory.shape}."
             )
-        return memory
+        return self._to_model_dtype(memory)
 
     def _get_ref_chunk(self, obs: dict) -> torch.Tensor:
         ref_chunk = self._flatten_batch(obs["ref_chunk"]).reshape(
             obs["ref_chunk"].shape[0], -1, self.step_action_dim
         )
         ref_chunk = ref_chunk[:, : self.chunk_len]
-        return ref_chunk.reshape(ref_chunk.shape[0], -1)
+        ref_chunk = ref_chunk.reshape(ref_chunk.shape[0], -1)
+        return self._to_model_dtype(ref_chunk)
 
     def _maybe_drop_reference(
         self,
@@ -198,9 +212,10 @@ class RLTMLPPolicy(MLPPolicy):
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
         del shared_feature
         critic_state = self._critic_state(obs)
+        actions = self._to_model_dtype(self._flatten_batch(actions))
         if detach_encoder:
             critic_state = critic_state.detach()
-        return self.q_head(critic_state, self._flatten_batch(actions))
+        return self.q_head(critic_state, actions)
 
     def crossq_q_forward(
         self,
@@ -216,17 +231,21 @@ class RLTMLPPolicy(MLPPolicy):
         next_critic_state = (
             self._critic_state(next_obs) if next_obs is not None else None
         )
+        actions = self._to_model_dtype(self._flatten_batch(actions))
+        next_actions = (
+            self._to_model_dtype(self._flatten_batch(next_actions))
+            if next_actions is not None
+            else None
+        )
         if detach_encoder:
             critic_state = critic_state.detach()
             if next_critic_state is not None:
                 next_critic_state = next_critic_state.detach()
         return self.q_head(
             critic_state,
-            self._flatten_batch(actions),
+            actions,
             next_state_features=next_critic_state,
-            next_action_features=(
-                self._flatten_batch(next_actions) if next_actions is not None else None
-            ),
+            next_action_features=next_actions,
         )
 
     def crossq_forward(self, obs, **kwargs):
