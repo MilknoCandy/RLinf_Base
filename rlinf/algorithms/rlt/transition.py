@@ -21,7 +21,9 @@ from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
 RLT_TRANSITION_PREFIX = "rlt_transition_"
-RLT_STM_KEY = "stm_memory"
+RLT_STM_HISTORY_KEY = "stm_history"
+RLT_STM_HISTORY_MASK_KEY = "stm_history_mask"
+RLT_STM_KEYS = (RLT_STM_HISTORY_KEY, RLT_STM_HISTORY_MASK_KEY)
 
 
 def use_simulator_transition_replay(cfg: Any) -> bool:
@@ -47,8 +49,9 @@ def extract_rlt_obs_from_forward_inputs(
 ) -> dict[str, Any]:
     prefix = RLT_TRANSITION_PREFIX if transition else ""
     keys = list(RLT_OBS_KEYS)
-    if f"{prefix}{RLT_STM_KEY}" in forward_inputs:
-        keys.append(RLT_STM_KEY)
+    for key in RLT_STM_KEYS:
+        if f"{prefix}{key}" in forward_inputs:
+            keys.append(key)
     missing = [f"{prefix}{key}" for key in keys if f"{prefix}{key}" not in forward_inputs]
     if missing:
         raise ValueError(

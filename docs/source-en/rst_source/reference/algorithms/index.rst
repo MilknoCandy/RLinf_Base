@@ -41,4 +41,3 @@ notes for a supported RL algorithm.
    RLPD <rlpd>
    IQL <iql>
    Async PPO <async_ppo>
-   RLT + STM-FIFO <rlt_stm_fifo>

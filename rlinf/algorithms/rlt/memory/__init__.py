@@ -12,26 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from rlinf.algorithms.expert import build_expert_model_config
-from rlinf.algorithms.rlt.memory import STMBuffer
-from rlinf.algorithms.rlt.rollout import predict_rlt_actions
-from rlinf.algorithms.rlt.route import (
-    RealworldRLTRoute,
-    RLTRoute,
-    RLTRouteContext,
-    SimulatorRLTRoute,
-    build_rlt_route,
-)
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.memory.buffer import STMBuffer, memory_entry_dim
+from rlinf.algorithms.rlt.memory.encoder import GRUMemoryEncoder
+from rlinf.algorithms.rlt.memory.fusion import ResidualMemoryFusion
+from rlinf.algorithms.rlt.memory.module import RLTSTMModule, build_memory_module
 
 __all__ = [
-    "RLTRoute",
-    "RLTRouteContext",
+    "GRUMemoryEncoder",
+    "RLTSTMModule",
+    "ResidualMemoryFusion",
     "STMBuffer",
-    "RealworldRLTRoute",
-    "SimulatorRLTRoute",
-    "build_expert_model_config",
-    "build_rlt_route",
-    "predict_rlt_actions",
-    "use_simulator_transition_replay",
+    "build_memory_module",
+    "memory_entry_dim",
 ]

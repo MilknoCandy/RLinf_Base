@@ -25,10 +25,10 @@ from tqdm import tqdm
 
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
+    STMBuffer,
     build_rlt_route,
     predict_rlt_actions,
 )
-from rlinf.algorithms.rlt.stm import RLTSTMFIFO
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -82,10 +82,10 @@ class MultiStepRolloutWorker(Worker):
         self.rlt_feature_model = None
         self.rlt_route = None
         self.rlt_stm_cfg = OmegaConf.select(
-            cfg, "algorithm.rlt_stm", default=None
+            cfg, "algorithm.memory", default=None
         )
         self.rlt_stm_enabled = bool(
-            OmegaConf.select(cfg, "algorithm.rlt_stm.enable", default=False)
+            OmegaConf.select(cfg, "algorithm.memory.enabled", default=False)
         )
         self._rlt_stm_train = None
         self._rlt_stm_eval = None
@@ -168,20 +168,29 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
             if self.rlt_stm_enabled:
-                stm_capacity = int(self.rlt_stm_cfg.get("capacity", 4))
+                stm_window = int(self.rlt_stm_cfg.get("window_size", 8))
+                stm_entry_cfg = OmegaConf.to_container(
+                    self.rlt_stm_cfg.get("entry", {}),
+                    resolve=True,
+                )
+                stm_retrieval = str(self.rlt_stm_cfg.get("retrieval", "recent"))
                 stm_z_dim = int(self.model_cfg.z_dim)
                 stm_action_dim = int(self.model_cfg.action_dim) * int(
                     self.model_cfg.num_action_chunks
                 )
-                self._rlt_stm_train = RLTSTMFIFO(
-                    capacity=stm_capacity,
+                self._rlt_stm_train = STMBuffer(
+                    window_size=stm_window,
                     z_dim=stm_z_dim,
                     action_dim=stm_action_dim,
+                    entry_cfg=stm_entry_cfg,
+                    retrieval=stm_retrieval,
                 )
-                self._rlt_stm_eval = RLTSTMFIFO(
-                    capacity=stm_capacity,
+                self._rlt_stm_eval = STMBuffer(
+                    window_size=stm_window,
                     z_dim=stm_z_dim,
                     action_dim=stm_action_dim,
+                    entry_cfg=stm_entry_cfg,
+                    retrieval=stm_retrieval,
                 )
 
         if self.cfg.rollout.get("expert_model", None) and not self.enable_opd:

@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
+from rlinf.algorithms.rlt.memory import build_memory_module
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
 
@@ -37,7 +38,7 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
-        stm_memory_dim: int = 0,
+        memory_config: dict | None = None,
     ):
         if not add_q_head:
             raise ValueError(
@@ -56,10 +57,9 @@ class RLTMLPPolicy(MLPPolicy):
                 f"{ref_chunk_len} < {chunk_len}."
             )
         flat_action_dim = chunk_len * step_action_dim
-        stm_memory_dim = int(stm_memory_dim or 0)
 
-        actor_obs_dim = z_dim + proprio_dim + flat_action_dim + stm_memory_dim
-        critic_obs_dim = z_dim + proprio_dim + stm_memory_dim
+        actor_obs_dim = z_dim + proprio_dim + flat_action_dim
+        critic_obs_dim = z_dim + proprio_dim
 
         super().__init__(
             obs_dim=actor_obs_dim,
@@ -76,7 +76,11 @@ class RLTMLPPolicy(MLPPolicy):
         self.chunk_len = chunk_len
         self.ref_chunk_len = ref_chunk_len
         self.flat_action_dim = flat_action_dim
-        self.stm_memory_dim = stm_memory_dim
+        self.memory = build_memory_module(
+            memory_config,
+            z_dim=z_dim,
+            action_dim=flat_action_dim,
+        )
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
@@ -84,7 +88,7 @@ class RLTMLPPolicy(MLPPolicy):
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
         dtype = self.backbone[0].weight.dtype
-        feature_keys = {"ref_chunk", "z_rl", "stm_memory", "proprio"}
+        feature_keys = {"ref_chunk", "z_rl", "stm_history", "proprio"}
         processed = {}
         for key, value in env_obs.items():
             if torch.is_tensor(value):
@@ -115,27 +119,21 @@ class RLTMLPPolicy(MLPPolicy):
     def _get_proprio(self, obs: dict) -> torch.Tensor:
         return self._to_model_dtype(self._flatten_batch(obs["proprio"]))
 
-    def _get_stm_memory(self, obs: dict) -> torch.Tensor:
-        if self.stm_memory_dim <= 0:
-            return torch.empty(
-                (obs["z_rl"].shape[0], 0),
-                device=obs["z_rl"].device,
-                dtype=self._model_dtype(),
-            )
-        memory = obs.get("stm_memory")
-        if memory is None:
-            return torch.zeros(
-                (obs["z_rl"].shape[0], self.stm_memory_dim),
-                device=obs["z_rl"].device,
-                dtype=self._model_dtype(),
-            )
-        memory = self._flatten_batch(memory)
-        if memory.shape[-1] != self.stm_memory_dim:
-            raise ValueError(
-                "stm_memory shape does not match the configured "
-                f"stm_memory_dim={self.stm_memory_dim}, got {memory.shape}."
-            )
-        return self._to_model_dtype(memory)
+    def _get_stm_history(self, obs: dict) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.memory is None:
+            return None, None
+        history = obs.get("stm_history")
+        mask = obs.get("stm_history_mask")
+        if history is None or mask is None:
+            return None, None
+        return self._to_model_dtype(history), mask
+
+    def _get_z_fused(self, obs: dict) -> torch.Tensor:
+        z_t = self._get_z(obs)
+        if self.memory is None:
+            return z_t
+        history, mask = self._get_stm_history(obs)
+        return self.memory(z_t, history, mask)
 
     def _get_ref_chunk(self, obs: dict) -> torch.Tensor:
         ref_chunk = self._flatten_batch(obs["ref_chunk"]).reshape(
@@ -171,8 +169,7 @@ class RLTMLPPolicy(MLPPolicy):
         return torch.cat(
             [
                 ref_chunk,
-                self._get_z(obs),
-                self._get_stm_memory(obs),
+                self._get_z_fused(obs),
                 self._get_proprio(obs),
             ],
             dim=-1,
@@ -180,7 +177,7 @@ class RLTMLPPolicy(MLPPolicy):
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
         return torch.cat(
-            [self._get_z(obs), self._get_stm_memory(obs), self._get_proprio(obs)],
+            [self._get_z_fused(obs), self._get_proprio(obs)],
             dim=-1,
         )
 

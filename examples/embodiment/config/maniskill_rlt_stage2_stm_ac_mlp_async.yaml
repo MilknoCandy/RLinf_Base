@@ -24,15 +24,16 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stm_fifo_stage2_ac_mlp"
+    experiment_name: "maniskill_rlt_stage2_stm_ac_mlp_async"
     logger_backends: ["wandb"]
 
-  max_epochs: 3000
+  max_epochs: 5000
   max_steps: -1
   only_eval: False
   weight_sync_interval: 1
-  val_check_interval: 100
-  save_interval: 100
+  use_training_pipeline: False
+  val_check_interval: 25
+  save_interval: 50
   resume_dir: null
   ckpt_path: null
 
@@ -51,12 +52,24 @@ algorithm:
   loss_type: rlt_ac
   loss_agg_func: "token-mean"
 
-  # Phase-1 short-term memory: a fixed per-env FIFO over recent RL-token
-  # experiences. The reader pools z_rl and chunk reward and appends the pooled
-  # vector to the Stage-2 actor/critic input.
-  rlt_stm:
-    enable: True
-    capacity: 4
+  # Step 2A fixed short-term memory. The VLM/RLT representation and RL token
+  # encoder stay frozen; only the GRU memory encoder and residual projection
+  # are trained together with the Stage-2 actor/critic.
+  memory:
+    enabled: True
+    type: stm
+    window_size: 8
+    entry:
+      token: True
+      action: True
+      reward: True
+    retrieval: recent   # recent | shuffled | random
+    encoder:
+      type: gru
+      hidden_dim: 256
+    fusion:
+      type: residual
+      memory_proj_dim: 256
 
   agg_q: min
   actor_agg_q: q1
@@ -246,7 +259,7 @@ rollout:
     add_q_head: ${actor.model.add_q_head}
     q_head_type: ${actor.model.q_head_type}
     fixed_std: ${actor.model.fixed_std}
-    stm_memory_dim: ${actor.model.stm_memory_dim}
+    memory: ${algorithm.memory}
     is_lora: False
     lora_rank: 32
 
@@ -331,6 +344,7 @@ actor:
   global_batch_size: 512
   seed: 1234
   enable_offload: False
+  sync_weight_no_wait: True
 
   model:
     model_type: "rlt_mlp_policy"
@@ -346,8 +360,7 @@ actor:
     add_q_head: True
     q_head_type: "default"
     fixed_std: 0.002
-    # z_dim(2048) + mean_reward(1) + last_reward(1).
-    stm_memory_dim: 2050
+    memory: ${algorithm.memory}
     is_lora: False
     lora_rank: 32
 

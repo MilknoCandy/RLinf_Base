@@ -89,7 +89,7 @@ class EnvWorker(Worker):
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
         self.rlt_stm_enabled = self.enable_rlt and bool(
-            OmegaConf.select(self.cfg, "algorithm.rlt_stm.enable", default=False)
+            OmegaConf.select(self.cfg, "algorithm.memory.enabled", default=False)
         )
         # Optional lossless compression of image observations before they are
         # sent to the rollout workers. Disabled unless `env.obs_compression`
@@ -1288,7 +1288,7 @@ class EnvWorker(Worker):
                     )
                     if not skip_rollout_send:
                         rlt_stm_context = self._build_rlt_stm_context(
-                            rewards,
+                            env_output.rewards,
                             env_output.dones,
                             self.train_num_envs_per_stage,
                         )
@@ -1546,7 +1546,10 @@ class EnvWorker(Worker):
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=self._build_rollout_input_data(
+                            env_batch,
+                            rlt_stm_context=rlt_stm_context,
+                        ),
                         split_fn=self._obs_split_fn,
                         mode="eval",
                         tag="rollout_results",
