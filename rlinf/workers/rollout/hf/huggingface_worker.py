@@ -164,6 +164,12 @@ class MultiStepRolloutWorker(Worker):
         )
         if rlt_feature_model_config is not None:
             self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
+            # Legacy ``openpi`` keeps normalization layers in fp32 through
+            # ``to_bfloat16_for_selected_params``, while ``extract_rlt_obs`` feeds
+            # the vision tower and language model bf16 inputs. The RLT feature
+            # model is frozen and inference-only, so cast it fully to bf16.
+            if str(rlt_feature_model_config.get("model_type", "")) == "openpi":
+                self.rlt_feature_model.to(torch.bfloat16)
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
