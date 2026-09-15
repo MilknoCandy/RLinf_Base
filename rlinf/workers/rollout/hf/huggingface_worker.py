@@ -26,7 +26,9 @@ from tqdm import tqdm
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
     A1ShortTermMemory,
+    A21ContextBuffer,
     build_a1_stm_config,
+    build_a21_context_config,
     build_rlt_route,
     predict_rlt_actions,
 )
@@ -85,6 +87,8 @@ class MultiStepRolloutWorker(Worker):
         # Keyed by (mode, stage_id) so async train generate and evaluate never
         # share pending windows / _num_envs across different batch sizes.
         self.a1_stm_by_mode_stage: dict[tuple[str, int], A1ShortTermMemory] = {}
+        self.a21_context_config = build_a21_context_config(cfg)
+        self.a21_context_by_mode_stage: dict[tuple[str, int], A21ContextBuffer] = {}
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -170,6 +174,24 @@ class MultiStepRolloutWorker(Worker):
                 )
             self.a1_stm_by_mode_stage = {
                 (mode, stage_id): A1ShortTermMemory(self.a1_stm_config)
+                for mode in ("train", "eval")
+                for stage_id in range(self.num_pipeline_stages)
+            }
+
+        if self.a21_context_config.enable:
+            if self.rlt_feature_model is None:
+                raise ValueError(
+                    "algorithm.a21_context.enable=True requires "
+                    "rollout.rlt_feature_model."
+                )
+            if getattr(self.hf_model, "context_dim", 0) <= 0:
+                raise ValueError(
+                    "algorithm.a21_context.enable=True requires actor/rollout "
+                    "model.a21_context (via ${algorithm.a21_context}) so "
+                    "RLTMLPPolicy is constructed with matching input dims."
+                )
+            self.a21_context_by_mode_stage = {
+                (mode, stage_id): A21ContextBuffer(self.a21_context_config)
                 for mode in ("train", "eval")
                 for stage_id in range(self.num_pipeline_stages)
             }
@@ -583,6 +605,18 @@ class MultiStepRolloutWorker(Worker):
         resolved_stage = 0 if stage_id is None else int(stage_id)
         return self.a1_stm_by_mode_stage.get((mode, resolved_stage))
 
+    def _get_a21_context(
+        self,
+        stage_id: int | None,
+        mode: Literal["train", "eval"] = "train",
+    ) -> A21ContextBuffer | None:
+        if not self.a21_context_config.enable:
+            return None
+        if not self.a21_context_by_mode_stage:
+            return None
+        resolved_stage = 0 if stage_id is None else int(stage_id)
+        return self.a21_context_by_mode_stage.get((mode, resolved_stage))
+
     def pop_a1_stm_metrics(self) -> dict[str, float]:
         """Flush train-mode STM accumulators into one rank-level metric dict."""
         if not self.a1_stm_by_mode_stage:
@@ -633,6 +667,7 @@ class MultiStepRolloutWorker(Worker):
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
                 a1_stm=self._get_a1_stm(stage_id, mode=mode),
+                a21_context=self._get_a21_context(stage_id, mode=mode),
                 dones=dones,
                 rewards=rewards,
                 success=success,

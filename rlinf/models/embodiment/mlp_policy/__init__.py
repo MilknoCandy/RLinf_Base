@@ -17,10 +17,24 @@ from omegaconf import DictConfig
 
 
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
+    from rlinf.algorithms.rlt.a21_context import A21ContextConfig
     from rlinf.models.embodiment.mlp_policy.iql_mlp_policy import IQLMLPPolicy
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
+
+    def _build_a21_from_model_cfg(model_cfg: DictConfig) -> A21ContextConfig | None:
+        block = model_cfg.get("a21_context", None)
+        if block is None or not bool(block.get("enable", False)):
+            return None
+        action_dim = int(model_cfg.action_dim)
+        num_chunks = int(model_cfg.num_action_chunks)
+        return A21ContextConfig(
+            enable=True,
+            ctx_len=int(block.get("ctx_len", 8)),
+            z_dim=int(model_cfg.z_dim),
+            action_dim=int(block.get("action_dim", action_dim * num_chunks)),
+        )
 
     iql_config = cfg.get("iql_config", None)
     if cfg.model_type == "rlt_mlp_policy":
@@ -35,6 +49,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+            a21_context_config=_build_a21_from_model_cfg(cfg),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

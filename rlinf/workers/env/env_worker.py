@@ -84,6 +84,12 @@ class EnvWorker(Worker):
         self.enable_a1_stm = bool(
             OmegaConf.select(self.cfg, "algorithm.a1_stm.enable", default=False)
         )
+        self.enable_a21_context = bool(
+            OmegaConf.select(self.cfg, "algorithm.a21_context.enable", default=False)
+        )
+        self.enable_a22_memory = bool(
+            OmegaConf.select(self.cfg, "algorithm.a22_memory.enable", default=False)
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -980,7 +986,7 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
-        if self.enable_a1_stm:
+        if self.enable_a1_stm or self.enable_a21_context or self.enable_a22_memory:
             data["dones"] = env_batch.get("dones", None)
             data["rewards"] = env_batch.get("rewards", None)
             data["success"] = self._extract_a1_stm_success(env_batch)

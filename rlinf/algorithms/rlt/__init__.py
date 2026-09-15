@@ -18,6 +18,17 @@ from rlinf.algorithms.rlt.a1_stm import (
     A1STMConfig,
     build_a1_stm_config,
 )
+from rlinf.algorithms.rlt.a21_context import (
+    A21ContextBuffer,
+    A21ContextConfig,
+    build_a21_context_config,
+)
+from rlinf.algorithms.rlt.a22_memory import (
+    A22MemoryBank,
+    A22MemoryConfig,
+    build_a22_memory_config,
+    compute_a22_memory_loss,
+)
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
@@ -31,13 +42,20 @@ from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 __all__ = [
     "A1STMConfig",
     "A1ShortTermMemory",
+    "A21ContextBuffer",
+    "A21ContextConfig",
+    "A22MemoryBank",
+    "A22MemoryConfig",
     "RLTRoute",
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
     "build_a1_stm_config",
+    "build_a21_context_config",
+    "build_a22_memory_config",
     "build_expert_model_config",
     "build_rlt_route",
+    "compute_a22_memory_loss",
     "predict_rlt_actions",
     "use_simulator_transition_replay",
 ]

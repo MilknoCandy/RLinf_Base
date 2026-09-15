@@ -18,6 +18,11 @@ import queue
 import torch
 import torch.nn.functional as F
 
+from rlinf.algorithms.rlt.a22_memory import (
+    A22MemoryBank,
+    build_a22_memory_config,
+    compute_a22_memory_loss,
+)
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -365,6 +370,29 @@ class RLTACLossMixin:
         metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
 
+        # A22: advantage-weighted memory loss with detached Q(z, pi) baseline.
+        a22_bank = getattr(self, "a22_memory_bank", None)
+        a22_cfg = getattr(self, "a22_memory_config", None)
+        if (
+            a22_bank is not None
+            and a22_cfg is not None
+            and a22_cfg.enable
+            and a22_bank.memory_size > 0
+        ):
+            lm_loss, lm_metrics = compute_a22_memory_loss(
+                policy_model=self.model,
+                obs=curr_obs,
+                bank=a22_bank,
+                q_baseline=qf_pi.detach(),
+                fixed_std=float(getattr(self.model, "fixed_std", 0.002)),
+            )
+            actor_loss = actor_loss + float(a22_cfg.lambda_m) * lm_loss
+            metrics.update(lm_metrics)
+            metrics["a22_memory/lambda_m"] = float(a22_cfg.lambda_m)
+            metrics["a22_memory/weighted_lm"] = float(
+                (float(a22_cfg.lambda_m) * lm_loss).detach().item()
+            )
+
         return actor_loss, entropy, metrics
 
     @Worker.timer("forward_alpha")
@@ -378,6 +406,79 @@ class RLTACLossMixin:
 
 class RLTACReplayMixin:
     """Shared rollout-to-replay ingestion for sync and async RLT AC workers."""
+
+    def _setup_a22_memory(self) -> None:
+        self.a22_memory_config = build_a22_memory_config(self.cfg)
+        self.a22_memory_bank: A22MemoryBank | None = None
+        if self.a22_memory_config.enable:
+            self.a22_memory_bank = A22MemoryBank(self.a22_memory_config)
+
+    def _ingest_a22_from_raw_trajectories(self, recv_list: list[Trajectory]) -> None:
+        """Commit E1∪E2 memory entries after each completed episode (MC-RTG)."""
+        bank = getattr(self, "a22_memory_bank", None)
+        if bank is None:
+            return
+        for trajectory in recv_list:
+            if (
+                trajectory.actions is None
+                or trajectory.rewards is None
+                or trajectory.dones is None
+                or not trajectory.curr_obs
+                or "z_rl" not in trajectory.curr_obs
+            ):
+                continue
+            actions = trajectory.actions
+            rewards = trajectory.rewards
+            dones = trajectory.dones
+            z_all = trajectory.curr_obs["z_rl"]
+            # Expected shapes: actions/rewards/z [T, B, ...], dones [T+1, B, ...]
+            if actions.ndim < 2 or z_all.ndim < 2:
+                continue
+            traj_len = int(actions.shape[0])
+            bsz = int(actions.shape[1])
+            critical = None
+            if isinstance(trajectory.forward_inputs, dict):
+                critical = trajectory.forward_inputs.get("rlt_switch_flags")
+
+            for env_idx in range(bsz):
+                # Split by done boundaries within this env's time series.
+                # dones has an extra leading slot; transition t uses dones[t+1].
+                done_flags = []
+                for t in range(traj_len):
+                    done_idx = min(t + 1, int(dones.shape[0]) - 1)
+                    flag = dones[done_idx, env_idx]
+                    if isinstance(flag, torch.Tensor):
+                        flag = bool(flag.reshape(-1).to(torch.bool).any().item())
+                    else:
+                        flag = bool(flag)
+                    done_flags.append(flag)
+
+                start = 0
+                for t, is_done in enumerate(done_flags):
+                    if not is_done:
+                        continue
+                    end = t + 1  # inclusive end index for slice [start, end)
+                    z_seq = z_all[start:end, env_idx]
+                    a_seq = actions[start:end, env_idx]
+                    r_seq = rewards[start:end, env_idx]
+                    crit_seq = None
+                    if isinstance(critical, torch.Tensor) and critical.shape[0] >= end:
+                        crit_seq = critical[start:end, env_idx]
+                        if crit_seq.ndim > 1:
+                            crit_seq = crit_seq.reshape(crit_seq.shape[0], -1).any(
+                                dim=-1
+                            )
+                    success = bool(
+                        r_seq.detach().float().reshape(-1).sum().item() > 0.0
+                    )
+                    bank.commit_episode(
+                        z_seq=z_seq,
+                        a_seq=a_seq,
+                        r_seq=r_seq,
+                        critical_mask=crit_seq,
+                        success=success,
+                    )
+                    start = end
 
     @staticmethod
     def _trajectory_transition_count(traj: Trajectory) -> int:
@@ -610,6 +711,7 @@ class RLTACReplayMixin:
         recv_list: list[Trajectory],
     ) -> tuple[int, int]:
         self._last_replay_metrics = {}
+        self._ingest_a22_from_raw_trajectories(recv_list)
 
         if use_simulator_transition_replay(self.cfg):
             replay_list = []
@@ -687,6 +789,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
+        self._setup_a22_memory()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
 
@@ -882,6 +985,9 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         mean_metric_dict = self.process_train_metrics(metrics)
         self.transitions_since_train = 0
         self.episodes_since_train = 0
+        bank = getattr(self, "a22_memory_bank", None)
+        if bank is not None:
+            mean_metric_dict = {**mean_metric_dict, **bank.pop_write_metrics()}
 
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -991,4 +1097,7 @@ class AsyncRLTACFSDPPolicy(RLTACFSDPPolicy, AsyncEmbodiedSACFSDPPolicy):
         replay_metrics = getattr(self, "_last_replay_metrics", {})
         if replay_metrics:
             mean_metric_dict = {**mean_metric_dict, **replay_metrics}
+        bank = getattr(self, "a22_memory_bank", None)
+        if bank is not None:
+            mean_metric_dict = {**mean_metric_dict, **bank.pop_write_metrics()}
         return mean_metric_dict
