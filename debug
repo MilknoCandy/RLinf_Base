@@ -1,0 +1,45 @@
+  报错原因
+
+  一句话：async 模式下，train 生成后台任务与 eval 协程在同一个 rollout worker 上并发共享同一个 
+  A1ShortTermMemory 实例，而两者每 rank 的 batch 大小不同；finalize_pending 用上一次调用注册的
+  _num_envs 去 reshape 本次传入的 dones，phase 切换时尺寸不匹配即崩溃。
+
+  因果链（结合代码与 traceback）：
+
+  1. STM 实例只按 stage_id 建一份（huggingface_worker.py 
+     (rlinf/workers/rollout/hf/huggingface_worker.py) 第 169-172 行），pipeline_stage_num=1
+     时每 rank 全局唯一，train/eval 共用。
+
+  2. async runner 中 rollout.generate() 启动的后台任务永久循环
+     generate_one_epoch（async_huggingface_worker.py 
+     (rlinf/workers/rollout/hf/async_huggingface_worker.py) 第 72-78 行）；到达
+     val_check_interval 时，evaluate() 在同一 worker 上并发调用
+     rollout.evaluate()（async_embodied_runner.py (rlinf/runners/async_embodied_runner.py) 第 
+     149 行），train 任务并不暂停。
+
+  3. STM 的尺寸注册逻辑（a1_stm.py (rlinf/algorithms/rlt/a1_stm.py)）：
+    • _ensure_num_envs 只在 enhance/set_pending 中被调用，按当前 batch 重建全部状态（第
+      191-216 行）；
+    • finalize_pending 却用上一次注册的 self._num_envs 去 reshape 本次的 dones（第 278 行 → 第
+      229 行）。
+
+  4. 实际交错时序（与你的报错完全吻合）：
+    • train 调用：_num_envs=12（你部署配置的 train 每 rank batch，如 total_num_envs=96/8
+      卡）；
+    • eval 开始（日志中 Evaluating Rollout Epochs: 0/1）：eval 调用 mode="eval" →
+      allow_write=False，finalize_pending 提前返回不报错，但 enhance(z<16>) 把 _num_envs
+      重建为 16（eval 每 rank batch，如 eval 128/8），同时 set_pending 置
+      _pending_valid=True；
+    • train 任务下一个 chunk step：finalize_pending(dones<12个元素>, allow_write=True) →
+      _as_bool_mask(dones, 16) → reshape(16) 作用于 12 个元素 → RuntimeError: shape '[16]' is 
+      invalid for input of size 12。
+
+  这也解释了为何恰好在首次 eval 启动时崩溃：那是整个运行中第一次出现不同 batch 尺寸。
+
+  同根源的另外两个隐患（即使绕过崩溃也存在）
+
+  1. 状态被静默清空：每次 eval 的 enhance 都会重建 _num_envs，train 积累的 STM 窗口/pending
+     被无声销毁。
+  2. 跨 phase 污染：eval 的 set_pending 置位后，下一个 train 的
+     finalize_pending（allow_write=True）会把 eval 的 z 写入 train 窗口、并拿 train 的 dones
+     做 consolidate；且 train/eval 的 env 索引语义完全不同。
