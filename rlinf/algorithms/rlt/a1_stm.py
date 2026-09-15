@@ -228,6 +228,13 @@ class A1ShortTermMemory:
             out = out.reshape(out.shape[0], -1).any(dim=-1)
         return out.to(dtype=torch.bool).reshape(batch_size)
 
+    def _batch_size_of(
+        self, mask: torch.Tensor | None, fallback: int
+    ) -> int:
+        if mask is None:
+            return int(fallback)
+        return int(mask.shape[0])
+
     def finalize_pending(
         self,
         *,
@@ -239,6 +246,13 @@ class A1ShortTermMemory:
         """Commit the previous-step pending entries, then consolidate finished envs."""
         if not self.enabled or self._pending_valid is None or self._window_z is None:
             return
+
+        # Guard against train/eval (or any) batch-size mismatch on a shared worker.
+        feedback_batch = self._batch_size_of(dones, self._num_envs)
+        if feedback_batch != self._num_envs:
+            self._pending_valid.zero_()
+            return
+
         if not bool(self._pending_valid.any()):
             # Still honor done consolidation if pending was empty.
             if dones is not None and allow_write:

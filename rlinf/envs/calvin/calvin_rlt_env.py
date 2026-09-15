@@ -14,17 +14,14 @@
 
 """CALVIN RLT environment with actor/reference switching.
 
-The initial CALVIN RLT adapter keeps switching simple: it uses an
-``always_on`` RLT actor switch. This is enough to validate the RLT
-actor-critic path on CALVIN without adding per-subtask phase detection.
-``current_task_idx`` / ``subtask_success`` are already available inside
-``CalvinEnv`` and can be used later to implement task-aware switching.
+Supports:
+- ``trigger_mode: always_on`` — RLT actor for the full episode (ablation/smoke).
+- ``trigger_mode: auto`` — enter the RLT actor once ``current_task_idx`` reaches
+  ``auto_gate.min_task_idx`` (option A: index-gated critical phase), matching
+  the original RLT design of refining only the hard phase while the frozen VLA
+  handles earlier subtasks via ``ref_chunk``.
 
-For the history-injection experiment, ``history_len > 0`` appends the
-previous ``history_len`` pairs of ``(proprio, action)`` to the ``states``
-vector. Because the ``openpi`` RLT feature model returns the raw configured
-state as ``proprio``, the Stage2 actor sees this enlarged state without
-changing the VLA prefix/action code path.
+``latch_until_done`` keeps the actor switch on until episode reset.
 """
 
 from __future__ import annotations
@@ -38,7 +35,12 @@ from rlinf.envs.calvin.calvin_gym_env import CalvinEnv
 
 
 class CalvinRLTEnv(CalvinEnv):
-    """CALVIN env exposing RLT switch flags and optional history state."""
+    """CALVIN env exposing RLT switch flags for Stage 2 rollout."""
+
+    _RLT_FULL_TASK = "full_task"
+    _RLT_CRITICAL_PHASE = "critical_phase"
+    _RLT_ALWAYS_ON_TRIGGER = "always_on"
+    _RLT_AUTO_TRIGGER = "auto"
 
     def __init__(
         self,
@@ -57,20 +59,10 @@ class CalvinRLTEnv(CalvinEnv):
             worker_info,
         )
         self.record_metrics = record_metrics
-        self.history_len = int(getattr(cfg, "history_len", 0) or 0)
         self._rlt_switch_cfg = getattr(cfg, "rlt_policy_switch", None)
-
         self._rlt_switch_state: dict[str, torch.Tensor] | None = None
-        self._history_proprio: torch.Tensor | None = None
-        self._history_actions: torch.Tensor | None = None
-        self._history_pos: torch.Tensor | None = None
-
         self._init_rlt_switch()
-        self._init_history()
 
-    # ------------------------------------------------------------------
-    # RLT switching
-    # ------------------------------------------------------------------
     def _rlt_switch_enabled(self) -> bool:
         return self._rlt_switch_cfg is not None and bool(
             self._rlt_switch_cfg.get("enable", False)
@@ -79,120 +71,136 @@ class CalvinRLTEnv(CalvinEnv):
     def _init_rlt_switch(self) -> None:
         if not self._rlt_switch_enabled():
             return
-        self._rlt_switch_state = {
-            "rlt_switch_flags": torch.ones(
-                (self.num_envs,), dtype=torch.bool
+
+        task_mode = str(self._rlt_switch_cfg.get("task_mode", self._RLT_FULL_TASK))
+        trigger_mode = str(
+            self._rlt_switch_cfg.get("trigger_mode", self._RLT_AUTO_TRIGGER)
+        )
+        if task_mode not in {self._RLT_FULL_TASK, self._RLT_CRITICAL_PHASE}:
+            raise ValueError(
+                "CALVIN RLT task_mode must be 'full_task' or 'critical_phase', "
+                f"got {task_mode!r}."
+            )
+        if trigger_mode not in {
+            self._RLT_ALWAYS_ON_TRIGGER,
+            self._RLT_AUTO_TRIGGER,
+        }:
+            raise ValueError(
+                "CALVIN RLT trigger_mode must be 'always_on' or 'auto', "
+                f"got {trigger_mode!r}."
+            )
+        if trigger_mode == self._RLT_AUTO_TRIGGER:
+            auto_gate = self._rlt_switch_cfg.get("auto_gate", {}) or {}
+            min_task_idx = int(auto_gate.get("min_task_idx", 2))
+            if min_task_idx < 0:
+                raise ValueError(
+                    "CALVIN RLT auto_gate.min_task_idx must be >= 0, "
+                    f"got {min_task_idx}."
+                )
+
+        self._rlt_switch_state = self._init_rlt_switch_state(self.num_envs)
+
+    def _init_rlt_switch_state(self, batch_size: int) -> dict[str, torch.Tensor]:
+        task_mode = str(self._rlt_switch_cfg.get("task_mode", self._RLT_FULL_TASK))
+        trigger_mode = str(
+            self._rlt_switch_cfg.get("trigger_mode", self._RLT_AUTO_TRIGGER)
+        )
+        start_active = (
+            task_mode == self._RLT_CRITICAL_PHASE
+            or trigger_mode == self._RLT_ALWAYS_ON_TRIGGER
+        )
+        return {
+            "rlt_switch_flags": torch.full(
+                (batch_size,),
+                start_active,
+                dtype=torch.bool,
             ),
         }
 
+    def _reset_rlt_switch(self, env_idx: Optional[Any] = None) -> None:
+        if self._rlt_switch_state is None:
+            return
+        new_state = self._init_rlt_switch_state(self.num_envs)
+        if env_idx is None:
+            self._rlt_switch_state = new_state
+            return
+        indices = np.asarray(env_idx).reshape(-1)
+        if indices.size == 0:
+            return
+        for key, value in new_state.items():
+            self._rlt_switch_state[key][indices] = value[indices]
+
+    def _current_task_idx_tensor(self) -> torch.Tensor:
+        return torch.as_tensor(self.current_task_idx, dtype=torch.long)
+
+    def _rlt_auto_enter_actor(self) -> torch.Tensor:
+        auto_gate = self._rlt_switch_cfg.get("auto_gate", {}) or {}
+        min_task_idx = int(auto_gate.get("min_task_idx", 2))
+        task_idx = self._current_task_idx_tensor()
+        # idx == 5 means the 5-subtask chain finished; keep latch semantics via
+        # previous flags rather than re-entering from a completed episode.
+        return (task_idx >= min_task_idx) & (task_idx <= 4)
+
+    def _update_rlt_switch(self) -> None:
+        if self._rlt_switch_state is None:
+            return
+
+        task_mode = str(self._rlt_switch_cfg.get("task_mode", self._RLT_FULL_TASK))
+        trigger_mode = str(
+            self._rlt_switch_cfg.get("trigger_mode", self._RLT_AUTO_TRIGGER)
+        )
+        if (
+            task_mode == self._RLT_CRITICAL_PHASE
+            or trigger_mode == self._RLT_ALWAYS_ON_TRIGGER
+        ):
+            enter_actor = torch.ones(self.num_envs, dtype=torch.bool)
+        elif (
+            task_mode == self._RLT_FULL_TASK and trigger_mode == self._RLT_AUTO_TRIGGER
+        ):
+            enter_actor = self._rlt_auto_enter_actor()
+        else:
+            raise ValueError(
+                "rlt_policy_switch supports task_mode in "
+                f"{self._RLT_FULL_TASK, self._RLT_CRITICAL_PHASE} and trigger_mode in "
+                f"{self._RLT_AUTO_TRIGGER, self._RLT_ALWAYS_ON_TRIGGER}, got "
+                f"{task_mode=} {trigger_mode=}."
+            )
+
+        previous = self._rlt_switch_state["rlt_switch_flags"]
+        latch_until_done = bool(self._rlt_switch_cfg.get("latch_until_done", True))
+        if latch_until_done:
+            self._rlt_switch_state["rlt_switch_flags"] = previous | enter_actor
+        else:
+            self._rlt_switch_state["rlt_switch_flags"] = enter_actor
+
     def _export_rlt_switch_info(self) -> dict[str, torch.Tensor]:
         batch_size = self.num_envs
+        task_idx = self._current_task_idx_tensor()
         if self._rlt_switch_state is None:
-            rlt_switch_flags = torch.zeros(
-                batch_size, dtype=torch.bool
-            )
+            rlt_switch_flags = torch.zeros(batch_size, dtype=torch.bool)
         else:
             rlt_switch_flags = self._rlt_switch_state["rlt_switch_flags"]
         return {
             "rlt_switch_flags": rlt_switch_flags.reshape(batch_size, 1),
-            "intervene_flag": torch.zeros(
-                batch_size, 1, dtype=torch.bool
-            ),
+            "intervene_flag": torch.zeros(batch_size, 1, dtype=torch.bool),
+            "current_task_idx": task_idx.reshape(batch_size, 1),
         }
 
     def _attach_rlt_switch_info(self, infos: dict[str, Any]) -> None:
         if isinstance(infos, dict):
             infos.update(self._export_rlt_switch_info())
 
-    # ------------------------------------------------------------------
-    # History injection
-    # ------------------------------------------------------------------
-    def _init_history(self) -> None:
-        if self.history_len <= 0:
-            return
-        self._history_proprio = torch.zeros(
-            (self.num_envs, self.history_len, 7), dtype=torch.float32
-        )
-        self._history_actions = torch.zeros(
-            (self.num_envs, self.history_len, 7), dtype=torch.float32
-        )
-        self._history_pos = torch.zeros(
-            self.num_envs, dtype=torch.long
-        )
-
-    def _reset_history(self, env_idx: Optional[Any] = None) -> None:
-        if self.history_len <= 0:
-            return
-        if env_idx is None:
-            self._history_proprio.zero_()
-            self._history_actions.zero_()
-            self._history_pos.zero_()
-            return
-
-        indices = np.asarray(env_idx).reshape(-1)
-        if indices.size == 0:
-            return
-        self._history_proprio[indices].zero_()
-        self._history_actions[indices].zero_()
-        self._history_pos[indices] = 0
-
-    def _append_history(
-        self,
-        proprio: Any,
-        actions: Any,
-        dones: Optional[Any],
-    ) -> None:
-        if self.history_len <= 0:
-            return
-        proprio = torch.as_tensor(proprio, dtype=torch.float32).reshape(
-            self.num_envs, -1
-        )
-        actions = torch.as_tensor(actions, dtype=torch.float32).reshape(
-            self.num_envs, -1
-        )
-
-        write_pos = self._history_pos
-        rows = torch.arange(self.num_envs)
-        self._history_proprio[rows, write_pos, :] = proprio[:, :7]
-        self._history_actions[rows, write_pos, :] = actions[:, :7]
-        self._history_pos = (write_pos + 1) % self.history_len
-
-        if dones is not None:
-            done = torch.as_tensor(dones, dtype=torch.bool).reshape(
-                self.num_envs
-            )
-            if done.any():
-                done_idx = done.nonzero(as_tuple=False).reshape(-1)
-                self._reset_history(done_idx.numpy())
-
-    def _append_history_to_states(self, states: Any) -> torch.Tensor:
-        states = torch.as_tensor(states, dtype=torch.float32)
-        if self.history_len <= 0:
-            return states
-        history = torch.cat(
-            [self._history_proprio, self._history_actions], dim=-1
-        ).reshape(self.num_envs, -1)
-        return torch.cat([states, history], dim=-1)
-
-    def _wrap_obs(self, obs_list):
-        obs = super()._wrap_obs(obs_list)
-        if self.history_len > 0:
-            obs["states"] = self._append_history_to_states(obs["states"])
-        return obs
-
-    # ------------------------------------------------------------------
-    # Gym interface
-    # ------------------------------------------------------------------
     def reset(
         self,
         env_idx: Optional[Any] = None,
         reset_state_ids=None,
     ):
-        self._reset_history(env_idx)
+        self._reset_rlt_switch(env_idx)
         obs, infos = super().reset(
             env_idx=env_idx,
             reset_state_ids=reset_state_ids,
         )
+        self._update_rlt_switch()
         self._attach_rlt_switch_info(infos)
         return obs, infos
 
@@ -200,14 +208,7 @@ class CalvinRLTEnv(CalvinEnv):
         obs, step_reward, terminations, truncations, infos = super().step(
             actions, auto_reset=auto_reset
         )
-        if self.history_len > 0:
-            current_states = obs["states"][..., :7]
-            dones = torch.logical_or(terminations, truncations)
-            self._append_history(
-                current_states,
-                actions,
-                dones,
-            )
+        self._update_rlt_switch()
         self._attach_rlt_switch_info(infos)
         return obs, step_reward, terminations, truncations, infos
 

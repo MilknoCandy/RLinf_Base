@@ -15,11 +15,11 @@ hydra:
 cluster:
   num_nodes: 1
   # 8x A800: MLP actor is tiny; OpenPI feature extract is the bottleneck.
-  # Keep actor on GPU0, put rollout+env on 0-7 so collection stays saturated in async.
+  # Keep actor on GPU0, put rollout+env on all GPUs so collection stays saturated.
   component_placement:
     actor: 0-0
-    env: all
-    rollout: all
+    env: 0-7
+    rollout: 0-7
 
 runner:
   task_type: embodied
@@ -32,10 +32,12 @@ runner:
   max_epochs: 5000
   max_steps: -1
   only_eval: False
-  weight_sync_interval: 1
+  # Syncing every step stalls OpenPI rollout; 10 is enough for the tiny MLP.
+  weight_sync_interval: 10
   use_training_pipeline: False
-  val_check_interval: 50
-  save_interval: 50
+  # Full eval (many envs x long episodes) is the main wall-clock killer.
+  val_check_interval: 200
+  save_interval: 200
   resume_dir: null
   ckpt_path: null
 
@@ -56,7 +58,8 @@ algorithm:
     write_on_eval: False
   rlt_schedule:
     enable: True
-    max_updates_per_train_step: 400
+    # Cap per global_step so actor does not monopolize the process for minutes.
+    max_updates_per_train_step: 128
     warmup_min_size: 10000
     warmup_post_collect_updates: 30000
     train_every_episodes: 0
@@ -117,8 +120,9 @@ env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    # 8-GPU async: raise env count so OpenPI GPUs stay busy. If OOM, fall back to 128/96.
-    total_num_envs: 128
+    # More envs → faster buffer fill / more transitions per wall-clock second.
+    # If OOM on OpenPI, step down to 128 then 96.
+    total_num_envs: 192
     seed: 2026
     auto_reset: False
     ignore_terminations: False
@@ -137,22 +141,15 @@ env:
         near_hole_yz_margin: 1.5
         fallback_hole_radius: 0.03
       expert_takeover:
-        enable: True
-        # Simulated real-world takeover: only request expert after the RLT actor
-        # is already in critical phase and has made no measurable insertion
-        # progress for several action chunks. Rollout still masks this during
-        # warmup, and eval disables expert completely.
+        # Dual OpenPI (student feature + expert) halves rollout throughput.
+        # Enable only after baseline A1 STM runs are stable.
+        enable: False
         trigger_mode: stalled_progress
         gate:
           require_grasp: True
           require_not_success: True
-          # Do not diagnose "stuck" immediately after critical entry; first
-          # require the peg head to be close enough to the hole for insertion
-          # attempts to be meaningful.
           near_hole_x_min: -0.10
           near_hole_yz_margin: 2.0
-          # A chunk is considered improved if x advances, yz alignment improves,
-          # or the combined score x - progress_yz_weight * yz improves enough.
           stuck_chunks_before_takeover: 3
           min_x_progress: 0.003
           min_yz_progress: 0.0015
@@ -177,7 +174,8 @@ env:
         height: 384
   eval:
     rollout_epoch: 1
-    total_num_envs: 256
+    # Cheaper eval: still enough for success-rate signal without multi-minute stalls.
+    total_num_envs: 64
     seed: 2026
     auto_reset: False
     ignore_terminations: False
@@ -197,8 +195,6 @@ env:
         fallback_hole_radius: 0.03
       expert_takeover:
         enable: False
-        # Eval is full-task: base policy before critical phase, actor after
-        # critical phase, and no expert intervention.
         trigger_mode: stalled_progress
         gate:
           require_grasp: True

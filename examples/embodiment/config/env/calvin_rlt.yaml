@@ -14,7 +14,6 @@ use_fixed_reset_state_ids: False
 use_ordered_reset_state_ids: False
 
 is_eval: False
-history_len: 0
 
 max_steps_per_rollout_epoch: 480
 max_episode_steps: 480
@@ -22,8 +21,14 @@ max_episode_steps: 480
 rlt_policy_switch:
   enable: True
   task_mode: full_task
-  trigger_mode: always_on
+  # auto: enter RLT actor once current_task_idx >= min_task_idx (option A).
+  # always_on: full-episode actor (ablation / smoke only).
+  trigger_mode: auto
   latch_until_done: True
+  auto_gate:
+    # 0-based subtask index on the 5-step CALVIN chain.
+    # idx 0–1: VLA ref_chunk; idx >= 2: RLT actor (latched until reset).
+    min_task_idx: 2
   expert_takeover:
     enable: False
 

@@ -82,7 +82,9 @@ class MultiStepRolloutWorker(Worker):
         self.rlt_feature_model = None
         self.rlt_route = None
         self.a1_stm_config = build_a1_stm_config(cfg)
-        self.a1_stm_by_stage: dict[int, A1ShortTermMemory] = {}
+        # Keyed by (mode, stage_id) so async train generate and evaluate never
+        # share pending windows / _num_envs across different batch sizes.
+        self.a1_stm_by_mode_stage: dict[tuple[str, int], A1ShortTermMemory] = {}
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -166,8 +168,9 @@ class MultiStepRolloutWorker(Worker):
                 raise ValueError(
                     "algorithm.a1_stm.enable=True requires rollout.rlt_feature_model."
                 )
-            self.a1_stm_by_stage = {
-                stage_id: A1ShortTermMemory(self.a1_stm_config)
+            self.a1_stm_by_mode_stage = {
+                (mode, stage_id): A1ShortTermMemory(self.a1_stm_config)
+                for mode in ("train", "eval")
                 for stage_id in range(self.num_pipeline_stages)
             }
 
@@ -568,18 +571,21 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
-    def _get_a1_stm(self, stage_id: int | None) -> A1ShortTermMemory | None:
+    def _get_a1_stm(
+        self,
+        stage_id: int | None,
+        mode: Literal["train", "eval"] = "train",
+    ) -> A1ShortTermMemory | None:
         if not self.a1_stm_config.enable:
             return None
-        if not self.a1_stm_by_stage:
+        if not self.a1_stm_by_mode_stage:
             return None
-        if stage_id is None:
-            return self.a1_stm_by_stage.get(0)
-        return self.a1_stm_by_stage.get(int(stage_id))
+        resolved_stage = 0 if stage_id is None else int(stage_id)
+        return self.a1_stm_by_mode_stage.get((mode, resolved_stage))
 
     def pop_a1_stm_metrics(self) -> dict[str, float]:
-        """Flush per-stage STM accumulators into one rank-level metric dict."""
-        if not self.a1_stm_by_stage:
+        """Flush train-mode STM accumulators into one rank-level metric dict."""
+        if not self.a1_stm_by_mode_stage:
             return {}
         sum_keys = {
             "a1_stm/enhance_count",
@@ -588,7 +594,9 @@ class MultiStepRolloutWorker(Worker):
         }
         totals: dict[str, float] = {}
         counts: dict[str, int] = {}
-        for stm in self.a1_stm_by_stage.values():
+        for (mode, _), stm in self.a1_stm_by_mode_stage.items():
+            if mode != "train":
+                continue
             for key, value in stm.pop_logged_metrics().items():
                 totals[key] = totals.get(key, 0.0) + float(value)
                 counts[key] = counts.get(key, 0) + 1
@@ -624,7 +632,7 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
-                a1_stm=self._get_a1_stm(stage_id),
+                a1_stm=self._get_a1_stm(stage_id, mode=mode),
                 dones=dones,
                 rewards=rewards,
                 success=success,

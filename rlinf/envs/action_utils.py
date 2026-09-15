@@ -136,7 +136,11 @@ def prepare_actions_for_calvin(
     model_type,
 ) -> np.ndarray:
     chunk_actions = raw_chunk_actions
-    if SupportedModel(model_type) == SupportedModel.OPENPI:
+    # OpenPI / RLT-MLP emit continuous gripper logits in roughly [-1, 1].
+    if SupportedModel(model_type) in {
+        SupportedModel.OPENPI,
+        SupportedModel.RLT_MLP_POLICY,
+    }:
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1])
     else:
         chunk_actions[..., -1] = np.where(chunk_actions[..., -1] > 0, 1, -1)

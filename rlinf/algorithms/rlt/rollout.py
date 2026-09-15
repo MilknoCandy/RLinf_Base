@@ -60,7 +60,10 @@ def _apply_a1_stm(
     enhanced_z, metrics = stm.enhance(raw_z)
     rlt_obs["z_rl"] = enhanced_z
     rlt_obs["z_rl_raw"] = raw_z
-    stm.set_pending(z_rl=raw_z, critical_mask=rlt_switch_flags)
+    # Eval must not arm pending writes: async train/eval share a worker and
+    # different batch sizes; pending from eval would corrupt train STM.
+    if allow_write:
+        stm.set_pending(z_rl=raw_z, critical_mask=rlt_switch_flags)
     return metrics
 
 

@@ -934,10 +934,13 @@ class AsyncRLTACFSDPPolicy(RLTACFSDPPolicy, AsyncEmbodiedSACFSDPPolicy):
 
             updates_to_run, schedule_metrics = self._rlt_updates_to_run()
             if updates_to_run <= 0:
-                mean_metric_dict = self.process_train_metrics(schedule_metrics)
+                # Return empty so AsyncEmbodiedRunner treats this as skip_step
+                # (no global_step++ / weight sync / eval). Still drained
+                # trajectories above; avoid counting buffer-warmup polls as steps.
                 torch.cuda.synchronize()
                 torch.distributed.barrier()
                 torch.cuda.empty_cache()
+                return {}
             else:
                 assert (
                     self.cfg.actor.global_batch_size

@@ -108,3 +108,27 @@ def test_a1_stm_pop_logged_metrics_averages_enhance_stats():
     metrics_again = stm.pop_logged_metrics()
     assert metrics_again["a1_stm/enhance_count"] == 0.0
     assert metrics_again["a1_stm/write_pos_count"] == 0.0
+
+
+def test_a1_stm_finalize_drops_pending_on_batch_mismatch():
+    stm = _make_stm()
+    z12 = torch.randn(2, 8)
+    stm.set_pending(z_rl=z12, critical_mask=torch.tensor([True, True]))
+    assert bool(stm._pending_valid.any())
+
+    # Simulate async eval resizing the STM, then train returning with B=2 dones
+    # against a different registered size.
+    z16 = torch.randn(3, 8)
+    stm.enhance(z16)
+    assert stm._num_envs == 3
+
+    stm._pending_valid.fill_(True)
+    stm.finalize_pending(
+        dones=torch.tensor([False, False]),
+        rewards=None,
+        success=None,
+        allow_write=True,
+    )
+    assert not bool(stm._pending_valid.any())
+    assert stm.pos_bank.size == 0
+    assert stm.neg_bank.size == 0
