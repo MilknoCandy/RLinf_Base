@@ -84,12 +84,12 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 rollout_metrics = {
                     f"time/rollout/{k}": v for k, v in rollout_metrics.items()
                 }
-                a1_stm_metrics = self.pop_a1_stm_metrics()
+                a2_stm_metrics = self.pop_a2_stm_metrics()
                 metric_channel.put(
                     {
                         "rank": self._rank,
                         "time": rollout_metrics,
-                        "a1_stm": a1_stm_metrics,
+                        "a2_stm": a2_stm_metrics,
                     },
                     async_op=True,
                 )

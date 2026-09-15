@@ -25,8 +25,8 @@ from tqdm import tqdm
 
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
-    A1ShortTermMemory,
-    build_a1_stm_config,
+    A2MemoryBank,
+    build_a2_stm_config,
     build_rlt_route,
     predict_rlt_actions,
 )
@@ -81,10 +81,10 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
-        self.a1_stm_config = build_a1_stm_config(cfg)
+        self.a2_stm_config = build_a2_stm_config(cfg)
         # Keyed by (mode, stage_id) so async train generate and evaluate never
         # share pending windows / _num_envs across different batch sizes.
-        self.a1_stm_by_mode_stage: dict[tuple[str, int], A1ShortTermMemory] = {}
+        self.a2_stm_by_mode_stage: dict[tuple[str, int], A2MemoryBank] = {}
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -163,13 +163,19 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
 
-        if self.a1_stm_config.enable:
+        if self.a2_stm_config.enable:
             if self.rlt_feature_model is None:
                 raise ValueError(
-                    "algorithm.a1_stm.enable=True requires rollout.rlt_feature_model."
+                    "algorithm.a2_stm.enable=True requires rollout.rlt_feature_model."
                 )
-            self.a1_stm_by_mode_stage = {
-                (mode, stage_id): A1ShortTermMemory(self.a1_stm_config)
+            if getattr(self.hf_model, "a2_stm_encoder", None) is None:
+                raise ValueError(
+                    "algorithm.a2_stm.enable=True requires actor/rollout "
+                    "model.a2_stm (synced via ${algorithm.a2_stm}) so the "
+                    "learnable encoder is constructed on RLTMLPPolicy."
+                )
+            self.a2_stm_by_mode_stage = {
+                (mode, stage_id): A2MemoryBank(self.a2_stm_config)
                 for mode in ("train", "eval")
                 for stage_id in range(self.num_pipeline_stages)
             }
@@ -571,33 +577,62 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
-    def _get_a1_stm(
+    def _get_a2_stm_bank(
         self,
         stage_id: int | None,
         mode: Literal["train", "eval"] = "train",
-    ) -> A1ShortTermMemory | None:
-        if not self.a1_stm_config.enable:
+    ) -> A2MemoryBank | None:
+        if not self.a2_stm_config.enable:
             return None
-        if not self.a1_stm_by_mode_stage:
+        if not self.a2_stm_by_mode_stage:
             return None
         resolved_stage = 0 if stage_id is None else int(stage_id)
-        return self.a1_stm_by_mode_stage.get((mode, resolved_stage))
+        return self.a2_stm_by_mode_stage.get((mode, resolved_stage))
 
-    def pop_a1_stm_metrics(self) -> dict[str, float]:
+    def _gather_a2_stm_memory(
+        self,
+        stage_id: int | None,
+        mode: Literal["train", "eval"],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.a2_stm_config.enable:
+            return None
+        if (
+            mode == "eval"
+            and self.a2_stm_config.share_train_bank_on_eval
+            and self.a2_stm_by_mode_stage
+        ):
+            z_chunks: list[torch.Tensor] = []
+            a_chunks: list[torch.Tensor] = []
+            for (bank_mode, _), bank in self.a2_stm_by_mode_stage.items():
+                if bank_mode != "train":
+                    continue
+                mem_z, mem_a = bank.gather_memory(device)
+                if mem_z.numel() > 0:
+                    z_chunks.append(mem_z)
+                    a_chunks.append(mem_a)
+            if z_chunks:
+                return torch.cat(z_chunks, dim=0), torch.cat(a_chunks, dim=0)
+        bank = self._get_a2_stm_bank(stage_id, mode=mode)
+        if bank is None:
+            return None
+        return bank.gather_memory(device)
+
+    def pop_a2_stm_metrics(self) -> dict[str, float]:
         """Flush train-mode STM accumulators into one rank-level metric dict."""
-        if not self.a1_stm_by_mode_stage:
+        if not self.a2_stm_by_mode_stage:
             return {}
         sum_keys = {
-            "a1_stm/enhance_count",
-            "a1_stm/write_pos_count",
-            "a1_stm/write_neg_count",
+            "a2_stm/enhance_count",
+            "a2_stm/write_pos_count",
+            "a2_stm/write_neg_count",
         }
         totals: dict[str, float] = {}
         counts: dict[str, int] = {}
-        for (mode, _), stm in self.a1_stm_by_mode_stage.items():
+        for (mode, _), bank in self.a2_stm_by_mode_stage.items():
             if mode != "train":
                 continue
-            for key, value in stm.pop_logged_metrics().items():
+            for key, value in bank.pop_logged_metrics().items():
                 totals[key] = totals.get(key, 0.0) + float(value)
                 counts[key] = counts.get(key, 0) + 1
         out: dict[str, float] = {}
@@ -621,6 +656,7 @@ class MultiStepRolloutWorker(Worker):
         success: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
+            device = next(self.hf_model.parameters()).device
             return predict_rlt_actions(
                 policy_model=self.hf_model,
                 feature_model=self.rlt_feature_model,
@@ -632,7 +668,8 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
-                a1_stm=self._get_a1_stm(stage_id, mode=mode),
+                a2_stm_bank=self._get_a2_stm_bank(stage_id, mode=mode),
+                a2_stm_memory=self._gather_a2_stm_memory(stage_id, mode, device),
                 dones=dones,
                 rewards=rewards,
                 success=success,

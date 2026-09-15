@@ -17,10 +17,35 @@ from omegaconf import DictConfig
 
 
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
+    from rlinf.algorithms.rlt.a2_stm import A2STMConfig
     from rlinf.models.embodiment.mlp_policy.iql_mlp_policy import IQLMLPPolicy
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
+
+    def _build_a2_stm_config_from_model_cfg(model_cfg: DictConfig) -> A2STMConfig | None:
+        block = model_cfg.get("a2_stm", None)
+        if block is None or not bool(block.get("enable", False)):
+            return None
+        action_dim = int(model_cfg.action_dim)
+        num_chunks = int(model_cfg.num_action_chunks)
+        flat_action = int(block.get("action_dim", action_dim * num_chunks))
+        return A2STMConfig(
+            enable=True,
+            window_size=int(block.get("window_size", 64)),
+            pos_capacity=int(block.get("pos_capacity", 2048)),
+            neg_capacity=int(block.get("neg_capacity", 2048)),
+            top_k=int(block.get("top_k", 16)),
+            temperature=float(block.get("temperature", 0.07)),
+            only_critical=bool(block.get("only_critical", True)),
+            fail_tail_steps=int(block.get("fail_tail_steps", 16)),
+            write_on_eval=bool(block.get("write_on_eval", False)),
+            share_train_bank_on_eval=bool(block.get("share_train_bank_on_eval", True)),
+            z_dim=int(model_cfg.z_dim),
+            action_dim=flat_action,
+            hidden_dim=int(block.get("hidden_dim", 256)),
+            gate_init_bias=float(block.get("gate_init_bias", -2.0)),
+        )
 
     iql_config = cfg.get("iql_config", None)
     if cfg.model_type == "rlt_mlp_policy":
@@ -35,6 +60,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+            a2_stm_config=_build_a2_stm_config_from_model_cfg(cfg),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

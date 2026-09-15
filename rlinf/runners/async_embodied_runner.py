@@ -101,10 +101,10 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         time_metrics, ranked_time_metrics_list = self._process_ranked_numeric_results(
             results, metric_field="time"
         )
-        a1_stm_metrics, _ = self._process_ranked_numeric_results(
-            results, metric_field="a1_stm"
+        a2_stm_metrics, _ = self._process_ranked_numeric_results(
+            results, metric_field="a2_stm"
         )
-        return {**time_metrics, **a1_stm_metrics}, ranked_time_metrics_list
+        return {**time_metrics, **a2_stm_metrics}, ranked_time_metrics_list
 
     def _cleanup_pending_rollout_weight_sync(self, no_wait):
         if self._pending_rollout_weight_sync is None:
