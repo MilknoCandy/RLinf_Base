@@ -577,6 +577,29 @@ class MultiStepRolloutWorker(Worker):
             return self.a1_stm_by_stage.get(0)
         return self.a1_stm_by_stage.get(int(stage_id))
 
+    def pop_a1_stm_metrics(self) -> dict[str, float]:
+        """Flush per-stage STM accumulators into one rank-level metric dict."""
+        if not self.a1_stm_by_stage:
+            return {}
+        sum_keys = {
+            "a1_stm/enhance_count",
+            "a1_stm/write_pos_count",
+            "a1_stm/write_neg_count",
+        }
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for stm in self.a1_stm_by_stage.values():
+            for key, value in stm.pop_logged_metrics().items():
+                totals[key] = totals.get(key, 0.0) + float(value)
+                counts[key] = counts.get(key, 0) + 1
+        out: dict[str, float] = {}
+        for key, total in totals.items():
+            if key in sum_keys:
+                out[key] = total
+            else:
+                out[key] = total / max(counts[key], 1)
+        return out
+
     def _predict_rollout_actions(
         self,
         env_obs: dict[str, Any],

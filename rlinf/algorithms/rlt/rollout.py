@@ -83,7 +83,7 @@ def predict_rlt_actions(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     with torch.no_grad():
         rlt_obs = feature_model.extract_rlt_obs(env_obs)
-        stm_metrics = _apply_a1_stm(
+        _apply_a1_stm(
             rlt_obs=rlt_obs,
             stm=a1_stm,
             mode=mode,
@@ -122,7 +122,7 @@ def predict_rlt_actions(
             rlt_obs=rlt_obs,
             final_obs=final_obs,
         )
-        if stm_metrics:
-            result["forward_inputs"]["a1_stm_metrics"] = stm_metrics
+        # Do not put STM metrics into forward_inputs: _split_policy_output
+        # assumes every value is a batch tensor.
 
     return actions, result

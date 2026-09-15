@@ -144,6 +144,10 @@ class A1ShortTermMemory:
         self._pending_z: torch.Tensor | None = None
         self._pending_critical: torch.Tensor | None = None
         self._pending_valid: torch.Tensor | None = None
+        self._metric_count = 0
+        self._metric_sums: dict[str, float] = {}
+        self._write_pos_count = 0
+        self._write_neg_count = 0
 
     @property
     def enabled(self) -> bool:
@@ -155,6 +159,34 @@ class A1ShortTermMemory:
             "a1_stm/neg_size": float(self.neg_bank.size),
             "a1_stm/num_envs": float(self._num_envs),
         }
+
+    def _record_step_metrics(self, metrics: dict[str, float]) -> None:
+        """Accumulate per-enhance scalars until the next ``pop_logged_metrics``."""
+        self._metric_count += 1
+        for key, value in metrics.items():
+            self._metric_sums[key] = self._metric_sums.get(key, 0.0) + float(value)
+
+    def pop_logged_metrics(self) -> dict[str, float]:
+        """Return window averages + current gauges, then reset step accumulators.
+
+        Bank sizes are gauges (latest snapshot). Retrieve stats are means over
+        all ``enhance`` calls since the previous pop. Write counts are totals
+        since the previous pop.
+        """
+        out = self.stats()
+        if self._metric_count > 0:
+            count = float(self._metric_count)
+            for key, total in self._metric_sums.items():
+                # Prefer averaged step metrics over a one-shot gauge snapshot.
+                out[key] = total / count
+        out["a1_stm/enhance_count"] = float(self._metric_count)
+        out["a1_stm/write_pos_count"] = float(self._write_pos_count)
+        out["a1_stm/write_neg_count"] = float(self._write_neg_count)
+        self._metric_count = 0
+        self._metric_sums = {}
+        self._write_pos_count = 0
+        self._write_neg_count = 0
+        return out
 
     def _ensure_num_envs(self, num_envs: int, device: torch.device) -> None:
         if self._num_envs == num_envs and self._window_z is not None:
@@ -282,9 +314,11 @@ class A1ShortTermMemory:
             if entries.numel() > 0:
                 if bool(success_mask[env_id].item()):
                     self.pos_bank.append(entries)
+                    self._write_pos_count += 1
                 else:
                     tail = max(1, int(self.config.fail_tail_steps))
                     self.neg_bank.append(entries[-tail:])
+                    self._write_neg_count += 1
             self._window_len[env_id] = 0
             self._window_ptr[env_id] = 0
 
@@ -326,6 +360,7 @@ class A1ShortTermMemory:
         metrics["a1_stm/memory_size"] = float(memory.shape[0])
         if memory.numel() == 0:
             metrics["a1_stm/retrieve_used"] = 0.0
+            self._record_step_metrics(metrics)
             return z_rl, metrics
 
         # Cosine attention over the shared memory bank.
@@ -341,6 +376,7 @@ class A1ShortTermMemory:
         enhanced = z + gate * retrieved
         metrics["a1_stm/retrieve_used"] = 1.0
         metrics["a1_stm/top_score_mean"] = float(top_scores[:, 0].mean().item())
+        self._record_step_metrics(metrics)
         return enhanced.to(dtype=z_rl.dtype), metrics
 
     def _gather_memory(self, device: torch.device) -> torch.Tensor:

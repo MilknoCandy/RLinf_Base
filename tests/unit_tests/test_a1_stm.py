@@ -94,3 +94,17 @@ def test_a1_stm_skips_non_critical_when_only_critical():
     )
     assert stm.pos_bank.size == 0
     assert stm.neg_bank.size == 0
+
+
+def test_a1_stm_pop_logged_metrics_averages_enhance_stats():
+    stm = _make_stm()
+    z = torch.randn(1, 8)
+    stm.enhance(z)
+    stm.enhance(z)
+    metrics = stm.pop_logged_metrics()
+    assert metrics["a1_stm/enhance_count"] == 2.0
+    assert "a1_stm/retrieve_used" in metrics
+    # Second pop should reset step accumulators.
+    metrics_again = stm.pop_logged_metrics()
+    assert metrics_again["a1_stm/enhance_count"] == 0.0
+    assert metrics_again["a1_stm/write_pos_count"] == 0.0
