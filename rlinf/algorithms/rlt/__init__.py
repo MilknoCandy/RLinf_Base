@@ -13,11 +13,10 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
-from rlinf.algorithms.rlt.a2_stm import (
-    A2MemoryBank,
-    A2STMConfig,
-    A2STMEncoder,
-    build_a2_stm_config,
+from rlinf.algorithms.rlt.a1_stm import (
+    A1ShortTermMemory,
+    A1STMConfig,
+    build_a1_stm_config,
 )
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
@@ -30,14 +29,13 @@ from rlinf.algorithms.rlt.route import (
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 
 __all__ = [
-    "A2MemoryBank",
-    "A2STMConfig",
-    "A2STMEncoder",
+    "A1STMConfig",
+    "A1ShortTermMemory",
     "RLTRoute",
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
-    "build_a2_stm_config",
+    "build_a1_stm_config",
     "build_expert_model_config",
     "build_rlt_route",
     "predict_rlt_actions",

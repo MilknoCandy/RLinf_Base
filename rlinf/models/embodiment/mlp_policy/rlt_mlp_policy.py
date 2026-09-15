@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
-from rlinf.algorithms.rlt.a2_stm import A2MemoryBank, A2STMConfig, A2STMEncoder
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
 
@@ -26,9 +25,6 @@ class RLTMLPPolicy(MLPPolicy):
     Actor input follows RLT: reference action chunk, RL token feature, and
     proprioceptive state. Critic input follows RLT: action chunk, RL token
     feature, and proprioceptive state.
-
-    Optional A2 learnable STM recomputes ``z'`` from raw ``z_rl`` using a
-    worker-local ``a2_stm_bank`` so retrieval parameters receive RL gradients.
     """
 
     def __init__(
@@ -41,7 +37,6 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
-        a2_stm_config: A2STMConfig | None = None,
     ):
         if not add_q_head:
             raise ValueError(
@@ -83,18 +78,6 @@ class RLTMLPPolicy(MLPPolicy):
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
 
-        self.a2_stm_config = a2_stm_config
-        self.a2_stm_encoder: A2STMEncoder | None = None
-        # Attached by workers; not part of state_dict / weight sync.
-        self.a2_stm_bank: A2MemoryBank | None = None
-        self._last_a2_metrics: dict[str, float] = {}
-        if a2_stm_config is not None and a2_stm_config.enable:
-            if a2_stm_config.z_dim != z_dim:
-                a2_stm_config.z_dim = z_dim
-            if a2_stm_config.action_dim != flat_action_dim:
-                a2_stm_config.action_dim = flat_action_dim
-            self.a2_stm_encoder = A2STMEncoder(a2_stm_config)
-
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
         processed = {}
@@ -109,35 +92,7 @@ class RLTMLPPolicy(MLPPolicy):
         return tensor.reshape(tensor.shape[0], -1)
 
     def _get_z(self, obs: dict) -> torch.Tensor:
-        z = self._flatten_batch(obs["z_rl"])
-        if self.a2_stm_encoder is None:
-            return z
-        bank = self.a2_stm_bank
-        if bank is None or bank.memory_size == 0:
-            self._last_a2_metrics = {
-                "a2_stm/memory_size": 0.0,
-                "a2_stm/retrieve_used": 0.0,
-                "a2_stm/gate_mean": 0.0,
-                "a2_stm/top_score_mean": 0.0,
-                "a2_stm/enhance_delta_norm": 0.0,
-            }
-            return z
-        mem_z, mem_a = bank.gather_memory(z.device)
-        # Bank contents are experience; stop grads into stored tensors.
-        enhanced, metrics = self.a2_stm_encoder.enhance(
-            z, mem_z.detach(), mem_a.detach()
-        )
-        self._last_a2_metrics = metrics
-        if bank is not None:
-            bank.record_step_metrics(metrics)
-        return enhanced
-
-    def pop_a2_stm_metrics(self) -> dict[str, float]:
-        if self.a2_stm_bank is None:
-            return dict(self._last_a2_metrics)
-        metrics = self.a2_stm_bank.pop_logged_metrics()
-        metrics.update(self._last_a2_metrics)
-        return metrics
+        return self._flatten_batch(obs["z_rl"])
 
     def _get_proprio(self, obs: dict) -> torch.Tensor:
         return self._flatten_batch(obs["proprio"])

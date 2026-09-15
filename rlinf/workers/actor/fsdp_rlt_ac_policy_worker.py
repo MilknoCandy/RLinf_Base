@@ -18,7 +18,6 @@ import queue
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.a2_stm import A2MemoryBank, build_a2_stm_config
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -380,47 +379,6 @@ class RLTACLossMixin:
 class RLTACReplayMixin:
     """Shared rollout-to-replay ingestion for sync and async RLT AC workers."""
 
-    def _setup_a2_stm(self) -> None:
-        """Attach a worker-local experience bank; encoder lives on the policy."""
-        self.a2_stm_config = build_a2_stm_config(self.cfg)
-        self.a2_stm_bank: A2MemoryBank | None = None
-        if not self.a2_stm_config.enable:
-            return
-        self.a2_stm_bank = A2MemoryBank(self.a2_stm_config)
-        model = getattr(self, "model", None)
-        if model is not None and hasattr(model, "a2_stm_bank"):
-            model.a2_stm_bank = self.a2_stm_bank
-        target = getattr(self, "target_model", None)
-        if target is not None and hasattr(target, "a2_stm_bank"):
-            target.a2_stm_bank = self.a2_stm_bank
-
-    def _remember_a2_stm_from_replay_list(
-        self, replay_list: list[Trajectory]
-    ) -> None:
-        if self.a2_stm_bank is None:
-            return
-        for traj in replay_list:
-            if traj.curr_obs is None or traj.actions is None:
-                continue
-            z_rl = traj.curr_obs.get("z_rl")
-            if not isinstance(z_rl, torch.Tensor):
-                continue
-            success = None
-            if isinstance(traj.rewards, torch.Tensor):
-                reward = traj.rewards.reshape(-1)
-                success = reward > 0
-            self.a2_stm_bank.remember_batch(
-                z_rl=z_rl, actions=traj.actions, success=success
-            )
-
-    def _pop_a2_stm_train_metrics(self) -> dict[str, float]:
-        model = getattr(self, "model", None)
-        if model is not None and hasattr(model, "pop_a2_stm_metrics"):
-            return model.pop_a2_stm_metrics()
-        if getattr(self, "a2_stm_bank", None) is not None:
-            return self.a2_stm_bank.pop_logged_metrics()
-        return {}
-
     @staticmethod
     def _trajectory_transition_count(traj: Trajectory) -> int:
         if traj.actions is None:
@@ -667,7 +625,6 @@ class RLTACReplayMixin:
                 **self._transition_replay_metrics(replay_list),
                 **collect_trajectory_replay_metrics(recv_list, reducer=all_reduce_dict),
             }
-            self._remember_a2_stm_from_replay_list(replay_list)
             self.replay_buffer.add_trajectories(replay_list)
 
             if self.demo_buffer is not None:
@@ -682,7 +639,6 @@ class RLTACReplayMixin:
             return len(replay_list), completed
 
         self.replay_buffer.add_trajectories(recv_list)
-        self._remember_a2_stm_from_replay_list(recv_list)
 
         if self.demo_buffer is not None:
             intervene_traj_list = []
@@ -731,7 +687,6 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
-        self._setup_a2_stm()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
 
@@ -931,9 +886,6 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         torch.cuda.synchronize()
         torch.distributed.barrier()
         torch.cuda.empty_cache()
-        a2_metrics = self._pop_a2_stm_train_metrics()
-        if a2_metrics:
-            mean_metric_dict = {**mean_metric_dict, **a2_metrics}
         return mean_metric_dict
 
 
@@ -1039,7 +991,4 @@ class AsyncRLTACFSDPPolicy(RLTACFSDPPolicy, AsyncEmbodiedSACFSDPPolicy):
         replay_metrics = getattr(self, "_last_replay_metrics", {})
         if replay_metrics:
             mean_metric_dict = {**mean_metric_dict, **replay_metrics}
-        a2_metrics = self._pop_a2_stm_train_metrics()
-        if a2_metrics:
-            mean_metric_dict = {**mean_metric_dict, **a2_metrics}
         return mean_metric_dict

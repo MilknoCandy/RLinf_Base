@@ -14,48 +14,46 @@ hydra:
 
 cluster:
   num_nodes: 1
-  # 8x A800: MLP actor is tiny; OpenPI feature extract is the bottleneck.
   component_placement:
     actor: 0-0
-    env: 0-7
-    rollout: 0-7
+    env: all
+    rollout: all
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_a2_stm_async"
+    experiment_name: "maniskill_rlt_stage2_a1_stm"
     logger_backends: ["wandb"]
 
   max_epochs: 5000
   max_steps: -1
   only_eval: False
-  weight_sync_interval: 10
-  use_training_pipeline: False
-  val_check_interval: 200
-  save_interval: 200
+  weight_sync_interval: 1
+  val_check_interval: 50
+  save_interval: 50
   resume_dir: null
   ckpt_path: null
 
 algorithm:
   update_epoch: 5
-  a2_stm:
+  # A1 STM verifier: rule-based short-term memory over RLT tokens.
+  # Compare against maniskill_rlt_stage2_ac_mlp.yaml (same hyper-params, STM off).
+  a1_stm:
     enable: True
     window_size: 64
     pos_capacity: 2048
     neg_capacity: 2048
     top_k: 16
     temperature: 0.07
+    gate: 0.5
     only_critical: True
     fail_tail_steps: 16
     write_on_eval: False
-    share_train_bank_on_eval: True
-    hidden_dim: 256
-    gate_init_bias: -2.0
   rlt_schedule:
     enable: True
-    max_updates_per_train_step: 128
+    max_updates_per_train_step: 400
     warmup_min_size: 10000
     warmup_post_collect_updates: 30000
     train_every_episodes: 0
@@ -116,7 +114,7 @@ env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    total_num_envs: 192
+    total_num_envs: 64
     seed: 2026
     auto_reset: False
     ignore_terminations: False
@@ -135,7 +133,7 @@ env:
         near_hole_yz_margin: 1.5
         fallback_hole_radius: 0.03
       expert_takeover:
-        enable: False
+        enable: True
         # Simulated real-world takeover: only request expert after the RLT actor
         # is already in critical phase and has made no measurable insertion
         # progress for several action chunks. Rollout still masks this during
@@ -175,7 +173,7 @@ env:
         height: 384
   eval:
     rollout_epoch: 1
-    total_num_envs: 64
+    total_num_envs: 256
     seed: 2026
     auto_reset: False
     ignore_terminations: False
@@ -256,7 +254,6 @@ rollout:
     fixed_std: ${actor.model.fixed_std}
     is_lora: False
     lora_rank: 32
-    a2_stm: ${algorithm.a2_stm}
 
   rlt_feature_model:
     model_type: "openpi"
@@ -299,7 +296,10 @@ rollout:
       rlt_image_only: False
       rlt_use_mask: True
 
-  # Optional ManiSkill expert takeover model.
+  # Optional ManiSkill expert takeover model. Enable it with
+  # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
+  # to a stronger openpi SFT checkpoint trained with the same task
+  # transforms; it predicts expert actions directly and does not use RLT tokens.
   expert_model:
     model_type: "openpi"
     model_path: "/path/to/rlt_maniskill_joint_pi05_sft_more_steps/checkpoints/global_step_<step>/actor"
@@ -336,7 +336,6 @@ actor:
   global_batch_size: 512
   seed: 1234
   enable_offload: False
-  sync_weight_no_wait: True
 
   model:
     model_type: "rlt_mlp_policy"
@@ -354,7 +353,6 @@ actor:
     fixed_std: 0.002
     is_lora: False
     lora_rank: 32
-    a2_stm: ${algorithm.a2_stm}
 
   optim:
     clip_grad: 10.0
