@@ -81,6 +81,9 @@ class EnvWorker(Worker):
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
+        self.enable_a1_stm = bool(
+            OmegaConf.select(self.cfg, "algorithm.a1_stm.enable", default=False)
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -952,6 +955,23 @@ class EnvWorker(Worker):
 
         return env_outputs
 
+    @staticmethod
+    def _extract_a1_stm_success(env_batch: dict[str, Any]) -> torch.Tensor | None:
+        env_infos = env_batch.get("env_infos")
+        if not isinstance(env_infos, dict):
+            return None
+        for key in ("success", "success_current", "success_once"):
+            value = env_infos.get(key)
+            if isinstance(value, torch.Tensor):
+                return value
+        episode = env_infos.get("episode")
+        if isinstance(episode, dict):
+            for key in ("success_at_end", "success_once", "success"):
+                value = episode.get(key)
+                if isinstance(value, torch.Tensor):
+                    return value
+        return None
+
     def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
         data = {
             "obs": env_batch["obs"],
@@ -960,6 +980,10 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
+        if self.enable_a1_stm:
+            data["dones"] = env_batch.get("dones", None)
+            data["rewards"] = env_batch.get("rewards", None)
+            data["success"] = self._extract_a1_stm_success(env_batch)
         return data
 
     def _send_train_bootstrap(

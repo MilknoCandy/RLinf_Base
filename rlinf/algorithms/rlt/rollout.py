@@ -17,6 +17,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from rlinf.algorithms.rlt.a1_stm import A1ShortTermMemory
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
 
@@ -35,6 +36,34 @@ def _append_rlt_transition_obs(
         result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
 
 
+def _apply_a1_stm(
+    *,
+    rlt_obs: dict[str, torch.Tensor],
+    stm: A1ShortTermMemory | None,
+    mode: Literal["train", "eval"],
+    rlt_switch_flags: torch.Tensor | None,
+    dones: torch.Tensor | None,
+    rewards: torch.Tensor | None,
+    success: torch.Tensor | None,
+) -> dict[str, float]:
+    if stm is None or not stm.enabled:
+        return {}
+
+    allow_write = mode == "train" or bool(stm.config.write_on_eval)
+    stm.finalize_pending(
+        dones=dones,
+        rewards=rewards,
+        success=success,
+        allow_write=allow_write,
+    )
+    raw_z = rlt_obs["z_rl"]
+    enhanced_z, metrics = stm.enhance(raw_z)
+    rlt_obs["z_rl"] = enhanced_z
+    rlt_obs["z_rl_raw"] = raw_z
+    stm.set_pending(z_rl=raw_z, critical_mask=rlt_switch_flags)
+    return metrics
+
+
 def predict_rlt_actions(
     *,
     policy_model: Any,
@@ -47,9 +76,22 @@ def predict_rlt_actions(
     rlt_switch_flags: torch.Tensor | None = None,
     intervene_requested: torch.Tensor | None = None,
     expert_model: Any | None = None,
+    a1_stm: A1ShortTermMemory | None = None,
+    dones: torch.Tensor | None = None,
+    rewards: torch.Tensor | None = None,
+    success: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     with torch.no_grad():
         rlt_obs = feature_model.extract_rlt_obs(env_obs)
+        stm_metrics = _apply_a1_stm(
+            rlt_obs=rlt_obs,
+            stm=a1_stm,
+            mode=mode,
+            rlt_switch_flags=rlt_switch_flags,
+            dones=dones,
+            rewards=rewards,
+            success=success,
+        )
         actions, result = policy_model.predict_action_batch(
             env_obs=rlt_obs,
             mode=mode,
@@ -80,5 +122,7 @@ def predict_rlt_actions(
             rlt_obs=rlt_obs,
             final_obs=final_obs,
         )
+        if stm_metrics:
+            result["forward_inputs"]["a1_stm_metrics"] = stm_metrics
 
     return actions, result

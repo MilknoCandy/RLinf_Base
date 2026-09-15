@@ -25,6 +25,8 @@ from tqdm import tqdm
 
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
+    A1ShortTermMemory,
+    build_a1_stm_config,
     build_rlt_route,
     predict_rlt_actions,
 )
@@ -79,6 +81,8 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self.a1_stm_config = build_a1_stm_config(cfg)
+        self.a1_stm_by_stage: dict[int, A1ShortTermMemory] = {}
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -156,6 +160,16 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
+
+        if self.a1_stm_config.enable:
+            if self.rlt_feature_model is None:
+                raise ValueError(
+                    "algorithm.a1_stm.enable=True requires rollout.rlt_feature_model."
+                )
+            self.a1_stm_by_stage = {
+                stage_id: A1ShortTermMemory(self.a1_stm_config)
+                for stage_id in range(self.num_pipeline_stages)
+            }
 
         if self.cfg.rollout.get("expert_model", None) and not self.enable_opd:
             expert_model_config = build_expert_model_config(
@@ -554,6 +568,15 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
+    def _get_a1_stm(self, stage_id: int | None) -> A1ShortTermMemory | None:
+        if not self.a1_stm_config.enable:
+            return None
+        if not self.a1_stm_by_stage:
+            return None
+        if stage_id is None:
+            return self.a1_stm_by_stage.get(0)
+        return self.a1_stm_by_stage.get(int(stage_id))
+
     def _predict_rollout_actions(
         self,
         env_obs: dict[str, Any],
@@ -561,6 +584,10 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None = None,
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
+        stage_id: int | None = None,
+        dones: torch.Tensor | None = None,
+        rewards: torch.Tensor | None = None,
+        success: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
@@ -574,6 +601,10 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
+                a1_stm=self._get_a1_stm(stage_id),
+                dones=dones,
+                rewards=rewards,
+                success=success,
             )
         return self.predict(env_obs, mode=mode)
 
@@ -695,6 +726,10 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    stage_id=stage_id,
+                    dones=env_output.get("dones", None),
+                    rewards=env_output.get("rewards", None),
+                    success=env_output.get("success", None),
                 )
 
                 policy_output = self._build_policy_output(
@@ -728,6 +763,10 @@ class MultiStepRolloutWorker(Worker):
                 final_obs=env_output.get("final_obs", None),
                 rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                 intervene_requested=env_output.get("intervene_flags", None),
+                stage_id=stage_id,
+                dones=env_output.get("dones", None),
+                rewards=env_output.get("rewards", None),
+                success=env_output.get("success", None),
             )
 
             if self.enable_opd:
@@ -807,6 +846,10 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    stage_id=0,
+                    dones=env_output.get("dones", None),
+                    rewards=env_output.get("rewards", None),
+                    success=env_output.get("success", None),
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -841,6 +884,10 @@ class MultiStepRolloutWorker(Worker):
                             final_obs=env_output.get("final_obs", None),
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
+                            stage_id=stage_id,
+                            dones=env_output.get("dones", None),
+                            rewards=env_output.get("rewards", None),
+                            success=env_output.get("success", None),
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -922,6 +969,9 @@ class MultiStepRolloutWorker(Worker):
         intervene_flags_list = [
             obs_batch.get("intervene_flags", None) for obs_batch in obs_batches
         ]
+        dones_list = [obs_batch.get("dones", None) for obs_batch in obs_batches]
+        rewards_list = [obs_batch.get("rewards", None) for obs_batch in obs_batches]
+        success_list = [obs_batch.get("success", None) for obs_batch in obs_batches]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -958,6 +1008,9 @@ class MultiStepRolloutWorker(Worker):
             "intervene_flags": self._merge_optional_flag_tensors(
                 obs_dicts, intervene_flags_list
             ),
+            "dones": self._merge_optional_flag_tensors(obs_dicts, dones_list),
+            "rewards": self._merge_optional_flag_tensors(obs_dicts, rewards_list),
+            "success": self._merge_optional_flag_tensors(obs_dicts, success_list),
         }
 
     def _split_policy_output(
