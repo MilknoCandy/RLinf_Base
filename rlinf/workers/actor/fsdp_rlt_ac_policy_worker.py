@@ -484,9 +484,16 @@ class RLTACReplayMixin:
             dones = trajectory.dones
             z_all = trajectory.curr_obs["z_rl"]
             # Expected shapes: actions/rewards/z [T, B, ...], dones [T+1, B, ...]
+            # ManiSkill may keep one extra final action forward; align on z length.
             if actions.ndim < 2 or z_all.ndim < 2:
                 continue
-            traj_len = int(actions.shape[0])
+            traj_len = min(
+                int(actions.shape[0]),
+                int(z_all.shape[0]),
+                int(rewards.shape[0]),
+            )
+            if traj_len <= 0:
+                continue
             bsz = int(actions.shape[1])
             critical = None
             if isinstance(trajectory.forward_inputs, dict):
@@ -520,6 +527,7 @@ class RLTACReplayMixin:
                             crit_seq = crit_seq.reshape(crit_seq.shape[0], -1).any(
                                 dim=-1
                             )
+                    # Chunk rewards are [ep_len, C]; sum>0 still marks success.
                     success = bool(
                         r_seq.detach().float().reshape(-1).sum().item() > 0.0
                     )

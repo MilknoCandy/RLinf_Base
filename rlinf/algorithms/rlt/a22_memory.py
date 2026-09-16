@@ -119,6 +119,27 @@ def compute_monte_carlo_rtg(rewards: torch.Tensor, gamma: float) -> torch.Tensor
     return rtg
 
 
+def collapse_chunk_rewards(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Collapse per-substep chunk rewards ``[T, C]`` into one scalar per chunk.
+
+    Matches RLT critic ``_discounted_chunk_rewards``::
+
+        r_t = sum_{c=0}^{C-1} gamma^c * r_{t,c}
+
+    Already-1D rewards are returned unchanged.
+    """
+    rewards = rewards.detach().float()
+    if rewards.ndim <= 1:
+        return rewards.reshape(-1)
+    flat = rewards.reshape(rewards.shape[0], -1)
+    chunk_len = int(flat.shape[-1])
+    discounts = torch.pow(
+        torch.as_tensor(gamma, dtype=flat.dtype),
+        torch.arange(chunk_len, dtype=flat.dtype),
+    )
+    return torch.sum(flat * discounts, dim=-1)
+
+
 class _EntryRingBank:
     """Fixed-capacity ring of ``(z, a, r, R)``."""
 
@@ -230,10 +251,13 @@ class A22MemoryBank:
         """Commit E1∪E2 indices after episode end with MC-RTG filled."""
         z_seq = z_seq.detach().float().reshape(-1, self.config.z_dim)
         a_seq = self._flatten_action(a_seq)
-        r_seq = r_seq.detach().float().reshape(-1)
-        t = int(z_seq.shape[0])
-        if t == 0 or a_seq.shape[0] != t or r_seq.numel() != t:
+        r_seq = collapse_chunk_rewards(r_seq, self.config.gamma)
+        t = min(int(z_seq.shape[0]), int(a_seq.shape[0]), int(r_seq.shape[0]))
+        if t == 0:
             return 0
+        z_seq = z_seq[:t]
+        a_seq = a_seq[:t]
+        r_seq = r_seq[:t]
 
         rtg = compute_monte_carlo_rtg(r_seq, self.config.gamma)
         select = torch.zeros(t, dtype=torch.bool)

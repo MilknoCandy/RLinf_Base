@@ -17,6 +17,7 @@ import torch
 from rlinf.algorithms.rlt.a22_memory import (
     A22MemoryBank,
     A22MemoryConfig,
+    collapse_chunk_rewards,
     compute_a22_memory_loss,
     compute_monte_carlo_rtg,
 )
@@ -27,6 +28,17 @@ def test_monte_carlo_rtg():
     rewards = torch.tensor([0.0, 0.0, 1.0])
     rtg = compute_monte_carlo_rtg(rewards, gamma=0.5)
     assert torch.allclose(rtg, torch.tensor([0.25, 0.5, 1.0]))
+
+
+def test_collapse_chunk_rewards_matches_critic():
+    rewards = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
+    collapsed = collapse_chunk_rewards(rewards, gamma=0.5)
+    assert torch.allclose(collapsed, torch.tensor([1.0, 0.5]))
 
 
 def test_a22_commit_episode_fills_rtg_and_e3_window():
@@ -62,6 +74,36 @@ def test_a22_commit_episode_fills_rtg_and_e3_window():
     assert bank.pos_bank.size == n
     _, _, _, R = bank.pos_bank.tensors()
     assert float(R.max()) == 1.0
+
+
+def test_a22_commit_accepts_chunk_rewards():
+    cfg = A22MemoryConfig(
+        enable=True,
+        pos_capacity=64,
+        neg_capacity=64,
+        top_k=4,
+        gamma=1.0,
+        k_pre=2,
+        k_post=0,
+        z_dim=4,
+        action_dim=2,
+    )
+    bank = A22MemoryBank(cfg)
+    t = 5
+    z = torch.randn(t, 4)
+    a = torch.randn(t, 2)
+    # ManiSkill-style per-substep chunk rewards [T, C].
+    r = torch.zeros(t, 10)
+    r[-1, 0] = 1.0
+    n = bank.commit_episode(
+        z_seq=z,
+        a_seq=a,
+        r_seq=r,
+        critical_mask=torch.ones(t, dtype=torch.bool),
+        success=True,
+    )
+    assert n == t
+    assert bank.memory_size == t
 
 
 def test_a22_memory_loss_positive_adv_only():

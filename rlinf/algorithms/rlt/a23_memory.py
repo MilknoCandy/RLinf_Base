@@ -40,7 +40,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.a22_memory import compute_monte_carlo_rtg
+from rlinf.algorithms.rlt.a22_memory import (
+    collapse_chunk_rewards,
+    compute_monte_carlo_rtg,
+)
 
 
 @dataclass
@@ -213,10 +216,13 @@ class A23MemoryBank:
         """Commit E1∪E2 indices after episode end with MC-RTG filled."""
         z_seq = z_seq.detach().float().reshape(-1, self.config.z_dim)
         a_seq = self._flatten_action(a_seq)
-        r_seq = r_seq.detach().float().reshape(-1)
-        t = int(z_seq.shape[0])
-        if t == 0 or a_seq.shape[0] != t or r_seq.numel() != t:
+        r_seq = collapse_chunk_rewards(r_seq, self.config.gamma)
+        t = min(int(z_seq.shape[0]), int(a_seq.shape[0]), int(r_seq.shape[0]))
+        if t == 0:
             return 0
+        z_seq = z_seq[:t]
+        a_seq = a_seq[:t]
+        r_seq = r_seq[:t]
 
         rtg = compute_monte_carlo_rtg(r_seq, self.config.gamma)
         select = torch.zeros(t, dtype=torch.bool)
