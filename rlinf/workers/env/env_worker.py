@@ -81,9 +81,6 @@ class EnvWorker(Worker):
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
-        self.enable_a1_stm = bool(
-            OmegaConf.select(self.cfg, "algorithm.a1_stm.enable", default=False)
-        )
         self.enable_a21_context = bool(
             OmegaConf.select(self.cfg, "algorithm.a21_context.enable", default=False)
         )
@@ -962,7 +959,7 @@ class EnvWorker(Worker):
         return env_outputs
 
     @staticmethod
-    def _extract_a1_stm_success(env_batch: dict[str, Any]) -> torch.Tensor | None:
+    def _extract_env_success(env_batch: dict[str, Any]) -> torch.Tensor | None:
         env_infos = env_batch.get("env_infos")
         if not isinstance(env_infos, dict):
             return None
@@ -986,10 +983,10 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
-        if self.enable_a1_stm or self.enable_a21_context or self.enable_a22_memory:
+        if self.enable_a21_context or self.enable_a22_memory:
             data["dones"] = env_batch.get("dones", None)
             data["rewards"] = env_batch.get("rewards", None)
-            data["success"] = self._extract_a1_stm_success(env_batch)
+            data["success"] = self._extract_env_success(env_batch)
         return data
 
     def _send_train_bootstrap(

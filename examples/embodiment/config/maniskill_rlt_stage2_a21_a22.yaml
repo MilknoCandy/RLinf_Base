@@ -38,9 +38,7 @@ runner:
 
 algorithm:
   update_epoch: 5
-  # A1 off for this recipe. A21 = in-episode (z,a) context; A22 = MC-RTG bank + L_M.
-  a1_stm:
-    enable: False
+  # A21 = in-episode (z,a) context; A22 = MC-RTG bank + L_M.
   a21_context:
     enable: True
     ctx_len: 8

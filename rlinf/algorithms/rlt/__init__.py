@@ -13,11 +13,6 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
-from rlinf.algorithms.rlt.a1_stm import (
-    A1ShortTermMemory,
-    A1STMConfig,
-    build_a1_stm_config,
-)
 from rlinf.algorithms.rlt.a21_context import (
     A21ContextBuffer,
     A21ContextConfig,
@@ -40,8 +35,6 @@ from rlinf.algorithms.rlt.route import (
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 
 __all__ = [
-    "A1STMConfig",
-    "A1ShortTermMemory",
     "A21ContextBuffer",
     "A21ContextConfig",
     "A22MemoryBank",
@@ -50,7 +43,6 @@ __all__ = [
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
-    "build_a1_stm_config",
     "build_a21_context_config",
     "build_a22_memory_config",
     "build_expert_model_config",

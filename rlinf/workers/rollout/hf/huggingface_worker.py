@@ -25,9 +25,7 @@ from tqdm import tqdm
 
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
-    A1ShortTermMemory,
     A21ContextBuffer,
-    build_a1_stm_config,
     build_a21_context_config,
     build_rlt_route,
     predict_rlt_actions,
@@ -83,11 +81,9 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
-        self.a1_stm_config = build_a1_stm_config(cfg)
+        self.a21_context_config = build_a21_context_config(cfg)
         # Keyed by (mode, stage_id) so async train generate and evaluate never
         # share pending windows / _num_envs across different batch sizes.
-        self.a1_stm_by_mode_stage: dict[tuple[str, int], A1ShortTermMemory] = {}
-        self.a21_context_config = build_a21_context_config(cfg)
         self.a21_context_by_mode_stage: dict[tuple[str, int], A21ContextBuffer] = {}
 
         self.total_num_train_envs = (
@@ -166,17 +162,6 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
-
-        if self.a1_stm_config.enable:
-            if self.rlt_feature_model is None:
-                raise ValueError(
-                    "algorithm.a1_stm.enable=True requires rollout.rlt_feature_model."
-                )
-            self.a1_stm_by_mode_stage = {
-                (mode, stage_id): A1ShortTermMemory(self.a1_stm_config)
-                for mode in ("train", "eval")
-                for stage_id in range(self.num_pipeline_stages)
-            }
 
         if self.a21_context_config.enable:
             if self.rlt_feature_model is None:
@@ -593,18 +578,6 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
-    def _get_a1_stm(
-        self,
-        stage_id: int | None,
-        mode: Literal["train", "eval"] = "train",
-    ) -> A1ShortTermMemory | None:
-        if not self.a1_stm_config.enable:
-            return None
-        if not self.a1_stm_by_mode_stage:
-            return None
-        resolved_stage = 0 if stage_id is None else int(stage_id)
-        return self.a1_stm_by_mode_stage.get((mode, resolved_stage))
-
     def _get_a21_context(
         self,
         stage_id: int | None,
@@ -616,31 +589,6 @@ class MultiStepRolloutWorker(Worker):
             return None
         resolved_stage = 0 if stage_id is None else int(stage_id)
         return self.a21_context_by_mode_stage.get((mode, resolved_stage))
-
-    def pop_a1_stm_metrics(self) -> dict[str, float]:
-        """Flush train-mode STM accumulators into one rank-level metric dict."""
-        if not self.a1_stm_by_mode_stage:
-            return {}
-        sum_keys = {
-            "a1_stm/enhance_count",
-            "a1_stm/write_pos_count",
-            "a1_stm/write_neg_count",
-        }
-        totals: dict[str, float] = {}
-        counts: dict[str, int] = {}
-        for (mode, _), stm in self.a1_stm_by_mode_stage.items():
-            if mode != "train":
-                continue
-            for key, value in stm.pop_logged_metrics().items():
-                totals[key] = totals.get(key, 0.0) + float(value)
-                counts[key] = counts.get(key, 0) + 1
-        out: dict[str, float] = {}
-        for key, total in totals.items():
-            if key in sum_keys:
-                out[key] = total
-            else:
-                out[key] = total / max(counts[key], 1)
-        return out
 
     def _predict_rollout_actions(
         self,
@@ -666,7 +614,6 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
-                a1_stm=self._get_a1_stm(stage_id, mode=mode),
                 a21_context=self._get_a21_context(stage_id, mode=mode),
                 dones=dones,
                 rewards=rewards,
