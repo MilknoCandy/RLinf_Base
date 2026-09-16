@@ -22,12 +22,6 @@ from rlinf.utils.nested_dict_process import copy_dict_tensor
 RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
 RLT_TRANSITION_PREFIX = "rlt_transition_"
 
-# Optional A21 context keys; extracted when present in forward_inputs.
-try:
-    from rlinf.algorithms.rlt.a21_context import RLT_CONTEXT_KEYS as _RLT_CONTEXT_KEYS
-except Exception:  # pragma: no cover - circular import safety
-    _RLT_CONTEXT_KEYS = ("ctx_z", "ctx_a", "ctx_mask")
-
 
 def use_simulator_transition_replay(cfg: Any) -> bool:
     """Return True for envs that store one replay row per env step."""
@@ -63,10 +57,6 @@ def extract_rlt_obs_from_forward_inputs(
             "populates RLT features."
         )
     out = {key: forward_inputs[f"{prefix}{key}"] for key in RLT_OBS_KEYS}
-    for key in _RLT_CONTEXT_KEYS:
-        full = f"{prefix}{key}"
-        if full in forward_inputs:
-            out[key] = forward_inputs[full]
     return copy_dict_tensor(out)
 
 

@@ -81,11 +81,11 @@ class EnvWorker(Worker):
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
-        self.enable_a21_context = bool(
-            OmegaConf.select(self.cfg, "algorithm.a21_context.enable", default=False)
-        )
         self.enable_a22_memory = bool(
             OmegaConf.select(self.cfg, "algorithm.a22_memory.enable", default=False)
+        )
+        self.enable_a23_memory = bool(
+            OmegaConf.select(self.cfg, "algorithm.a23_memory.enable", default=False)
         )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -983,7 +983,7 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
-        if self.enable_a21_context or self.enable_a22_memory:
+        if self.enable_a22_memory or self.enable_a23_memory:
             data["dones"] = env_batch.get("dones", None)
             data["rewards"] = env_batch.get("rewards", None)
             data["success"] = self._extract_env_success(env_batch)

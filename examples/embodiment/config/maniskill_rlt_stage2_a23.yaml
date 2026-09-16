@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_a21_a22"
+    experiment_name: "maniskill_rlt_stage2_a23"
     logger_backends: ["wandb"]
 
   max_epochs: 5000
@@ -38,11 +38,11 @@ runner:
 
 algorithm:
   update_epoch: 5
-  # A21 = in-episode (z,a) context; A22 = MC-RTG bank + L_M.
-  a21_context:
-    enable: True
-    ctx_len: 8
+  # A23-v1: action-conditioned episodic Q_M only mixes into critic bootstrap.
+  # Actor loss stays the original RLT objective (no Memory→Actor path).
   a22_memory:
+    enable: False
+  a23_memory:
     enable: True
     pos_capacity: 4096
     neg_capacity: 4096
@@ -50,8 +50,8 @@ algorithm:
     temperature: 0.07
     k_pre: 16
     k_post: 4
-    lambda_m: 0.1
-    adv_threshold: 0.0
+    alpha: 0.1
+    failure_beta: 0.25
   rlt_schedule:
     enable: True
     max_updates_per_train_step: 400
@@ -255,7 +255,6 @@ rollout:
     fixed_std: ${actor.model.fixed_std}
     is_lora: False
     lora_rank: 32
-    a21_context: ${algorithm.a21_context}
 
   rlt_feature_model:
     model_type: "openpi"
@@ -355,7 +354,6 @@ actor:
     fixed_std: 0.002
     is_lora: False
     lora_rank: 32
-    a21_context: ${algorithm.a21_context}
 
   optim:
     clip_grad: 10.0

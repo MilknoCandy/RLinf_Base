@@ -16,11 +16,6 @@ import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
-from rlinf.algorithms.rlt.a21_context import (
-    A21ContextConfig,
-    empty_context_batch,
-    flatten_context,
-)
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
 
@@ -30,9 +25,6 @@ class RLTMLPPolicy(MLPPolicy):
     Actor input follows RLT: reference action chunk, RL token feature, and
     proprioceptive state. Critic input follows RLT: action chunk, RL token
     feature, and proprioceptive state.
-
-    Optional A21 context appends the last ``K_ctx`` steps of ``(z, a)`` to both
-    actor and critic inputs.
     """
 
     def __init__(
@@ -45,7 +37,6 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
-        a21_context_config: A21ContextConfig | None = None,
     ):
         if not add_q_head:
             raise ValueError(
@@ -65,19 +56,8 @@ class RLTMLPPolicy(MLPPolicy):
             )
         flat_action_dim = chunk_len * step_action_dim
 
-        self.a21_context_config = a21_context_config
-        self.context_dim = 0
-        if a21_context_config is not None and a21_context_config.enable:
-            if a21_context_config.z_dim != z_dim:
-                a21_context_config.z_dim = z_dim
-            if a21_context_config.action_dim != flat_action_dim:
-                a21_context_config.action_dim = flat_action_dim
-            self.context_dim = int(a21_context_config.ctx_len) * (
-                z_dim + flat_action_dim
-            )
-
-        actor_obs_dim = z_dim + proprio_dim + flat_action_dim + self.context_dim
-        critic_obs_dim = z_dim + proprio_dim + self.context_dim
+        actor_obs_dim = z_dim + proprio_dim + flat_action_dim
+        critic_obs_dim = z_dim + proprio_dim
 
         super().__init__(
             obs_dim=actor_obs_dim,
@@ -117,17 +97,6 @@ class RLTMLPPolicy(MLPPolicy):
     def _get_proprio(self, obs: dict) -> torch.Tensor:
         return self._flatten_batch(obs["proprio"])
 
-    def _get_context(self, obs: dict) -> torch.Tensor | None:
-        if self.context_dim <= 0:
-            return None
-        if "ctx_z" in obs and "ctx_a" in obs:
-            return flatten_context(obs)
-        assert self.a21_context_config is not None
-        batch = int(obs["z_rl"].shape[0])
-        device = obs["z_rl"].device
-        empty = empty_context_batch(batch, self.a21_context_config, device)
-        return flatten_context(empty)
-
     def _get_ref_chunk(self, obs: dict) -> torch.Tensor:
         ref_chunk = self._flatten_batch(obs["ref_chunk"]).reshape(
             obs["ref_chunk"].shape[0], -1, self.step_action_dim
@@ -158,18 +127,12 @@ class RLTMLPPolicy(MLPPolicy):
         ref_chunk = self._get_ref_chunk(obs)
         if apply_reference_dropout:
             ref_chunk = self._maybe_drop_reference(ref_chunk, reference_dropout_prob)
-        parts = [ref_chunk, self._get_z(obs), self._get_proprio(obs)]
-        ctx = self._get_context(obs)
-        if ctx is not None:
-            parts.append(ctx)
-        return torch.cat(parts, dim=-1)
+        return torch.cat(
+            [ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1
+        )
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
-        parts = [self._get_z(obs), self._get_proprio(obs)]
-        ctx = self._get_context(obs)
-        if ctx is not None:
-            parts.append(ctx)
-        return torch.cat(parts, dim=-1)
+        return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
 
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)

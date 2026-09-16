@@ -14,7 +14,6 @@
 
 import torch
 
-from rlinf.algorithms.rlt.a21_context import A21ContextBuffer, A21ContextConfig
 from rlinf.algorithms.rlt.a22_memory import (
     A22MemoryBank,
     A22MemoryConfig,
@@ -28,47 +27,6 @@ def test_monte_carlo_rtg():
     rewards = torch.tensor([0.0, 0.0, 1.0])
     rtg = compute_monte_carlo_rtg(rewards, gamma=0.5)
     assert torch.allclose(rtg, torch.tensor([0.25, 0.5, 1.0]))
-
-
-def test_a21_context_buffer_push_and_reset():
-    cfg = A21ContextConfig(enable=True, ctx_len=3, z_dim=4, action_dim=2)
-    buf = A21ContextBuffer(cfg)
-    ctx0 = buf.get(2, torch.device("cpu"))
-    assert float(ctx0["ctx_mask"].sum()) == 0.0
-
-    z = torch.randn(2, 4)
-    a = torch.randn(2, 2)
-    ctx1 = buf.push(z_rl=z, actions=a)
-    assert float(ctx1["ctx_mask"][:, -1].sum()) == 2.0 or float(ctx1["ctx_mask"].sum()) == 2.0
-
-    buf.reset(torch.tensor([True, False]))
-    ctx2 = buf.get(2, torch.device("cpu"))
-    assert float(ctx2["ctx_mask"][0].sum()) == 0.0
-    assert float(ctx2["ctx_mask"][1].sum()) == 1.0
-
-
-def test_a21_policy_input_dim_includes_context():
-    cfg = A21ContextConfig(enable=True, ctx_len=2, z_dim=8, action_dim=8)
-    policy = RLTMLPPolicy(
-        z_dim=8,
-        proprio_dim=4,
-        action_dim=2,
-        num_action_chunks=4,
-        a21_context_config=cfg,
-    )
-    assert policy.context_dim == 2 * (8 + 8)
-    obs = {
-        "z_rl": torch.randn(2, 8),
-        "proprio": torch.randn(2, 4),
-        "ref_chunk": torch.randn(2, 4, 2),
-        "ctx_z": torch.randn(2, 2, 8),
-        "ctx_a": torch.randn(2, 2, 8),
-        "ctx_mask": torch.ones(2, 2),
-    }
-    action, _, _ = policy.sac_forward(obs)
-    assert action.shape[0] == 2
-    q = policy.sac_q_forward(obs, action)
-    assert q.shape[0] == 2
 
 
 def test_a22_commit_episode_fills_rtg_and_e3_window():
@@ -98,7 +56,7 @@ def test_a22_commit_episode_fills_rtg_and_e3_window():
         critical_mask=critical,
         success=True,
     )
-    # E1: indices 1,2; E2 around T=5 with k_pre=2,k_post=1 -> 3,4,5 (and maybe 6 clipped)
+    # E1: indices 1,2; E2 around T=5 with k_pre=2,k_post=1 -> 3,4,5
     # union at least {1,2,3,4,5}
     assert n >= 5
     assert bank.pos_bank.size == n

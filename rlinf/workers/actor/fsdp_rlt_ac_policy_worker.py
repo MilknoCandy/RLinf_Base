@@ -14,6 +14,7 @@
 
 import asyncio
 import queue
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,11 @@ from rlinf.algorithms.rlt.a22_memory import (
     A22MemoryBank,
     build_a22_memory_config,
     compute_a22_memory_loss,
+)
+from rlinf.algorithms.rlt.a23_memory import (
+    A23MemoryBank,
+    build_a23_memory_config,
+    mix_a23_bootstrap_q,
 )
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
@@ -251,6 +257,7 @@ class RLTACLossMixin:
         not_done = ~done_source.reshape(done_source.shape[0], -1).bool().any(
             dim=-1, keepdim=True
         )
+        a23_metrics: dict[str, float] = {}
 
         with torch.no_grad():
             next_actions, _, _ = self._next_actions_for_critic_target(next_obs)
@@ -275,6 +282,26 @@ class RLTACLossMixin:
             reward_target = self._discounted_chunk_rewards(rewards)
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
             bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
+
+            a23_bank = getattr(self, "a23_memory_bank", None)
+            a23_cfg = getattr(self, "a23_memory_config", None)
+            if (
+                a23_bank is not None
+                and a23_cfg is not None
+                and a23_cfg.enable
+                and a23_bank.memory_size > 0
+            ):
+                next_z = next_obs.get("z_rl")
+                if isinstance(next_z, torch.Tensor):
+                    q_m, q_m_metrics = a23_bank.estimate_q_m(next_z, next_actions)
+                    q_next, mix_metrics = mix_a23_bootstrap_q(
+                        q_next=q_next,
+                        q_m=q_m,
+                        alpha=float(a23_cfg.alpha),
+                    )
+                    a23_metrics.update(q_m_metrics)
+                    a23_metrics.update(mix_metrics)
+
             if bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
             elif bootstrap_type == "standard":
@@ -301,7 +328,9 @@ class RLTACLossMixin:
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        critic_metrics = {"q_data": all_data_q_values.mean().item()}
+        critic_metrics.update(a23_metrics)
+        return critic_loss, critic_metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -413,10 +442,33 @@ class RLTACReplayMixin:
         if self.a22_memory_config.enable:
             self.a22_memory_bank = A22MemoryBank(self.a22_memory_config)
 
+    def _setup_a23_memory(self) -> None:
+        self.a23_memory_config = build_a23_memory_config(self.cfg)
+        self.a23_memory_bank: A23MemoryBank | None = None
+        if self.a23_memory_config.enable:
+            self.a23_memory_bank = A23MemoryBank(self.a23_memory_config)
+
     def _ingest_a22_from_raw_trajectories(self, recv_list: list[Trajectory]) -> None:
         """Commit E1∪E2 memory entries after each completed episode (MC-RTG)."""
-        bank = getattr(self, "a22_memory_bank", None)
-        if bank is None:
+        self._ingest_episode_memory_banks(
+            recv_list,
+            banks=[
+                bank
+                for bank in (
+                    getattr(self, "a22_memory_bank", None),
+                    getattr(self, "a23_memory_bank", None),
+                )
+                if bank is not None
+            ],
+        )
+
+    def _ingest_episode_memory_banks(
+        self,
+        recv_list: list[Trajectory],
+        banks: list[Any],
+    ) -> None:
+        """Commit completed episodes into one or more episodic memory banks."""
+        if not banks:
             return
         for trajectory in recv_list:
             if (
@@ -471,13 +523,14 @@ class RLTACReplayMixin:
                     success = bool(
                         r_seq.detach().float().reshape(-1).sum().item() > 0.0
                     )
-                    bank.commit_episode(
-                        z_seq=z_seq,
-                        a_seq=a_seq,
-                        r_seq=r_seq,
-                        critical_mask=crit_seq,
-                        success=success,
-                    )
+                    for bank in banks:
+                        bank.commit_episode(
+                            z_seq=z_seq,
+                            a_seq=a_seq,
+                            r_seq=r_seq,
+                            critical_mask=crit_seq,
+                            success=success,
+                        )
                     start = end
 
     @staticmethod
@@ -790,6 +843,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
         self._setup_a22_memory()
+        self._setup_a23_memory()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
 
@@ -988,6 +1042,9 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         bank = getattr(self, "a22_memory_bank", None)
         if bank is not None:
             mean_metric_dict = {**mean_metric_dict, **bank.pop_write_metrics()}
+        a23_bank = getattr(self, "a23_memory_bank", None)
+        if a23_bank is not None:
+            mean_metric_dict = {**mean_metric_dict, **a23_bank.pop_write_metrics()}
 
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -1100,4 +1157,7 @@ class AsyncRLTACFSDPPolicy(RLTACFSDPPolicy, AsyncEmbodiedSACFSDPPolicy):
         bank = getattr(self, "a22_memory_bank", None)
         if bank is not None:
             mean_metric_dict = {**mean_metric_dict, **bank.pop_write_metrics()}
+        a23_bank = getattr(self, "a23_memory_bank", None)
+        if a23_bank is not None:
+            mean_metric_dict = {**mean_metric_dict, **a23_bank.pop_write_metrics()}
         return mean_metric_dict

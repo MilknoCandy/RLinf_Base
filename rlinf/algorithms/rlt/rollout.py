@@ -17,7 +17,6 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
-from rlinf.algorithms.rlt.a21_context import A21ContextBuffer, RLT_CONTEXT_KEYS
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
 
@@ -28,27 +27,12 @@ def _append_rlt_transition_obs(
     result: dict[str, Any],
     rlt_obs: dict[str, torch.Tensor],
     final_obs: dict[str, Any] | None,
-    next_context: dict[str, torch.Tensor] | None = None,
 ) -> None:
     transition_obs = rlt_obs
     if final_obs is not None:
         transition_obs = feature_model.extract_rlt_obs(final_obs)
     for key in RLT_OBS_KEYS:
         result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
-    # A21: next state's context is the buffer *after* pushing current (z, a).
-    if next_context is not None:
-        for key in RLT_CONTEXT_KEYS:
-            if key in next_context:
-                result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = next_context[
-                    key
-                ]
-
-
-def _flatten_actions(actions: torch.Tensor) -> torch.Tensor:
-    flat = actions.detach().float()
-    if flat.ndim > 2:
-        flat = flat.reshape(flat.shape[0], -1)
-    return flat
 
 
 def predict_rlt_actions(
@@ -63,22 +47,13 @@ def predict_rlt_actions(
     rlt_switch_flags: torch.Tensor | None = None,
     intervene_requested: torch.Tensor | None = None,
     expert_model: Any | None = None,
-    a21_context: A21ContextBuffer | None = None,
     dones: torch.Tensor | None = None,
     rewards: torch.Tensor | None = None,
     success: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    del rewards, success  # Reserved for future A22 rollout-side write hooks.
+    del dones, rewards, success  # Reserved for future memory write hooks.
     with torch.no_grad():
         rlt_obs = feature_model.extract_rlt_obs(env_obs)
-
-        if a21_context is not None and a21_context.enabled:
-            # Reset completed envs before reading context for the new step.
-            a21_context.reset(dones)
-            batch_size = int(rlt_obs["z_rl"].shape[0])
-            device = rlt_obs["z_rl"].device
-            ctx = a21_context.get(batch_size, device)
-            rlt_obs.update(ctx)
 
         actions, result = policy_model.predict_action_batch(
             env_obs=rlt_obs,
@@ -107,19 +82,11 @@ def predict_rlt_actions(
         actions = route_output.actions
         result = route_output.result
 
-        next_context = None
-        if a21_context is not None and a21_context.enabled:
-            # Push executed (routed) actions so context matches what the env saw.
-            next_context = a21_context.push(
-                z_rl=rlt_obs["z_rl"], actions=_flatten_actions(actions)
-            )
-
         _append_rlt_transition_obs(
             feature_model=feature_model,
             result=result,
             rlt_obs=rlt_obs,
             final_obs=final_obs,
-            next_context=next_context,
         )
 
     return actions, result
