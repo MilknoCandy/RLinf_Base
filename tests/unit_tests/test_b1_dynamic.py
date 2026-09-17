@@ -46,6 +46,7 @@ B1DynamicModule = _b1.B1DynamicModule
 B1DynamicRuntime = _b1.B1DynamicRuntime
 compute_b1_pred_loss = _b1.compute_b1_pred_loss
 attach_b1_future_targets = _b1.attach_b1_future_targets
+ensure_b1_obs_schema = _b1.ensure_b1_obs_schema
 
 
 def _cfg(**overrides):
@@ -215,3 +216,28 @@ def test_attach_b1_future_targets_masks_past_horizon():
     assert not bool(curr_obs["z_app_future_mask_1"].item())
     assert not bool(curr_obs["z_app_future_mask_4"].item())
     assert curr_obs["z_app_future_mask_1"].dim() >= 2
+
+
+def test_ensure_b1_obs_schema_aligns_next_obs_with_curr():
+    """Non-terminal next_obs must match curr_obs keys after flatten (cache schema)."""
+    horizons = (1, 4, 8)
+    curr = {"z_rl": torch.randn(1, 1, 8), "z_app": torch.randn(1, 1, 8)}
+    attach_b1_future_targets(
+        curr,
+        flat_curr_obs={"z_app": torch.randn(3, 8)},
+        t=0,
+        env_idx=0,
+        traj_len=3,
+        bsz=1,
+        horizons=horizons,
+        z_dim=8,
+        feature_dim=4,
+        num_tokens=2,
+    )
+    nxt = {"z_rl": torch.randn(1, 1, 8)}
+    ensure_b1_obs_schema(
+        nxt, horizons=horizons, z_dim=8, feature_dim=4, num_tokens=2
+    )
+    flat_curr = _flatten_curr_obs_like_replay(curr)
+    flat_next = _flatten_curr_obs_like_replay(nxt)
+    assert set(flat_curr.keys()) == set(flat_next.keys())

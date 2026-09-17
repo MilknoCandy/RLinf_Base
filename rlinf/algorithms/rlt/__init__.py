@@ -32,6 +32,7 @@ from rlinf.algorithms.rlt.b1_dynamic import (
     attach_b1_future_targets,
     build_b1_dynamic_config,
     compute_b1_pred_loss,
+    ensure_b1_obs_schema,
     maybe_build_b1_module,
 )
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
@@ -64,6 +65,7 @@ __all__ = [
     "build_rlt_route",
     "compute_a22_memory_loss",
     "compute_b1_pred_loss",
+    "ensure_b1_obs_schema",
     "maybe_build_b1_module",
     "mix_a23_bootstrap_q",
     "predict_rlt_actions",

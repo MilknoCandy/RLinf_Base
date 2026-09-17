@@ -33,6 +33,7 @@ from rlinf.algorithms.rlt.b1_dynamic import (
     attach_b1_future_targets,
     build_b1_dynamic_config,
     compute_b1_pred_loss,
+    ensure_b1_obs_schema,
 )
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
@@ -762,11 +763,12 @@ class RLTACReplayMixin:
                         f"before replay ingestion, got row index {idx}."
                     )
                 b1_cfg = getattr(self, "b1_dynamic_config", None)
-                if (
+                b1_enabled = (
                     b1_cfg is not None
                     and b1_cfg.enable
                     and isinstance(flat.get("curr_obs"), dict)
-                ):
+                )
+                if b1_enabled:
                     self._attach_b1_future_targets(
                         curr_obs,
                         flat_curr_obs=flat["curr_obs"],
@@ -812,6 +814,17 @@ class RLTACReplayMixin:
                     next_obs = curr_obs
                 else:
                     next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
+                    # Non-terminal next_obs must share curr_obs's B1 key set;
+                    # otherwise TrajectoryCache freezes without z_app_future_* and
+                    # terminal rows (next_obs is curr_obs) KeyError on insert.
+                    if b1_enabled and next_obs is not None:
+                        ensure_b1_obs_schema(
+                            next_obs,
+                            horizons=b1_cfg.pred_horizons,
+                            z_dim=int(b1_cfg.z_dim),
+                            feature_dim=int(b1_cfg.feature_dim),
+                            num_tokens=int(b1_cfg.num_tokens),
+                        )
                 if next_obs is not None:
                     transition.next_obs = next_obs
                 else:
