@@ -1,45 +1,109 @@
-  报错原因
+  KeyError: 'z_app_future_1' 说明轨迹字段与 replay buffer 的 schema 不一致；我先沿 ingest → buffer insert 和 B1 的 z_app_future_*
+  写入路径查。
 
-  一句话：async 模式下，train 生成后台任务与 eval 协程在同一个 rollout worker 上并发共享同一个 
-  A1ShortTermMemory 实例，而两者每 rank 的 batch 大小不同；finalize_pending 用上一次调用注册的
-  _num_envs 去 reshape 本次传入的 dones，phase 切换时尺寸不匹配即崩溃。
+    Grepped, read 15 greps, 22 files
+    … 34 earlier items hidden
+    Grepped "def add_trajectories|clone_dict|_flatten" in rlinf/data/storage/replay/buffer.py
+    Grepped "...ct_rlt_actions|update_rlt_transitions" in rlinf/workers/rollout
+    Read rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 508-547
 
-  因果链（结合代码与 traceback）：
+  结论
 
-  1. STM 实例只按 stage_id 建一份（huggingface_worker.py 
-     (rlinf/workers/rollout/hf/huggingface_worker.py) 第 169-172 行），pipeline_stage_num=1
-     时每 rank 全局唯一，train/eval 共用。
+  这是 B1 在 ingest 时往 curr_obs 注入的 z_app_future_*，与 TrajectoryCache「按首条轨迹冻结 schema」冲突 导致的。AsyncMultiStepRolloutWorker
+  挂掉是连带现象（actor 先挂，Ray 取消依赖 task）。
 
-  2. async runner 中 rollout.generate() 启动的后台任务永久循环
-     generate_one_epoch（async_huggingface_worker.py 
-     (rlinf/workers/rollout/hf/async_huggingface_worker.py) 第 72-78 行）；到达
-     val_check_interval 时，evaluate() 在同一 worker 上并发调用
-     rollout.evaluate()（async_embodied_runner.py (rlinf/runners/async_embodied_runner.py) 第 
-     149 行），train 任务并不暂停。
+  ────────────────────────────────────────
 
-  3. STM 的尺寸注册逻辑（a1_stm.py (rlinf/algorithms/rlt/a1_stm.py)）：
-    • _ensure_num_envs 只在 enhance/set_pending 中被调用，按当前 batch 重建全部状态（第
-      191-216 行）；
-    • finalize_pending 却用上一次注册的 self._num_envs 去 reshape 本次的 dones（第 278 行 → 第
-      229 行）。
+  调用链
 
-  4. 实际交错时序（与你的报错完全吻合）：
-    • train 调用：_num_envs=12（你部署配置的 train 每 rank batch，如 total_num_envs=96/8
-      卡）；
-    • eval 开始（日志中 Evaluating Rollout Epochs: 0/1）：eval 调用 mode="eval" →
-      allow_write=False，finalize_pending 提前返回不报错，但 enhance(z<16>) 把 _num_envs
-      重建为 16（eval 每 rank batch，如 eval 128/8），同时 set_pending 置
-      _pending_valid=True；
-    • train 任务下一个 chunk step：finalize_pending(dones<12个元素>, allow_write=True) →
-      _as_bool_mask(dones, 16) → reshape(16) 作用于 12 个元素 → RuntimeError: shape '[16]' is 
-      invalid for input of size 12。
+  run_training
+    → _drain_received_trajectories
+    → _ingest_rollout_trajectories
+    → _transition_replay_trajectories   # 这里 _attach_b1_future_targets 写入 z_app_future_*
+    → replay_buffer.add_trajectories
+    → TrajectoryCache.put / _insert_into_buffer
+    → KeyError: 'z_app_future_1'
 
-  这也解释了为何恰好在首次 eval 启动时崩溃：那是整个运行中第一次出现不同 batch 尺寸。
+  ────────────────────────────────────────
 
-  同根源的另外两个隐患（即使绕过崩溃也存在）
+  根因
 
-  1. 状态被静默清空：每次 eval 的 enhance 都会重建 _num_envs，train 积累的 STM 窗口/pending
-     被无声销毁。
-  2. 跨 phase 污染：eval 的 set_pending 置位后，下一个 train 的
-     finalize_pending（allow_write=True）会把 eval 的 z 写入 train 窗口、并拿 train 的 dones
-     做 consolidate；且 train/eval 的 env 索引语义完全不同。
+  1. Cache schema 冻结（直接触发 KeyError）
+
+  TrajectoryCache (rlinf/data/storage/replay/buffer.py) 在第一次 put 时用 _alloc_buffer_like 按该条 flat traj 的 key 建 buffer；之后 
+  _insert_into_buffer 假定 key 集合不变：
+
+   rlinf/data/storage/replay/buffer.py lines 96-102
+
+      def _insert_into_buffer(self, trajectory: dict, buffer: dict, start: int) -> None:
+          for key, value in trajectory.items():
+              if isinstance(value, torch.Tensor):
+                  end = start + value.shape[0]
+                  buffer[key][start:end] = value
+              elif isinstance(value, dict):
+                  self._insert_into_buffer(value, buffer[key], start)
+
+  B1 的 future 字段不是 rollout 原始字段，而是 actor 侧后加的：
+
+   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 768-779
+
+                  b1_cfg = getattr(self, "b1_dynamic_config", None)
+                  if (
+                      b1_cfg is not None
+                      and b1_cfg.enable
+                      and isinstance(flat.get("curr_obs"), dict)
+                  ):
+                      self._attach_b1_future_targets(
+                          curr_obs,
+                          flat_curr_obs=flat["curr_obs"],
+                          ...
+                          horizons=b1_cfg.pred_horizons,
+                      )
+
+  因此会出现：
+
+  ┌────────────────────────────┬───────────────────┬────────────────────────┐
+  │ 先写入 cache 的 traj       │ 后写入的 traj     │ 结果                   │
+  ├────────────────────────────┼───────────────────┼────────────────────────┤
+  │ 无 curr_obs.z_app_future_* │ 有 z_app_future_1 │ KeyError（你现在的错） │
+  └────────────────────────────┴───────────────────┴────────────────────────┘
+
+  2. 为何有的 transition 没有 future keys
+
+  _attach_b1_future_targets 在没有 z_app 时直接 return，不写任何 future 占位：
+
+   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 506-508
+
+          z_app_all = flat_curr_obs.get("z_app")
+          if not isinstance(z_app_all, torch.Tensor):
+              return
+
+  z_app 又只在 RLT_B1_OPTIONAL_KEYS 里按需拷贝；episode stack 用的是第一步的 key 集合（stack_list_of_dict_tensor 
+  (rlinf/utils/nested_dict_process.py)）。只要某条 episode 的 stacked curr_obs 里没有 z_app，整条拆出来的 transition 都不会带
+  z_app_future_*。这些「无 future」的 transition 若先 put，schema 就冻死了；后面带 B1 future 的一写就炸。
+
+  3. 连带 bug：mask 形状导致 L_pred 即使不 KeyError 也存不进 cache
+
+   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 514-516
+
+                  curr_obs[m_key] = torch.tensor(False)   # 0-dim!
+                  ...
+              curr_obs[m_key] = torch.tensor(True)        # 0-dim!
+
+  而 flatten 只保留 dim >= 2 的 tensor：
+
+   rlinf/data/storage/replay/buffer.py lines 736-738
+
+              for key, tensor in trajectory.curr_obs.items():
+                  if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
+                      flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+
+  所以 z_app_future_mask_* 永远进不了 flat cache。Actor 侧又要求 z 和 mask 都在才算 L_pred：
+
+   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 444-446
+
+                  if z_key in curr_obs and m_key in curr_obs:
+                      future_z[horizon] = curr_obs[z_key]
+                      future_mask[horizon] = curr_obs[m_key]
+
+  即便修掉 KeyError，B1 的 pred_loss 也很可能一直不生效。
