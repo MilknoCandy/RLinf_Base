@@ -73,7 +73,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     model: OpenPiProbeForRLActionPrediction = OpenPiProbeForRLActionPrediction(
         actor_model_config,
-        rlt_feature_source=rlt_feature_source,
+        feature_source=rlt_feature_source,
         rlt_mode=rlt_mode,
     )
     if actor_model_config.train_expert_only:
