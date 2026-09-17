@@ -1,109 +1,29 @@
-  KeyError: 'z_app_future_1' 说明轨迹字段与 replay buffer 的 schema 不一致；我先沿 ingest → buffer insert 和 B1 的 z_app_future_*
-  写入路径查。
-
-    Grepped, read 15 greps, 22 files
-    … 34 earlier items hidden
-    Grepped "def add_trajectories|clone_dict|_flatten" in rlinf/data/storage/replay/buffer.py
-    Grepped "...ct_rlt_actions|update_rlt_transitions" in rlinf/workers/rollout
-    Read rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 508-547
-
-  结论
-
-  这是 B1 在 ingest 时往 curr_obs 注入的 z_app_future_*，与 TrajectoryCache「按首条轨迹冻结 schema」冲突 导致的。AsyncMultiStepRolloutWorker
-  挂掉是连带现象（actor 先挂，Ray 取消依赖 task）。
-
-  ────────────────────────────────────────
-
-  调用链
-
-  run_training
-    → _drain_received_trajectories
-    → _ingest_rollout_trajectories
-    → _transition_replay_trajectories   # 这里 _attach_b1_future_targets 写入 z_app_future_*
-    → replay_buffer.add_trajectories
-    → TrajectoryCache.put / _insert_into_buffer
-    → KeyError: 'z_app_future_1'
-
-  ────────────────────────────────────────
-
-  根因
-
-  1. Cache schema 冻结（直接触发 KeyError）
-
-  TrajectoryCache (rlinf/data/storage/replay/buffer.py) 在第一次 put 时用 _alloc_buffer_like 按该条 flat traj 的 key 建 buffer；之后 
-  _insert_into_buffer 假定 key 集合不变：
-
-   rlinf/data/storage/replay/buffer.py lines 96-102
-
-      def _insert_into_buffer(self, trajectory: dict, buffer: dict, start: int) -> None:
-          for key, value in trajectory.items():
-              if isinstance(value, torch.Tensor):
-                  end = start + value.shape[0]
-                  buffer[key][start:end] = value
-              elif isinstance(value, dict):
-                  self._insert_into_buffer(value, buffer[key], start)
-
-  B1 的 future 字段不是 rollout 原始字段，而是 actor 侧后加的：
-
-   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 768-779
-
-                  b1_cfg = getattr(self, "b1_dynamic_config", None)
-                  if (
-                      b1_cfg is not None
-                      and b1_cfg.enable
-                      and isinstance(flat.get("curr_obs"), dict)
-                  ):
-                      self._attach_b1_future_targets(
-                          curr_obs,
-                          flat_curr_obs=flat["curr_obs"],
-                          ...
-                          horizons=b1_cfg.pred_horizons,
-                      )
-
-  因此会出现：
-
-  ┌────────────────────────────┬───────────────────┬────────────────────────┐
-  │ 先写入 cache 的 traj       │ 后写入的 traj     │ 结果                   │
-  ├────────────────────────────┼───────────────────┼────────────────────────┤
-  │ 无 curr_obs.z_app_future_* │ 有 z_app_future_1 │ KeyError（你现在的错） │
-  └────────────────────────────┴───────────────────┴────────────────────────┘
-
-  2. 为何有的 transition 没有 future keys
-
-  _attach_b1_future_targets 在没有 z_app 时直接 return，不写任何 future 占位：
-
-   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 506-508
-
-          z_app_all = flat_curr_obs.get("z_app")
-          if not isinstance(z_app_all, torch.Tensor):
-              return
-
-  z_app 又只在 RLT_B1_OPTIONAL_KEYS 里按需拷贝；episode stack 用的是第一步的 key 集合（stack_list_of_dict_tensor 
-  (rlinf/utils/nested_dict_process.py)）。只要某条 episode 的 stacked curr_obs 里没有 z_app，整条拆出来的 transition 都不会带
-  z_app_future_*。这些「无 future」的 transition 若先 put，schema 就冻死了；后面带 B1 future 的一写就炸。
-
-  3. 连带 bug：mask 形状导致 L_pred 即使不 KeyError 也存不进 cache
-
-   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 514-516
-
-                  curr_obs[m_key] = torch.tensor(False)   # 0-dim!
-                  ...
-              curr_obs[m_key] = torch.tensor(True)        # 0-dim!
-
-  而 flatten 只保留 dim >= 2 的 tensor：
-
-   rlinf/data/storage/replay/buffer.py lines 736-738
-
-              for key, tensor in trajectory.curr_obs.items():
-                  if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                      flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
-
-  所以 z_app_future_mask_* 永远进不了 flat cache。Actor 侧又要求 z 和 mask 都在才算 L_pred：
-
-   rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py lines 444-446
-
-                  if z_key in curr_obs and m_key in curr_obs:
-                      future_z[horizon] = curr_obs[z_key]
-                      future_mask[horizon] = curr_obs[m_key]
-
-  即便修掉 KeyError，B1 的 pred_loss 也很可能一直不生效。
+Exception occurred while running AsyncRLTACFSDPPolicy's function run_training: exception is ray::AsyncRLTACFSDPPolicy.run_training() (pid=1637582, ip=172.16.6.41, actor_id=ddf3498bcc4c2d870901926a01000000, repr=ActorGroup(rank=0))
+  File "/opt/huawei/explorer-env/dataset/Common_wl/miniconda3/envs/sdw_rlinf-pi312/lib/python3.12/concurrent/futures/_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/huawei/explorer-env/dataset/Common_wl/miniconda3/envs/sdw_rlinf-pi312/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/scheduler/worker/worker.py", line 91, in async_func
+    return await func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py", line 1185, in run_training
+    self._drain_received_trajectories()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py", line 1181, in _drain_received_trajectories
+    added, completed = self._ingest_rollout_trajectories(recv_list)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py", line 881, in _ingest_rollout_trajectories
+    self.replay_buffer.add_trajectories(replay_list)
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/data/storage/replay/buffer.py", line 502, in add_trajectories
+    self._flat_trajectory_cache.put(
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/data/storage/replay/buffer.py", line 216, in put
+    self._insert_into_buffer(trajectory, self._buffer, start)
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/data/storage/replay/buffer.py", line 102, in _insert_into_buffer
+    self._insert_into_buffer(value, buffer[key], start)
+  File "/home/ma-user/work/algorithm/sdw_calvin/RLinf_Base/rlinf/data/storage/replay/buffer.py", line 100, in _insert_into_buffer
+    buffer[key][start:end] = value
+    ~~~~~~^^^^^
+KeyError: 'z_app_future_1'
