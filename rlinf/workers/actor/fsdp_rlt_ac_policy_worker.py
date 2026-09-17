@@ -29,6 +29,10 @@ from rlinf.algorithms.rlt.a23_memory import (
     build_a23_memory_config,
     mix_a23_bootstrap_q,
 )
+from rlinf.algorithms.rlt.b1_dynamic import (
+    build_b1_dynamic_config,
+    compute_b1_pred_loss,
+)
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -422,6 +426,42 @@ class RLTACLossMixin:
                 (float(a22_cfg.lambda_m) * lm_loss).detach().item()
             )
 
+        # B1: future-token prediction on recomputed h_t = U(h_prev, z_app).
+        b1_module = getattr(self.model, "b1_dynamic", None)
+        b1_cfg = getattr(self, "b1_dynamic_config", None)
+        if (
+            b1_module is not None
+            and b1_cfg is not None
+            and b1_cfg.enable
+            and "z_app" in curr_obs
+            and "b1_h_prev" in curr_obs
+        ):
+            future_z = {}
+            future_mask = {}
+            for horizon in b1_cfg.pred_horizons:
+                z_key = f"z_app_future_{horizon}"
+                m_key = f"z_app_future_mask_{horizon}"
+                if z_key in curr_obs and m_key in curr_obs:
+                    future_z[horizon] = curr_obs[z_key]
+                    future_mask[horizon] = curr_obs[m_key]
+            if future_z:
+                update_mask = curr_obs.get("b1_updated")
+                pred_loss, pred_metrics = compute_b1_pred_loss(
+                    b1_module,
+                    z_app=curr_obs["z_app"],
+                    h_prev=curr_obs["b1_h_prev"],
+                    future_z=future_z,
+                    future_mask=future_mask,
+                    config=b1_cfg,
+                    update_mask=update_mask,
+                )
+                actor_loss = actor_loss + float(b1_cfg.lambda_pred) * pred_loss
+                metrics.update(pred_metrics)
+                metrics["b1_dynamic/lambda_pred"] = float(b1_cfg.lambda_pred)
+                metrics["b1_dynamic/weighted_pred"] = float(
+                    (float(b1_cfg.lambda_pred) * pred_loss).detach().item()
+                )
+
         return actor_loss, entropy, metrics
 
     @Worker.timer("forward_alpha")
@@ -447,6 +487,42 @@ class RLTACReplayMixin:
         self.a23_memory_bank: A23MemoryBank | None = None
         if self.a23_memory_config.enable:
             self.a23_memory_bank = A23MemoryBank(self.a23_memory_config)
+
+    def _setup_b1_dynamic(self) -> None:
+        self.b1_dynamic_config = build_b1_dynamic_config(self.cfg)
+
+    @staticmethod
+    def _attach_b1_future_targets(
+        curr_obs: dict[str, torch.Tensor],
+        *,
+        flat_curr_obs: dict[str, Any],
+        t: int,
+        env_idx: int,
+        traj_len: int,
+        bsz: int,
+        horizons: tuple[int, ...],
+    ) -> None:
+        """Look ahead in the same env trajectory for future appearance tokens."""
+        z_app_all = flat_curr_obs.get("z_app")
+        if not isinstance(z_app_all, torch.Tensor):
+            return
+        for horizon in horizons:
+            future_t = t + int(horizon)
+            z_key = f"z_app_future_{horizon}"
+            m_key = f"z_app_future_mask_{horizon}"
+            if future_t >= traj_len:
+                curr_obs[z_key] = torch.zeros_like(curr_obs["z_app"])
+                curr_obs[m_key] = torch.tensor(False)
+                continue
+            future_idx = future_t * bsz + env_idx
+            if future_idx >= int(z_app_all.shape[0]):
+                curr_obs[z_key] = torch.zeros_like(curr_obs["z_app"])
+                curr_obs[m_key] = torch.tensor(False)
+                continue
+            curr_obs[z_key] = z_app_all[future_idx : future_idx + 1].reshape_as(
+                curr_obs["z_app"]
+            )
+            curr_obs[m_key] = torch.tensor(True)
 
     def _ingest_a22_from_raw_trajectories(self, recv_list: list[Trajectory]) -> None:
         """Commit E1∪E2 memory entries after each completed episode (MC-RTG)."""
@@ -689,6 +765,21 @@ class RLTACReplayMixin:
                         "update_rlt_transitions() populated transition obs "
                         f"before replay ingestion, got row index {idx}."
                     )
+                b1_cfg = getattr(self, "b1_dynamic_config", None)
+                if (
+                    b1_cfg is not None
+                    and b1_cfg.enable
+                    and isinstance(flat.get("curr_obs"), dict)
+                ):
+                    self._attach_b1_future_targets(
+                        curr_obs,
+                        flat_curr_obs=flat["curr_obs"],
+                        t=t,
+                        env_idx=env_idx,
+                        traj_len=traj_len,
+                        bsz=bsz,
+                        horizons=b1_cfg.pred_horizons,
+                    )
                 transition.curr_obs = curr_obs
 
                 # Dones have one extra initial slot, so transition t reads
@@ -852,6 +943,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         super().setup_sac_components()
         self._setup_a22_memory()
         self._setup_a23_memory()
+        self._setup_b1_dynamic()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
 

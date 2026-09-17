@@ -36,6 +36,30 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
         )
+        b1_block = cfg.get("b1_dynamic", None)
+        if b1_block is not None and bool(b1_block.get("enable", False)):
+            from rlinf.algorithms.rlt.b1_dynamic import (
+                B1DynamicConfig,
+                B1DynamicModule,
+            )
+
+            horizons = b1_block.get("pred_horizons", [1, 4, 8])
+            weights = b1_block.get("pred_weights", [1.0, 0.5, 0.25])
+            b1_cfg = B1DynamicConfig(
+                enable=True,
+                z_dim=int(b1_block.get("z_dim", cfg.z_dim)),
+                feature_dim=int(b1_block.get("feature_dim", 256)),
+                num_tokens=int(b1_block.get("num_tokens", 16)),
+                num_layers=int(b1_block.get("num_layers", 2)),
+                num_heads=int(b1_block.get("num_heads", 4)),
+                mlp_ratio=float(b1_block.get("mlp_ratio", 4.0)),
+                dropout=float(b1_block.get("dropout", 0.0)),
+                only_critical=bool(b1_block.get("only_critical", True)),
+                lambda_pred=float(b1_block.get("lambda_pred", 0.1)),
+                pred_horizons=tuple(int(x) for x in list(horizons)),
+                pred_weights=tuple(float(x) for x in list(weights)),
+            )
+            model.add_module("b1_dynamic", B1DynamicModule(b1_cfg))
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(
             z_dim=cfg.z_dim,

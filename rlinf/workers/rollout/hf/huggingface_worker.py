@@ -79,6 +79,7 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self.b1_runtime = None
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -185,6 +186,12 @@ class MultiStepRolloutWorker(Worker):
                 train_batch_size=self.per_node_train_batch_size,
                 eval_batch_size=self.per_node_eval_batch_size,
             )
+
+        b1_module = getattr(self.hf_model, "b1_dynamic", None)
+        if b1_module is not None:
+            from rlinf.algorithms.rlt.b1_dynamic import B1DynamicRuntime
+
+            self.b1_runtime = B1DynamicRuntime(config=b1_module.config)
 
         self.setup_sample_params()
         if self.enable_offload:
@@ -582,6 +589,7 @@ class MultiStepRolloutWorker(Worker):
                 dones=dones,
                 rewards=rewards,
                 success=success,
+                b1_runtime=self.b1_runtime,
             )
         return self.predict(env_obs, mode=mode)
 

@@ -20,6 +20,14 @@ from rlinf.envs import SupportedEnvType
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
+# Optional B1 fields stored alongside core RLT obs when enabled.
+RLT_B1_OPTIONAL_KEYS = (
+    "z_app",
+    "b1_h",
+    "b1_h_prev",
+    "b1_gate",
+    "b1_updated",
+)
 RLT_TRANSITION_PREFIX = "rlt_transition_"
 
 
@@ -57,6 +65,12 @@ def extract_rlt_obs_from_forward_inputs(
             "populates RLT features."
         )
     out = {key: forward_inputs[f"{prefix}{key}"] for key in RLT_OBS_KEYS}
+    for key in RLT_B1_OPTIONAL_KEYS:
+        full_key = f"{prefix}{key}"
+        if full_key in forward_inputs:
+            out[key] = forward_inputs[full_key]
+        elif key in forward_inputs:
+            out[key] = forward_inputs[key]
     return copy_dict_tensor(out)
 
 

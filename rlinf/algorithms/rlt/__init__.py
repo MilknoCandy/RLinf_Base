@@ -25,6 +25,14 @@ from rlinf.algorithms.rlt.a23_memory import (
     build_a23_memory_config,
     mix_a23_bootstrap_q,
 )
+from rlinf.algorithms.rlt.b1_dynamic import (
+    B1DynamicConfig,
+    B1DynamicModule,
+    B1DynamicRuntime,
+    build_b1_dynamic_config,
+    compute_b1_pred_loss,
+    maybe_build_b1_module,
+)
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
@@ -40,15 +48,21 @@ __all__ = [
     "A22MemoryConfig",
     "A23MemoryBank",
     "A23MemoryConfig",
+    "B1DynamicConfig",
+    "B1DynamicModule",
+    "B1DynamicRuntime",
     "RLTRoute",
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
     "build_a22_memory_config",
     "build_a23_memory_config",
+    "build_b1_dynamic_config",
     "build_expert_model_config",
     "build_rlt_route",
     "compute_a22_memory_loss",
+    "compute_b1_pred_loss",
+    "maybe_build_b1_module",
     "mix_a23_bootstrap_q",
     "predict_rlt_actions",
     "use_simulator_transition_replay",
