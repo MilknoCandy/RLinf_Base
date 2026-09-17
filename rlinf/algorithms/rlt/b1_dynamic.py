@@ -311,7 +311,9 @@ class B1DynamicRuntime:
             "b1_h": h_out.detach(),
             "b1_h_prev": h_prev,
             "b1_gate": gate_out.detach(),
-            "b1_updated": update_mask,
+            # Keep a trailing dim so episode stack [T, B, 1] survives
+            # ReplayBuffer._flatten_trajectory (requires tensor.dim() >= 2).
+            "b1_updated": update_mask.unsqueeze(-1),
         }
 
 
@@ -370,6 +372,84 @@ def compute_b1_pred_loss(
     return loss, metrics
 
 
+def attach_b1_future_targets(
+    curr_obs: dict[str, torch.Tensor],
+    *,
+    flat_curr_obs: dict[str, Any],
+    t: int,
+    env_idx: int,
+    traj_len: int,
+    bsz: int,
+    horizons: Sequence[int],
+    z_dim: int = 2048,
+    feature_dim: int = 256,
+    num_tokens: int = 16,
+) -> None:
+    """Write a fixed B1 curr_obs schema onto one transition row.
+
+    TrajectoryCache freezes keys on the first ``put``, so every transition must
+    carry the same B1 / future / mask keys even when rollout omitted ``z_app``.
+    Masks use shape ``[1, 1, 1]`` so they survive ``ReplayBuffer._flatten_trajectory``
+    (keeps only ``tensor.dim() >= 2``).
+    """
+    device = torch.device("cpu")
+    for value in curr_obs.values():
+        if isinstance(value, torch.Tensor):
+            device = value.device
+            break
+
+    z_rl = curr_obs.get("z_rl")
+    z_app = curr_obs.get("z_app")
+    if isinstance(z_app, torch.Tensor):
+        ref = z_app
+    elif isinstance(z_rl, torch.Tensor):
+        ref = z_rl
+    else:
+        ref = torch.zeros(1, 1, int(z_dim), device=device)
+
+    # Stable core B1 keys (same set on every transition when B1 is enabled).
+    if not isinstance(curr_obs.get("z_app"), torch.Tensor):
+        curr_obs["z_app"] = torch.zeros_like(ref)
+    if not isinstance(curr_obs.get("b1_h"), torch.Tensor):
+        curr_obs["b1_h"] = torch.zeros(
+            1, 1, int(num_tokens), int(feature_dim), device=device, dtype=ref.dtype
+        )
+    if not isinstance(curr_obs.get("b1_h_prev"), torch.Tensor):
+        curr_obs["b1_h_prev"] = torch.zeros_like(curr_obs["b1_h"])
+    if not isinstance(curr_obs.get("b1_gate"), torch.Tensor):
+        curr_obs["b1_gate"] = torch.zeros(1, 1, 1, device=device, dtype=ref.dtype)
+    if not isinstance(curr_obs.get("b1_updated"), torch.Tensor):
+        curr_obs["b1_updated"] = torch.zeros(1, 1, 1, dtype=torch.bool, device=device)
+
+    z_app = curr_obs["z_app"]
+    z_app_all = flat_curr_obs.get("z_app")
+    has_lookup = isinstance(z_app_all, torch.Tensor)
+
+    def _mask(valid: bool) -> torch.Tensor:
+        return torch.full(
+            (1, 1, 1),
+            fill_value=bool(valid),
+            dtype=torch.bool,
+            device=device,
+        )
+
+    for horizon in horizons:
+        future_t = t + int(horizon)
+        z_key = f"z_app_future_{horizon}"
+        m_key = f"z_app_future_mask_{horizon}"
+        if not has_lookup or future_t >= traj_len:
+            curr_obs[z_key] = torch.zeros_like(z_app)
+            curr_obs[m_key] = _mask(False)
+            continue
+        future_idx = future_t * int(bsz) + int(env_idx)
+        if future_idx >= int(z_app_all.shape[0]):
+            curr_obs[z_key] = torch.zeros_like(z_app)
+            curr_obs[m_key] = _mask(False)
+            continue
+        curr_obs[z_key] = z_app_all[future_idx : future_idx + 1].reshape_as(z_app)
+        curr_obs[m_key] = _mask(True)
+
+
 def maybe_build_b1_module(cfg: Any) -> B1DynamicModule | None:
     config = build_b1_dynamic_config(cfg)
     if not config.enable:
@@ -384,6 +464,7 @@ __all__ = [
     "B1DynamicRuntime",
     "B1FuturePredictors",
     "B1GatedFusion",
+    "attach_b1_future_targets",
     "build_b1_dynamic_config",
     "compute_b1_pred_loss",
     "cosine_distance",

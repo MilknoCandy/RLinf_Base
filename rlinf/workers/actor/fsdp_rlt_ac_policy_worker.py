@@ -30,6 +30,7 @@ from rlinf.algorithms.rlt.a23_memory import (
     mix_a23_bootstrap_q,
 )
 from rlinf.algorithms.rlt.b1_dynamic import (
+    attach_b1_future_targets,
     build_b1_dynamic_config,
     compute_b1_pred_loss,
 )
@@ -501,28 +502,23 @@ class RLTACReplayMixin:
         traj_len: int,
         bsz: int,
         horizons: tuple[int, ...],
+        z_dim: int = 2048,
+        feature_dim: int = 256,
+        num_tokens: int = 16,
     ) -> None:
-        """Look ahead in the same env trajectory for future appearance tokens."""
-        z_app_all = flat_curr_obs.get("z_app")
-        if not isinstance(z_app_all, torch.Tensor):
-            return
-        for horizon in horizons:
-            future_t = t + int(horizon)
-            z_key = f"z_app_future_{horizon}"
-            m_key = f"z_app_future_mask_{horizon}"
-            if future_t >= traj_len:
-                curr_obs[z_key] = torch.zeros_like(curr_obs["z_app"])
-                curr_obs[m_key] = torch.tensor(False)
-                continue
-            future_idx = future_t * bsz + env_idx
-            if future_idx >= int(z_app_all.shape[0]):
-                curr_obs[z_key] = torch.zeros_like(curr_obs["z_app"])
-                curr_obs[m_key] = torch.tensor(False)
-                continue
-            curr_obs[z_key] = z_app_all[future_idx : future_idx + 1].reshape_as(
-                curr_obs["z_app"]
-            )
-            curr_obs[m_key] = torch.tensor(True)
+        """Look ahead for future appearance tokens; always write a fixed schema."""
+        attach_b1_future_targets(
+            curr_obs,
+            flat_curr_obs=flat_curr_obs,
+            t=t,
+            env_idx=env_idx,
+            traj_len=traj_len,
+            bsz=bsz,
+            horizons=horizons,
+            z_dim=z_dim,
+            feature_dim=feature_dim,
+            num_tokens=num_tokens,
+        )
 
     def _ingest_a22_from_raw_trajectories(self, recv_list: list[Trajectory]) -> None:
         """Commit E1∪E2 memory entries after each completed episode (MC-RTG)."""
@@ -779,6 +775,9 @@ class RLTACReplayMixin:
                         traj_len=traj_len,
                         bsz=bsz,
                         horizons=b1_cfg.pred_horizons,
+                        z_dim=int(b1_cfg.z_dim),
+                        feature_dim=int(b1_cfg.feature_dim),
+                        num_tokens=int(b1_cfg.num_tokens),
                     )
                 transition.curr_obs = curr_obs
 
