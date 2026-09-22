@@ -1,10 +1,17 @@
-# B2 Stage 2: freeze VLM/VLA, continue Stage 1 encoder as a Loop on the
-# Stage 2 MLP. Same as original RLT Stage 2: MLP is created from scratch
-# (rollout.model.model_path empty, runner.ckpt_path null). ckpt_path is only
-# for later eval/resume, not the Stage 2 training recipe.
-#   python examples/embodiment/train_embodied_agent.py --config-name maniskill_rlt_stage2_b2_loop
-# Set rollout.rlt_feature_model.model_path (and actor.model.encoder_ckpt) to
-# the trained Stage 1 checkpoint.
+# Debug Stage 2 progress-memory wiring. Not a training recipe.
+# Frozen official openpi Stage 1 + scratch MLP. critic-only m_t.
+# Goal: crash-check env_infos -> rlt_progress -> critic metrics in TensorBoard.
+#
+#   bash examples/embodiment/run_embodiment.sh maniskill_rlt_stage2_ac_mlp_progress_debug
+#   tensorboard --logdir <runner.logger.log_path>/tensorboard --port 6006
+#
+# Pass if, after the first actor update (warmup is tiny):
+#   1. no "progress_dim>0 requires obs['rlt_progress']"
+#   2. critic/progress_has_history appears and is not stuck at 0
+#   3. critic/progress_d is not identically 0
+#   4. critic/q_corr_neg_d is logged (sign can be noise on this short run)
+# Fail if those scalars never appear, or progress_d stays 0 for every step.
+# Set rollout.rlt_feature_model.model_path to your Stage 1 openpi actor ckpt.
 
 defaults:
   - env/maniskill_rlt@env.train
@@ -32,27 +39,27 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_b2_loop"
-    logger_backends: ["wandb"]
+    experiment_name: "maniskill_rlt_stage2_ac_mlp_progress_debug"
+    logger_backends: ["tensorboard"]
 
-  max_epochs: 5000
+  max_epochs: 8
   max_steps: -1
   only_eval: False
   weight_sync_interval: 1
-  val_check_interval: 25
-  save_interval: 50
+  val_check_interval: 2
+  save_interval: -1
   resume_dir: null
   ckpt_path: null
 
 algorithm:
-  update_epoch: 5
+  update_epoch: 1
   rlt_schedule:
     enable: True
-    max_updates_per_train_step: 400
-    warmup_min_size: 10000
-    warmup_post_collect_updates: 30000
+    max_updates_per_train_step: 4
+    warmup_min_size: 8
+    warmup_post_collect_updates: 2
     train_every_episodes: 0
-    train_every_transitions: 5
+    train_every_transitions: 1
   group_size: 1
 
   adv_type: embodied_sac
@@ -67,20 +74,11 @@ algorithm:
   gamma: 0.99
   tau: 0.005
 
-  # RLT actor objective: -q_weight * Q + bc_weight * BC.
   q_weight: 1.0
   bc_weight: 1.0
   reference_dropout_prob: 0.5
-  # Schedule for the BC/Q weights in the actor objective. Disable it to use
-  # the fixed bc_weight and q_weight above for the entire run.
   actor_weight_schedule:
-    enable: True
-    warmup_updates: 20000
-    ramp_updates: 50000
-    warmup_bc_weight: 7.0
-    warmup_q_weight: 0.05
-    online_bc_weight: 2.5
-    online_q_weight: 0.45
+    enable: False
 
   entropy_tuning:
     alpha_type: fixed_alpha
@@ -92,26 +90,27 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 10000
-    sample_window_size: 50000
-    max_num_samples: 50000
-    min_buffer_size: 1000
+    cache_size: 64
+    sample_window_size: 64
+    max_num_samples: 128
+    min_buffer_size: 8
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: 1000
-  critic_actor_ratio: 4
+  train_actor_steps: 16
+  critic_actor_ratio: 2
   critic_subsample_size: 0
   backup_entropy: False
+  rlt_progress_distance_scale: 0.05
 
 env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    total_num_envs: 64
+    total_num_envs: 4
     seed: 2026
-    auto_reset: False
+    auto_reset: True
     ignore_terminations: False
     use_fixed_reset_state_ids: False
     wrap_obs_mode: rlt_openpi_joint
@@ -128,30 +127,21 @@ env:
         near_hole_yz_margin: 1.5
         fallback_hole_radius: 0.03
       expert_takeover:
-        enable: True
-        # Simulated real-world takeover: only request expert after the RLT actor
-        # is already in critical phase and has made no measurable insertion
-        # progress for several action chunks. Rollout still masks this during
-        # warmup, and eval disables expert completely.
+        enable: False
         trigger_mode: stalled_progress
         gate:
           require_grasp: True
           require_not_success: True
-          # Do not diagnose "stuck" immediately after critical entry; first
-          # require the peg head to be close enough to the hole for insertion
-          # attempts to be meaningful.
           near_hole_x_min: -0.10
           near_hole_yz_margin: 2.0
-          # A chunk is considered improved if x advances, yz alignment improves,
-          # or the combined score x - progress_yz_weight * yz improves enough.
           stuck_chunks_before_takeover: 3
           min_x_progress: 0.003
           min_yz_progress: 0.0015
           min_score_progress: 0.002
           progress_yz_weight: 1.0
           fallback_hole_radius: 0.03
-    max_episode_steps: 500
-    max_steps_per_rollout_epoch: 500
+    max_episode_steps: 40
+    max_steps_per_rollout_epoch: 40
     action_dim: 8
     num_action_chunks: 10
     ref_num_action_chunks: 10
@@ -168,9 +158,9 @@ env:
         height: 384
   eval:
     rollout_epoch: 1
-    total_num_envs: 256
+    total_num_envs: 4
     seed: 2026
-    auto_reset: False
+    auto_reset: True
     ignore_terminations: False
     use_fixed_reset_state_ids: True
     wrap_obs_mode: rlt_openpi_joint
@@ -188,8 +178,6 @@ env:
         fallback_hole_radius: 0.03
       expert_takeover:
         enable: False
-        # Eval is full-task: base policy before critical phase, actor after
-        # critical phase, and no expert intervention.
         trigger_mode: stalled_progress
         gate:
           require_grasp: True
@@ -202,8 +190,8 @@ env:
           min_score_progress: 0.002
           progress_yz_weight: 1.0
           fallback_hole_radius: 0.03
-    max_episode_steps: 500
-    max_steps_per_rollout_epoch: 500
+    max_episode_steps: 40
+    max_steps_per_rollout_epoch: 20
     policy_mode: eval
     group_size: 1
     action_dim: 8
@@ -249,18 +237,11 @@ rollout:
     fixed_std: ${actor.model.fixed_std}
     is_lora: False
     lora_rank: 32
-    rlt_loop: True
-    encoder_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_dropout_rate: 0.0
+    progress_dim: ${actor.model.progress_dim}
+    progress_in_actor: ${actor.model.progress_in_actor}
 
   rlt_feature_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/path/to/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
     precision: bf16
     num_action_chunks: 10
@@ -297,40 +278,10 @@ rollout:
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
       rlt_encoder_type: "append_self_attention"
-      rlt_image_only: True
+      rlt_image_only: False
       rlt_use_mask: True
-      rlt_b2: True
+      rlt_b2: False
       rlt_b2_image_keep_ratio: 0.5
-
-  # Optional ManiSkill expert takeover model. Enable it with
-  # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
-  # to a stronger openpi_rlinf SFT checkpoint trained with the same task
-  # transforms; it predicts expert actions directly and does not use RLT tokens.
-  expert_model:
-    model_type: "openpi_rlinf"
-    model_path: "/path/to/rlt_maniskill_joint_pi05_sft_more_steps/checkpoints/global_step_<step>/actor"
-    precision: bf16
-    num_action_chunks: 10
-    action_dim: 8
-    num_steps: 5
-    add_value_head: False
-    openpi:
-      task: eval
-      config_name: "pi05_rlt_maniskill_joint"
-      num_images_in_input: 2
-      action_chunk: 10
-      action_horizon: 10
-      action_env_dim: 8
-      num_steps: 5
-      model_action_dim: 32
-      paligemma_variant: "gemma_2b"
-      action_expert_variant: "gemma_300m"
-      max_token_len: 200
-      discrete_state_input: True
-      train_expert_only: False
-      add_value_head: False
-      detach_critic_input: True
-      use_rlt: False
 
   enable_torch_compile: False
   enable_cuda_graph: False
@@ -338,14 +289,13 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 128
-  global_batch_size: 512
+  micro_batch_size: 8
+  global_batch_size: 8
   seed: 1234
   enable_offload: False
 
   model:
     model_type: "rlt_mlp_policy"
-    # RLT AC keeps the small Stage2 head in fp32 for Q-learning stability.
     precision: fp32
     policy_setup: "panda-qpos"
     action_dim: 8
@@ -359,15 +309,8 @@ actor:
     fixed_std: 0.002
     is_lora: False
     lora_rank: 32
-    rlt_loop: True
-    encoder_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_dropout_rate: 0.0
+    progress_dim: 4
+    progress_in_actor: False
 
   optim:
     clip_grad: 10.0

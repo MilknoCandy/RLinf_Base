@@ -36,6 +36,19 @@ from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
 
+def _pearson_corr(left: torch.Tensor, right: torch.Tensor) -> float:
+    left = left.reshape(-1).float()
+    right = right.reshape(-1).float()
+    if left.numel() < 2 or right.numel() != left.numel():
+        return 0.0
+    left = left - left.mean()
+    right = right - right.mean()
+    denom = left.norm() * right.norm()
+    if float(denom.item()) < 1.0e-8:
+        return 0.0
+    return float((left * right).sum().item() / denom.item())
+
+
 class RLTACLossMixin:
     """RLT actor-critic losses on top of RLinf replay-buffer worker plumbing.
 
@@ -306,7 +319,45 @@ class RLTACLossMixin:
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
         critic_metrics = {"q_data": all_data_q_values.mean().item()}
+        critic_metrics.update(
+            self._progress_critic_metrics(curr_obs, all_data_q_values)
+        )
         return critic_loss, critic_metrics
+
+    @staticmethod
+    def _progress_critic_metrics(curr_obs, all_q_values) -> dict[str, float]:
+        progress = curr_obs.get("rlt_progress") if isinstance(curr_obs, dict) else None
+        if not torch.is_tensor(progress):
+            return {}
+        progress = progress.detach().float().reshape(progress.shape[0], -1)
+        if progress.shape[-1] < 4:
+            return {}
+        q = all_q_values.detach().float()
+        q = q.reshape(q.shape[0], -1).mean(dim=-1)
+        distance = progress[:, 0]
+        delta = progress[:, 1]
+        success = progress[:, 2]
+        has_history = progress[:, 3]
+        metrics = {
+            "progress_d": float(distance.mean().item()),
+            "progress_delta": float(delta.mean().item()),
+            "progress_success": float(success.mean().item()),
+            "progress_has_history": float(has_history.mean().item()),
+        }
+        if q.numel() == distance.numel() and q.numel() > 1:
+            metrics["q_corr_neg_d"] = _pearson_corr(q, -distance)
+            closer = delta < 0
+            farther = delta > 0
+            if bool(closer.any()) and bool(farther.any()):
+                metrics["q_closer_minus_farther"] = float(
+                    q[closer].mean().item() - q[farther].mean().item()
+                )
+            success_mask = success > 0.5
+            if bool(success_mask.any()) and bool((~success_mask).any()):
+                metrics["q_success_gap"] = float(
+                    q[success_mask].mean().item() - q[~success_mask].mean().item()
+                )
+        return metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):

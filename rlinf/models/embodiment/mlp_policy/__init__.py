@@ -35,6 +35,8 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+            progress_dim=int(cfg.get("progress_dim", 0) or 0),
+            progress_in_actor=bool(cfg.get("progress_in_actor", False)),
         )
         encoder_ckpt = cfg.get("encoder_ckpt", None)
         use_rlt_loop = bool(cfg.get("rlt_loop", False) or encoder_ckpt)

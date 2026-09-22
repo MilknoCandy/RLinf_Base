@@ -16,6 +16,7 @@ from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt.b2_dump import B2DumpWriter
 from rlinf.algorithms.rlt.b2_feedback import select_b2_env_infos
 from rlinf.algorithms.rlt.b2_loop import B2LoopState
+from rlinf.algorithms.rlt.progress import ProgressMemoryState
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
@@ -38,4 +39,5 @@ __all__ = [
     "B2DumpWriter",
     "use_simulator_transition_replay",
     "B2LoopState",
+    "ProgressMemoryState",
 ]

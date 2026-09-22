@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+﻿# Copyright 2025 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
     B2DumpWriter,
     B2LoopState,
+    ProgressMemoryState,
     build_rlt_route,
     predict_rlt_actions,
 )
@@ -165,6 +166,15 @@ class MultiStepRolloutWorker(Worker):
         )
         self.enable_rlt_b2 = bool(getattr(rlt_cfg, "rlt_b2", False))
         self._b2_loops: dict[int, B2LoopState] = {}
+        self.enable_rlt_progress = int(self.model_cfg.get("progress_dim", 0) or 0) > 0
+        self._progress_memories: dict[int, ProgressMemoryState] = {}
+        self._progress_distance_scale = float(
+            OmegaConf.select(
+                self.cfg,
+                "algorithm.rlt_progress_distance_scale",
+                default=0.05,
+            )
+        )
         self._b2_dump_writer = None
         dump_dir = self.cfg.rollout.get("rlt_b2_dump_dir", None)
         if dump_dir:
@@ -599,6 +609,12 @@ class MultiStepRolloutWorker(Worker):
             if self.enable_rlt_b2:
                 loop_stage = 0 if stage_id is None else stage_id
                 b2_loop = self._b2_loops.setdefault(loop_stage, B2LoopState())
+            progress_memory = None
+            if self.enable_rlt_progress:
+                mem_stage = 0 if stage_id is None else stage_id
+                progress_memory = self._progress_memories.setdefault(
+                    mem_stage, ProgressMemoryState()
+                )
             return predict_rlt_actions(
                 policy_model=self.hf_model,
                 feature_model=self.rlt_feature_model,
@@ -616,6 +632,8 @@ class MultiStepRolloutWorker(Worker):
                 env_infos=env_infos,
                 b2_loop=b2_loop,
                 dump_writer=self._b2_dump_writer,
+                progress_memory=progress_memory,
+                progress_distance_scale=self._progress_distance_scale,
             )
         return self.predict(env_obs, mode=mode)
 

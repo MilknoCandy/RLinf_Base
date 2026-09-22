@@ -90,6 +90,15 @@ class EnvWorker(Worker):
         self.enable_rlt_b2_dump = bool(
             OmegaConf.select(self.cfg, "rollout.rlt_b2_dump_dir", default=None)
         )
+        self.enable_rlt_progress = (
+            int(
+                OmegaConf.select(
+                    self.cfg, "actor.model.progress_dim", default=0
+                )
+                or 0
+            )
+            > 0
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -970,7 +979,7 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
-        if self.enable_rlt_b2 or self.enable_rlt_b2_dump:
+        if self.enable_rlt_b2 or self.enable_rlt_b2_dump or self.enable_rlt_progress:
             data["dones"] = env_batch.get("dones", None)
             data["env_infos"] = select_b2_env_infos(env_batch.get("env_infos"))
         return data
@@ -1396,7 +1405,11 @@ class EnvWorker(Worker):
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
                     eval_dones = None
-                    if self.enable_rlt_b2 or self.enable_rlt_b2_dump:
+                    if (
+                        self.enable_rlt_b2
+                        or self.enable_rlt_b2_dump
+                        or self.enable_rlt_progress
+                    ):
                         eval_dones = (
                             torch.zeros(
                                 (self.eval_num_envs_per_stage,), dtype=torch.bool

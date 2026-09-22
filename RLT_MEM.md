@@ -440,7 +440,7 @@ Dump + dist/success 读出头是**可选**路径，不是 B2 主训练。主路�
 
 ### 14.5 Stage 2 B2：在线 Loop RL（主路径）
 
-VLM/VLA 冻结。MLP **从头训**（`runner.ckpt_path` 为空）。Stage 1 encoder 挂在 `RLTMLPPolicy.rlt_loop`，经现有 MLP `weight_sync` 同步到 rollout。
+VLM/VLA 冻结。MLP 与原 Stage 2 相同：`get_model` 随机初始化，`runner.ckpt_path` 训练时为 `null`（那只是 eval/resume，不是 Stage 2 要加载的内容）。B2 多出来的是：把 Stage 1 encoder 挂在 `RLTMLPPolicy.rlt_loop`（`encoder_ckpt`），经现有 MLP `weight_sync` 同步到 rollout。
 
 Replay 存 VLM 之后的 \(I_t\)（TopK tokens，反馈已调制）、`z_prev`、`proprio`、`ref_chunk`。不存反馈原文。Actor：\(z_t=\mathrm{Encoder}(I_t, z_{\mathrm{prev}}.\mathrm{detach}())\)。
 

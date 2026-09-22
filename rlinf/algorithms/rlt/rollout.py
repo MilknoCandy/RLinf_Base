@@ -25,6 +25,7 @@ from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import (
     RLT_B2_OBS_KEYS,
     RLT_OBS_KEYS,
+    RLT_PROGRESS_OBS_KEYS,
     RLT_TRANSITION_PREFIX,
 )
 
@@ -39,7 +40,7 @@ def _append_rlt_transition_obs(
     transition_obs = rlt_obs
     if final_obs is not None:
         transition_obs = feature_model.extract_rlt_obs(final_obs)
-    for key in (*RLT_OBS_KEYS, *RLT_B2_OBS_KEYS):
+    for key in (*RLT_OBS_KEYS, *RLT_B2_OBS_KEYS, *RLT_PROGRESS_OBS_KEYS):
         if key in transition_obs:
             result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[
                 key
@@ -64,6 +65,8 @@ def predict_rlt_actions(
     env_infos: dict[str, Any] | None = None,
     b2_loop: Any | None = None,
     dump_writer: Any | None = None,
+    progress_memory: Any | None = None,
+    progress_distance_scale: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     del rewards, success
     with torch.no_grad():
@@ -129,6 +132,22 @@ def predict_rlt_actions(
         if use_b2:
             b2_loop.commit_z(rlt_obs["z_rl"])
 
+        if progress_memory is not None:
+            states = env_obs.get("states")
+            if not torch.is_tensor(states):
+                raise ValueError(
+                    "RLT progress memory requires batched env_obs['states']."
+                )
+            batch_size = int(states.shape[0])
+            device = rlt_obs["z_rl"].device
+            rlt_obs["rlt_progress"] = progress_memory.update(
+                batch_size=batch_size,
+                dones=dones,
+                env_infos=env_infos,
+                device=device,
+                distance_scale=progress_distance_scale,
+            )
+
         actions, result = policy_model.predict_action_batch(
             env_obs=rlt_obs,
             mode=mode,
@@ -178,7 +197,7 @@ def predict_rlt_actions(
                 feature_model=feature_model,
                 result=result,
                 rlt_obs=rlt_obs,
-                final_obs=None if use_b2 else final_obs,
+                final_obs=None if (use_b2 or progress_memory is not None) else final_obs,
             )
 
     return actions, result

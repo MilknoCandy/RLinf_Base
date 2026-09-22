@@ -1,10 +1,8 @@
-# B2 Stage 2: freeze VLM/VLA, continue Stage 1 encoder as a Loop on the
-# Stage 2 MLP. Same as original RLT Stage 2: MLP is created from scratch
-# (rollout.model.model_path empty, runner.ckpt_path null). ckpt_path is only
-# for later eval/resume, not the Stage 2 training recipe.
-#   python examples/embodiment/train_embodied_agent.py --config-name maniskill_rlt_stage2_b2_loop
-# Set rollout.rlt_feature_model.model_path (and actor.model.encoder_ckpt) to
-# the trained Stage 1 checkpoint.
+# Stage 2 RLT with privileged progress memory on the critic only.
+# Frozen Stage 1 VLM/encoder/VLA are unchanged. MLP is trained from scratch.
+# m_t = [tanh(d), tanh(Δd), success, has_history] is concatenated to Q(s,a).
+# Set progress_in_actor=True after critic Q tracks distance.
+#   python examples/embodiment/train_embodied_agent.py --config-name maniskill_rlt_stage2_ac_mlp_progress
 
 defaults:
   - env/maniskill_rlt@env.train
@@ -32,8 +30,8 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_b2_loop"
-    logger_backends: ["wandb"]
+    experiment_name: "maniskill_rlt_stage2_ac_mlp_progress"
+    logger_backends: ["tensorboard"]
 
   max_epochs: 5000
   max_steps: -1
@@ -104,6 +102,7 @@ algorithm:
   critic_actor_ratio: 4
   critic_subsample_size: 0
   backup_entropy: False
+  rlt_progress_distance_scale: 0.05
 
 env:
   group_name: "EnvGroup"
@@ -249,18 +248,11 @@ rollout:
     fixed_std: ${actor.model.fixed_std}
     is_lora: False
     lora_rank: 32
-    rlt_loop: True
-    encoder_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_dropout_rate: 0.0
+    progress_dim: ${actor.model.progress_dim}
+    progress_in_actor: ${actor.model.progress_in_actor}
 
   rlt_feature_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/path/to/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
     precision: bf16
     num_action_chunks: 10
@@ -297,17 +289,17 @@ rollout:
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
       rlt_encoder_type: "append_self_attention"
-      rlt_image_only: True
+      rlt_image_only: False
       rlt_use_mask: True
-      rlt_b2: True
+      rlt_b2: False
       rlt_b2_image_keep_ratio: 0.5
 
   # Optional ManiSkill expert takeover model. Enable it with
   # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
-  # to a stronger openpi_rlinf SFT checkpoint trained with the same task
+  # to a stronger openpi SFT checkpoint trained with the same task
   # transforms; it predicts expert actions directly and does not use RLT tokens.
   expert_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/path/to/rlt_maniskill_joint_pi05_sft_more_steps/checkpoints/global_step_<step>/actor"
     precision: bf16
     num_action_chunks: 10
@@ -359,15 +351,8 @@ actor:
     fixed_std: 0.002
     is_lora: False
     lora_rank: 32
-    rlt_loop: True
-    encoder_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_dropout_rate: 0.0
+    progress_dim: 4
+    progress_in_actor: False
 
   optim:
     clip_grad: 10.0

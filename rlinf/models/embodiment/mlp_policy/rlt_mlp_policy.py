@@ -23,8 +23,8 @@ class RLTMLPPolicy(MLPPolicy):
     """MLP actor-critic policy for RLT Stage 2 heads.
 
     Actor input follows RLT: reference action chunk, RL token feature, and
-    proprioceptive state. Critic input follows RLT: action chunk, RL token
-    feature, and proprioceptive state.
+    proprioceptive state. Critic input follows RLT: RL token, proprioception,
+    and optional privileged progress memory.
     """
 
     def __init__(
@@ -37,6 +37,8 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
+        progress_dim: int = 0,
+        progress_in_actor: bool = False,
     ):
         if not add_q_head:
             raise ValueError(
@@ -56,8 +58,11 @@ class RLTMLPPolicy(MLPPolicy):
             )
         flat_action_dim = chunk_len * step_action_dim
 
+        progress_dim = max(int(progress_dim), 0)
         actor_obs_dim = z_dim + proprio_dim + flat_action_dim
-        critic_obs_dim = z_dim + proprio_dim
+        if progress_in_actor:
+            actor_obs_dim += progress_dim
+        critic_obs_dim = z_dim + proprio_dim + progress_dim
 
         super().__init__(
             obs_dim=actor_obs_dim,
@@ -78,6 +83,8 @@ class RLTMLPPolicy(MLPPolicy):
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
         self.rlt_loop = None
+        self.progress_dim = progress_dim
+        self.progress_in_actor = bool(progress_in_actor) and progress_dim > 0
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -153,6 +160,25 @@ class RLTMLPPolicy(MLPPolicy):
             )
         return self._flatten_batch(obs["z_rl"])
 
+    def _get_progress(self, obs: dict) -> torch.Tensor:
+        if self.progress_dim <= 0:
+            batch = next(iter(obs.values()))
+            return torch.zeros(
+                (batch.shape[0], 0), device=batch.device, dtype=batch.dtype
+            )
+        if "rlt_progress" not in obs:
+            raise ValueError(
+                "progress_dim>0 requires obs['rlt_progress']. Enable progress "
+                "memory in the rollout worker."
+            )
+        progress = self._flatten_batch(obs["rlt_progress"])
+        if progress.shape[-1] != self.progress_dim:
+            raise ValueError(
+                "rlt_progress last dim must be "
+                f"{self.progress_dim}, got {tuple(progress.shape)}."
+            )
+        return progress
+
     def _get_proprio(self, obs: dict) -> torch.Tensor:
         return self._flatten_batch(obs["proprio"])
 
@@ -186,12 +212,16 @@ class RLTMLPPolicy(MLPPolicy):
         ref_chunk = self._get_ref_chunk(obs)
         if apply_reference_dropout:
             ref_chunk = self._maybe_drop_reference(ref_chunk, reference_dropout_prob)
-        return torch.cat(
-            [ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1
-        )
+        parts = [ref_chunk, self._get_z(obs), self._get_proprio(obs)]
+        if self.progress_in_actor:
+            parts.append(self._get_progress(obs))
+        return torch.cat(parts, dim=-1)
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
-        return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
+        parts = [self._get_z(obs), self._get_proprio(obs)]
+        if self.progress_dim > 0:
+            parts.append(self._get_progress(obs))
+        return torch.cat(parts, dim=-1)
 
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)
