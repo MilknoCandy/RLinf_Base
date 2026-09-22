@@ -1,4 +1,4 @@
-﻿# Copyright 2025 The RLinf Authors.
+# Copyright 2025 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -166,35 +166,23 @@ class MultiStepRolloutWorker(Worker):
         self.enable_rlt_b2 = bool(getattr(rlt_cfg, "rlt_b2", False))
         self._b2_loops: dict[int, B2LoopState] = {}
         self._b2_dump_writer = None
-        self._b2_dump_use_ref_chunk = bool(
-            self.cfg.rollout.get("rlt_b2_dump_use_ref_chunk", False)
-        )
         dump_dir = self.cfg.rollout.get("rlt_b2_dump_dir", None)
         if dump_dir:
-            if not self.enable_rlt_b2:
-                self.log_warning(
-                    "rollout.rlt_b2_dump_dir is set but openpi.rlt_b2 is False; "
-                    "dump is disabled."
+            env_key = "eval" if self.only_eval else "train"
+            auto_reset = bool(
+                OmegaConf.select(
+                    self.cfg, f"env.{env_key}.auto_reset", default=True
                 )
-            else:
-                env_key = "eval" if self.only_eval else "train"
-                auto_reset = bool(
-                    OmegaConf.select(
-                        self.cfg, f"env.{env_key}.auto_reset", default=True
-                    )
-                )
-                self._b2_dump_writer = B2DumpWriter(
-                    dump_dir,
-                    rank=self._rank,
-                    auto_reset=auto_reset,
-                )
-                if self.cfg.rollout.get("rlt_b2_dump_use_ref_chunk", True):
-                    self._b2_dump_use_ref_chunk = True
-                self.log_info(
-                    "B2 dump enabled: "
-                    f"dir={dump_dir} use_ref_chunk={self._b2_dump_use_ref_chunk} "
-                    f"auto_reset={auto_reset}"
-                )
+            )
+            self._b2_dump_writer = B2DumpWriter(
+                dump_dir,
+                rank=self._rank,
+                auto_reset=auto_reset,
+            )
+            self.log_info(
+                "B2 dump enabled: "
+                f"dir={dump_dir} auto_reset={auto_reset}"
+            )
 
         if self.cfg.rollout.get("expert_model", None) and not self.enable_opd:
             expert_model_config = build_expert_model_config(
@@ -628,7 +616,6 @@ class MultiStepRolloutWorker(Worker):
                 env_infos=env_infos,
                 b2_loop=b2_loop,
                 dump_writer=self._b2_dump_writer,
-                dump_use_ref_chunk=self._b2_dump_use_ref_chunk,
             )
         return self.predict(env_obs, mode=mode)
 

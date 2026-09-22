@@ -87,6 +87,9 @@ class EnvWorker(Worker):
                 self.cfg, "rollout.rlt_feature_model.openpi.rlt_b2", default=False
             )
         )
+        self.enable_rlt_b2_dump = bool(
+            OmegaConf.select(self.cfg, "rollout.rlt_b2_dump_dir", default=None)
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -621,6 +624,7 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            dones=chunk_dones,
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
         )
@@ -966,7 +970,7 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
-        if self.enable_rlt_b2:
+        if self.enable_rlt_b2 or self.enable_rlt_b2_dump:
             data["dones"] = env_batch.get("dones", None)
             data["env_infos"] = select_b2_env_infos(env_batch.get("env_infos"))
         return data
@@ -1391,8 +1395,18 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    eval_dones = None
+                    if self.enable_rlt_b2 or self.enable_rlt_b2_dump:
+                        eval_dones = (
+                            torch.zeros(
+                                (self.eval_num_envs_per_stage,), dtype=torch.bool
+                            )
+                            .unsqueeze(1)
+                            .repeat(1, self.model_cfg.num_action_chunks)
+                        )
                     env_output = EnvOutput(
                         obs=extracted_obs,
+                        dones=eval_dones,
                         final_obs=(
                             infos["final_observation"]
                             if "final_observation" in infos

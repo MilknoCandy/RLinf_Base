@@ -310,3 +310,57 @@ def test_load_encoder_weights_from_stage1_key_layout(tmp_path):
     load_encoder_weights(dst, ckpt)
     for left, right in zip(src.parameters(), dst.parameters()):
         assert torch.allclose(left, right)
+
+
+def test_rlt_loop_encoder_does_not_backprop_through_z_prev():
+    from types import SimpleNamespace
+
+    from rlinf.algorithms.rlt.b2_sft import build_encoder
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+
+    policy = RLTMLPPolicy(
+        z_dim=8,
+        proprio_dim=4,
+        action_dim=2,
+        num_action_chunks=2,
+    )
+    policy.rlt_loop = build_encoder(
+        SimpleNamespace(
+            rlt_input_dim=8,
+            rlt_embed_dim=8,
+            rlt_prefix_seq_len=16,
+            rlt_num_layers=1,
+            rlt_num_heads=2,
+            rlt_mlp_ratio=2.0,
+            rlt_dropout_rate=0.0,
+        )
+    )
+    tokens = torch.randn(3, 4, 8, requires_grad=True)
+    z_prev = torch.randn(3, 8, requires_grad=True)
+    z = policy.encode_rlt(tokens, None, z_prev)
+    z.sum().backward()
+    assert tokens.grad is not None
+    assert z_prev.grad is None
+
+
+def test_extract_rlt_obs_keeps_optional_b2_replay_keys():
+    from rlinf.algorithms.rlt.transition import extract_rlt_obs_from_forward_inputs
+
+    forward_inputs = {
+        "z_rl": torch.zeros(2, 4),
+        "proprio": torch.zeros(2, 3),
+        "ref_chunk": torch.zeros(2, 8),
+        "rlt_image_tokens": torch.zeros(2, 5, 4),
+        "rlt_image_mask": torch.ones(2, 5, dtype=torch.bool),
+        "z_prev": torch.zeros(2, 4),
+        "rlt_transition_z_rl": torch.ones(2, 4),
+        "rlt_transition_proprio": torch.ones(2, 3),
+        "rlt_transition_ref_chunk": torch.ones(2, 8),
+        "rlt_transition_rlt_image_tokens": torch.ones(2, 5, 4),
+        "rlt_transition_z_prev": torch.ones(2, 4),
+    }
+    current = extract_rlt_obs_from_forward_inputs(forward_inputs)
+    nxt = extract_rlt_obs_from_forward_inputs(forward_inputs, transition=True)
+    assert "rlt_image_tokens" in current
+    assert "z_prev" in current
+    assert float(nxt["z_prev"].sum()) == float(torch.ones(2, 4).sum())

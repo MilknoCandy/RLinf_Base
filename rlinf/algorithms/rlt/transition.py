@@ -20,6 +20,7 @@ from rlinf.envs import SupportedEnvType
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
+RLT_B2_OBS_KEYS = ("rlt_image_tokens", "rlt_image_mask", "z_prev")
 RLT_TRANSITION_PREFIX = "rlt_transition_"
 
 
@@ -57,6 +58,10 @@ def extract_rlt_obs_from_forward_inputs(
             "populates RLT features."
         )
     out = {key: forward_inputs[f"{prefix}{key}"] for key in RLT_OBS_KEYS}
+    for key in RLT_B2_OBS_KEYS:
+        prefixed = f"{prefix}{key}"
+        if prefixed in forward_inputs:
+            out[key] = forward_inputs[prefixed]
     return copy_dict_tensor(out)
 
 

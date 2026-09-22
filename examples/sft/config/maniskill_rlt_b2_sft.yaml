@@ -1,5 +1,5 @@
 # B2 Loop SFT: train encoder + dist/success heads on dumped I_t sequences.
-# Dump first:
+# Dump first along trained Stage 1/2 RLT (no feedback sentences):
 #   bash evaluations/run_eval.sh maniskill maniskill_rlt_b2_dump
 # Then:
 #   python examples/sft/train_rlt_b2.py

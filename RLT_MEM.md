@@ -374,7 +374,7 @@ VLM 与仿真是成本主体；encoder Loop 很便宜，但一条轨迹内不能
 | Stage 1 SFT | 独立帧 + prefix 重建 MSE | 轨迹窗口 + Loop + dist/success 头 |
 | Stage 2 MLP | 消费冻结的 `z_rl` | encoder 在 RL 中仍要更新「如何用」 |
 
-LeRobot SFT 数据（`maniskill_peginsertionside_joint`）通常只有图像、关节 state、action、prompt，**没有** `peg_head_hole_*` / `success_current`。因此 Stage 1 的 \(I_t\) dump **不应假设现成数据集带特权进度**，而应在 `ManiskillRLTEnv` 上用冻结 VLA 回放/专家 rollout 采一次。
+LeRobot SFT 数据（`maniskill_peginsertionside_joint`）通常只有图像、关节 state、action、prompt，**没有** `peg_head_hole_*` / `success_current`。因此 B2 的 \(I_t\) dump **不应假设现成数据集带特权进度**，而应在 `ManiskillRLTEnv` 上用已训练的 Stage 2 RLT（MLP 消费 \(z\)）采一次。
 
 ### 14.2 建议新增与修改
 
@@ -419,13 +419,15 @@ env_obs_t, feedback_{t-1}, z_{t-1}
 
 ### 14.4 Stage 1 SFT 实现路径
 
+Dump + dist/success 读出头是**可选**路径，不是 B2 主训练。主路径见 14.5：在线 Loop RL。
+
 不要在现有「独立帧 + 重建 MSE」的 `OpenPiPytorchSFTActionModel` 上硬接 Loop。B2 SFT 分两段：
 
 **Dump（一次，VLM 冻结）**
 
-1. 在 `ManiskillRLTEnv` 中用冻结 OpenPI 按 chunk 执行（或专家动作）。
-2. 每步写反馈句、跑 VLM、TopK，存 `I_t`、`d_t`、`s_t`、`done`。
-3. 得到按 episode 对齐的序列，之后不再跑 VLM。
+1. 加载已训练的 Stage 1（`rollout.rlt_feature_model`：VLM + encoder + VLA）和 Stage 2（`runner.ckpt_path`：MLP）。执行必须与这两个 checkpoint 的训练分布一致：VLM prompt **只有 instruction**，不用反馈句，encoder 不用 Loop \(z_{t-1}\)。反馈句和 Loop 是后续 B2 的事；为了 dump 硬塞进去会让 `ref_chunk` 和 MLP 都偏出分布。
+2. 每步走现有 RLT：同一套 prefix 出静态 RL token \(z\) 与 VLA `ref_chunk`；MLP 用 \((z,\mathrm{proprio},\mathrm{ref\_chunk})\) 做残差微调；`rlt_route` 非关键段执行 `ref_chunk`、关键段执行 MLP。
+3. 从这次 in-distribution prefix 另取 TopK image tokens 作为 \(I_t\)，连同环境特权 \(d_t,s_t\) 存盘。之后 SFT 不再跑 VLM / 仿真。Loop 只发生在离线 SFT 的 encoder 上。
 
 **Train（多次 epoch，只训 encoder + 读出头）**
 
@@ -436,14 +438,13 @@ env_obs_t, feedback_{t-1}, z_{t-1}
 
 可从现有 Stage 1 checkpoint 初始化 `rl_token_embed` 与 encoder 权重，再在 B2 目标上继续训。
 
-### 14.5 Stage 2：encoder 放哪
+### 14.5 Stage 2 B2：在线 Loop RL（主路径）
 
-现有 Stage 2 是冻结 `rlt_feature_model` 出 `z_rl`，只训 `RLTMLPPolicy`。B2 要求 RL 更新 encoder 的「使用权」，因此第一版建议：
+VLM/VLA 冻结。MLP **从头训**（`runner.ckpt_path` 为空）。Stage 1 encoder 挂在 `RLTMLPPolicy.rlt_loop`，经现有 MLP `weight_sync` 同步到 rollout。
 
-- **可训 encoder 放进 actor**（与 MLP 同一 FSDP 组），obs 改为 `{I_t, z_{t-1}, proprio, ref_chunk}`，actor 内部完成 Loop 并出动作。
-- **rollout 侧**持有同权重 encoder 的 inference 副本（沿用现有 feature/actor 权重同步），以维护每 env 的 \(z\)。
-- VLM 仍冻结；只同步 encoder + MLP。
-- \(z_{t-1}\) detach，避免时间维 BPTT。
+Replay 存 VLM 之后的 \(I_t\)（TopK tokens，反馈已调制）、`z_prev`、`proprio`、`ref_chunk`。不存反馈原文。Actor：\(z_t=\mathrm{Encoder}(I_t, z_{\mathrm{prev}}.\mathrm{detach}())\)。
+
+配置：`examples/embodiment/config/maniskill_rlt_stage2_b2_loop.yaml`。`encoder_ckpt` 指向 Stage 1。
 
 若第一版要降低风险，可先冻结 encoder、只训 MLP，作为消融；正实验仍应让 encoder 参与 RL。
 
@@ -463,8 +464,8 @@ CALVIN 换同一接口、另一套环境字段，不改 encoder。
 
 1. **B2-0 开关与单测**：`rl_token` 可注入；反馈句生成；TopK 在假 attn 上形状正确。  
 2. **B2-1 推理 Loop**：rollout 维护 \(z\) 与反馈；VLM prompt 拼接；`done` 重置。用现成 Stage 1 encoder，不改损失，先看 Peg Insertion 是否不崩。  
-3. **B2-2 Dump + SFT**：采 \(I_t\) 序列，训 dist/success 头。  
-4. **B2-3 Stage 2 RL**：encoder+MLP，detach \(z_{t-1}\)。  
+3. **B2-2 Dump + SFT**：可选，非主路径。  
+4. **B2-3 Stage 2 RL**：`maniskill_rlt_stage2_b2_loop.yaml`，encoder+MLP，detach \(z_{t-1}\)。  
 5. **B2-4 CALVIN**：换反馈字段与 instruction 切换，验证同场景换任务。
 
 ### 14.8 主要风险
@@ -472,5 +473,5 @@ CALVIN 换同一接口、另一套环境字段，不改 encoder。
 - 最后一层 attn 要改 `gemma.py` 的 Attention；必须只开 B2，且只钩最后一层，避免打断现有 eager prefix cache。  
 - Dump 必须来自带 `peg_head_*` 的 env，不能从缺特权信息的 LeRobot 帧硬编距离。  
 - 反馈句拉长 prompt 会改变 KV cache 与 `max_token_len=200` 预算，句子必须短。  
-- Stage 2 若把 encoder 放进 actor，要接好与 rollout feature 的权重同步，否则 Loop 的 \(z\) 与训练用的 encoder 会分叉。
+- Stage 2 encoder 挂在 MLP 的 `rlt_loop` 上（不要叫 `encoder`，以免进 critic 优化器）。通过现有 `hf_model` weight_sync 同步到 rollout；冻结的 VLM feature encoder 不再出 \(z\)。
 

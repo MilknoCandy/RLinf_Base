@@ -362,11 +362,18 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         rl_token: torch.Tensor | None = None,
         feedback_sentences: list[str] | None = None,
         return_image_tokens: bool = False,
+        encode_z: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """Extract the frozen Stage1 features consumed by the Stage2 RLT head.
+        """Extract RLT observations from one frozen VLM prefix pass.
 
-        When ``return_image_tokens`` is True (B2 dump / SFT), also return the
-        screened image tokens ``I_t`` and their mask.
+        The prefix produces both the RL token and the VLA reference:
+
+        - encoder([image tokens, ``rl_token``]) → ``z_rl``
+        - VLA action expert on the same KV cache → ``ref_chunk``
+
+        Stage 2 MLP residual-adjusts ``ref_chunk`` using ``z_rl``. ``z`` is not
+        injected into the VLA. Dump requests ``return_image_tokens`` to store
+        TopK image tokens from this same prefix; it must not change the prompt.
         """
         self._require_rlt()
         repacked = self._repack_env_obs(env_obs)
@@ -385,7 +392,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         prepared_observation = pi0_model_module.preprocess_observation(
             observation, train=False
         )
-        capture_last_attn = bool(self.rlt_cfg.rlt_b2)
+        capture_last_attn = bool(self.rlt_cfg.rlt_b2) or return_image_tokens
         prefix_output, prefix_mask, kv_cache = self.model.build_prefix_cache(
             prepared_observation,
             capture_last_attn=capture_last_attn,
@@ -395,24 +402,13 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             if capture_last_attn
             else None
         )
+        lang_tokens = prepared_observation.tokenized_prompt
         rlt_prefix_output, rlt_prefix_mask = self._select_rlt_prefix_embeddings(
             prefix_output,
             prefix_mask,
-            prepared_observation.tokenized_prompt,
+            lang_tokens,
             attn_probs=attn_probs,
         )
-        z_rl = self._encode_rlt_flat(
-            rlt_prefix_output, rlt_prefix_mask, rl_token=rl_token
-        ).to(dtype=torch.float32)
-
-        model_actions = self._sample_actions_from_prefix_cache(
-            prepared_observation,
-            prefix_mask,
-            kv_cache,
-        )
-        ref_chunk = self.output_transform(
-            {"actions": model_actions, "state": observation.state}
-        )["actions"]
 
         raw_proprio = self._select_configured_state(env_obs["states"])
         if "maniskill" in self.config_name.lower():
@@ -426,15 +422,46 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             proprio = raw_proprio
         if not torch.is_tensor(proprio):
             proprio = torch.as_tensor(proprio)
+        proprio = proprio.to(
+            device=rlt_prefix_output.device, dtype=torch.float32
+        )
 
-        out = {
-            "z_rl": z_rl,
-            "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
-            "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
+        model_actions = self._sample_actions_from_prefix_cache(
+            prepared_observation,
+            prefix_mask,
+            kv_cache,
+        )
+        ref_chunk = self.output_transform(
+            {"actions": model_actions, "state": observation.state}
+        )["actions"]
+        out: dict[str, torch.Tensor] = {
+            "proprio": proprio,
+            "ref_chunk": ref_chunk.to(
+                device=rlt_prefix_output.device, dtype=torch.float32
+            ),
         }
+        if encode_z:
+            out["z_rl"] = self._encode_rlt_flat(
+                rlt_prefix_output, rlt_prefix_mask, rl_token=rl_token
+            ).to(dtype=torch.float32)
         if return_image_tokens:
-            out["rlt_image_tokens"] = rlt_prefix_output
-            out["rlt_image_mask"] = rlt_prefix_mask
+            dump_tokens, dump_mask = rlt_prefix_output, rlt_prefix_mask
+            if attn_probs is not None:
+                from rlinf.models.embodiment.modules.rlt_b2_select import (
+                    select_topk_image_tokens,
+                )
+
+                lang_len = 0 if lang_tokens is None else int(lang_tokens.shape[1])
+                dump_tokens, dump_mask = select_topk_image_tokens(
+                    prefix_output,
+                    prefix_mask,
+                    attn_probs=attn_probs,
+                    num_image_tokens=prefix_output.shape[1] - lang_len,
+                    keep_ratio=self.rlt_cfg.rlt_b2_image_keep_ratio,
+                    lang_len=lang_len,
+                )
+            out["rlt_image_tokens"] = dump_tokens
+            out["rlt_image_mask"] = dump_mask
         return out
 
     def _sample_actions_from_prefix_cache(

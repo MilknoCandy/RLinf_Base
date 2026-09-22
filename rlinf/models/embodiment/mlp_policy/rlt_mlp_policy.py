@@ -77,6 +77,7 @@ class RLTMLPPolicy(MLPPolicy):
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+        self.rlt_loop = None
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -91,7 +92,65 @@ class RLTMLPPolicy(MLPPolicy):
             return tensor
         return tensor.reshape(tensor.shape[0], -1)
 
+    @staticmethod
+    def _as_batch_tokens(tensor: torch.Tensor, feature_dim: int) -> torch.Tensor:
+        while tensor.dim() > 3:
+            tensor = tensor.reshape(
+                tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]
+            )
+        if tensor.dim() == 2:
+            return tensor.unsqueeze(1)
+        if tensor.dim() == 3:
+            if tensor.shape[-1] != feature_dim:
+                raise ValueError(
+                    "Token feature dim mismatch: "
+                    f"{tuple(tensor.shape)} vs {feature_dim}."
+                )
+            return tensor
+        raise ValueError(
+            f"Unexpected token rank {tensor.dim()} for {tuple(tensor.shape)}."
+        )
+
+    def encode_rlt(
+        self,
+        image_tokens: torch.Tensor,
+        image_mask: torch.Tensor | None,
+        z_prev: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Encode post-VLM tokens. ``z_prev`` is detached so Loop is not BPTT."""
+        if self.rlt_loop is None:
+            raise RuntimeError("encode_rlt requires rlt_loop to be attached.")
+        tokens = image_tokens.to(
+            device=next(self.rlt_loop.parameters()).device,
+            dtype=next(self.rlt_loop.parameters()).dtype,
+        )
+        tokens = self._as_batch_tokens(tokens, int(tokens.shape[-1]))
+        mask = None
+        if image_mask is not None:
+            mask = image_mask.to(device=tokens.device, dtype=torch.bool)
+            if mask.dim() > 2:
+                mask = mask.reshape(tokens.shape[0], tokens.shape[1])
+            elif mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+        rl_token = None
+        if z_prev is not None:
+            rl_token = z_prev.detach()
+            while rl_token.dim() > 2:
+                rl_token = rl_token.reshape(
+                    rl_token.shape[0] * rl_token.shape[1], *rl_token.shape[2:]
+                )
+            if rl_token.dim() == 1:
+                rl_token = rl_token.unsqueeze(0)
+        encoded = self.rlt_loop(tokens, mask, rl_token=rl_token)
+        return encoded.reshape(tokens.shape[0], -1)
+
     def _get_z(self, obs: dict) -> torch.Tensor:
+        if self.rlt_loop is not None and "rlt_image_tokens" in obs:
+            return self.encode_rlt(
+                obs["rlt_image_tokens"],
+                obs.get("rlt_image_mask"),
+                obs.get("z_prev"),
+            )
         return self._flatten_batch(obs["z_rl"])
 
     def _get_proprio(self, obs: dict) -> torch.Tensor:

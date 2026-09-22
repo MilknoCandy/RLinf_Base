@@ -278,11 +278,18 @@ class RLTACLossMixin:
             else:
                 raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 
+        # Loop encoder sits on the actor optimizer. Detach critic TD so those
+        # unused encoder grads are not computed; actor Q keeps the graph.
+        detach_encoder = bool(
+            self.cfg.actor.model.get("rlt_loop", False)
+            or self.cfg.actor.model.get("encoder_ckpt", None)
+        )
         if not use_crossq:
             all_data_q_values = self.model(
                 forward_type=ForwardType.SAC_Q,
                 obs=curr_obs,
                 actions=actions,
+                detach_encoder=detach_encoder,
             )
         else:
             all_data_q_values, _ = self.model(
@@ -291,6 +298,7 @@ class RLTACLossMixin:
                 actions=actions,
                 next_obs=next_obs,
                 next_actions=next_actions,
+                detach_encoder=detach_encoder,
             )
 
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
@@ -318,12 +326,18 @@ class RLTACLossMixin:
             log_pi = log_pi.unsqueeze(-1)
         log_pi = log_pi.sum(dim=-1, keepdim=True)
 
+        # Default SAC detaches Q from the encoder. With a Loop encoder the
+        # actor optimizer owns those weights, so -Q must flow through them.
+        detach_encoder = not bool(
+            self.cfg.actor.model.get("rlt_loop", False)
+            or self.cfg.actor.model.get("encoder_ckpt", None)
+        )
         if not use_crossq:
             all_qf_pi = self.model(
                 forward_type=ForwardType.SAC_Q,
                 obs=curr_obs,
                 actions=pi,
-                detach_encoder=True,
+                detach_encoder=detach_encoder,
             )
         else:
             all_qf_pi, _ = self.model(
@@ -332,7 +346,7 @@ class RLTACLossMixin:
                 actions=pi,
                 next_obs=None,
                 next_actions=None,
-                detach_encoder=True,
+                detach_encoder=detach_encoder,
             )
 
         num_q_values = all_qf_pi.shape[-1]
