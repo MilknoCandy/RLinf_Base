@@ -14,27 +14,10 @@
 
 import asyncio
 import queue
-from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.a22_memory import (
-    A22MemoryBank,
-    build_a22_memory_config,
-    compute_a22_memory_loss,
-)
-from rlinf.algorithms.rlt.a23_memory import (
-    A23MemoryBank,
-    build_a23_memory_config,
-    mix_a23_bootstrap_q,
-)
-from rlinf.algorithms.rlt.b1_dynamic import (
-    attach_b1_future_targets,
-    build_b1_dynamic_config,
-    compute_b1_pred_loss,
-    ensure_b1_obs_schema,
-)
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -263,7 +246,6 @@ class RLTACLossMixin:
         not_done = ~done_source.reshape(done_source.shape[0], -1).bool().any(
             dim=-1, keepdim=True
         )
-        a23_metrics: dict[str, float] = {}
 
         with torch.no_grad():
             next_actions, _, _ = self._next_actions_for_critic_target(next_obs)
@@ -288,25 +270,6 @@ class RLTACLossMixin:
             reward_target = self._discounted_chunk_rewards(rewards)
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
             bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
-
-            a23_bank = getattr(self, "a23_memory_bank", None)
-            a23_cfg = getattr(self, "a23_memory_config", None)
-            if (
-                a23_bank is not None
-                and a23_cfg is not None
-                and a23_cfg.enable
-                and a23_bank.memory_size > 0
-            ):
-                next_z = next_obs.get("z_rl")
-                if isinstance(next_z, torch.Tensor):
-                    q_m, q_m_metrics = a23_bank.estimate_q_m(next_z, next_actions)
-                    q_next, mix_metrics = mix_a23_bootstrap_q(
-                        q_next=q_next,
-                        q_m=q_m,
-                        alpha=float(a23_cfg.alpha),
-                    )
-                    a23_metrics.update(q_m_metrics)
-                    a23_metrics.update(mix_metrics)
 
             if bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
@@ -335,7 +298,6 @@ class RLTACLossMixin:
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
         critic_metrics = {"q_data": all_data_q_values.mean().item()}
-        critic_metrics.update(a23_metrics)
         return critic_loss, critic_metrics
 
     @Worker.timer("forward_actor")
@@ -405,65 +367,6 @@ class RLTACLossMixin:
         metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
 
-        # A22: advantage-weighted memory loss with detached Q(z, pi) baseline.
-        a22_bank = getattr(self, "a22_memory_bank", None)
-        a22_cfg = getattr(self, "a22_memory_config", None)
-        if (
-            a22_bank is not None
-            and a22_cfg is not None
-            and a22_cfg.enable
-            and a22_bank.memory_size > 0
-        ):
-            lm_loss, lm_metrics = compute_a22_memory_loss(
-                policy_model=self.model,
-                obs=curr_obs,
-                bank=a22_bank,
-                q_baseline=qf_pi.detach(),
-                fixed_std=float(getattr(self.model, "fixed_std", 0.002)),
-            )
-            actor_loss = actor_loss + float(a22_cfg.lambda_m) * lm_loss
-            metrics.update(lm_metrics)
-            metrics["a22_memory/lambda_m"] = float(a22_cfg.lambda_m)
-            metrics["a22_memory/weighted_lm"] = float(
-                (float(a22_cfg.lambda_m) * lm_loss).detach().item()
-            )
-
-        # B1: future-token prediction on recomputed h_t = U(h_prev, z_app).
-        b1_module = getattr(self.model, "b1_dynamic", None)
-        b1_cfg = getattr(self, "b1_dynamic_config", None)
-        if (
-            b1_module is not None
-            and b1_cfg is not None
-            and b1_cfg.enable
-            and "z_app" in curr_obs
-            and "b1_h_prev" in curr_obs
-        ):
-            future_z = {}
-            future_mask = {}
-            for horizon in b1_cfg.pred_horizons:
-                z_key = f"z_app_future_{horizon}"
-                m_key = f"z_app_future_mask_{horizon}"
-                if z_key in curr_obs and m_key in curr_obs:
-                    future_z[horizon] = curr_obs[z_key]
-                    future_mask[horizon] = curr_obs[m_key]
-            if future_z:
-                update_mask = curr_obs.get("b1_updated")
-                pred_loss, pred_metrics = compute_b1_pred_loss(
-                    b1_module,
-                    z_app=curr_obs["z_app"],
-                    h_prev=curr_obs["b1_h_prev"],
-                    future_z=future_z,
-                    future_mask=future_mask,
-                    config=b1_cfg,
-                    update_mask=update_mask,
-                )
-                actor_loss = actor_loss + float(b1_cfg.lambda_pred) * pred_loss
-                metrics.update(pred_metrics)
-                metrics["b1_dynamic/lambda_pred"] = float(b1_cfg.lambda_pred)
-                metrics["b1_dynamic/weighted_pred"] = float(
-                    (float(b1_cfg.lambda_pred) * pred_loss).detach().item()
-                )
-
         return actor_loss, entropy, metrics
 
     @Worker.timer("forward_alpha")
@@ -477,142 +380,6 @@ class RLTACLossMixin:
 
 class RLTACReplayMixin:
     """Shared rollout-to-replay ingestion for sync and async RLT AC workers."""
-
-    def _setup_a22_memory(self) -> None:
-        self.a22_memory_config = build_a22_memory_config(self.cfg)
-        self.a22_memory_bank: A22MemoryBank | None = None
-        if self.a22_memory_config.enable:
-            self.a22_memory_bank = A22MemoryBank(self.a22_memory_config)
-
-    def _setup_a23_memory(self) -> None:
-        self.a23_memory_config = build_a23_memory_config(self.cfg)
-        self.a23_memory_bank: A23MemoryBank | None = None
-        if self.a23_memory_config.enable:
-            self.a23_memory_bank = A23MemoryBank(self.a23_memory_config)
-
-    def _setup_b1_dynamic(self) -> None:
-        self.b1_dynamic_config = build_b1_dynamic_config(self.cfg)
-
-    @staticmethod
-    def _attach_b1_future_targets(
-        curr_obs: dict[str, torch.Tensor],
-        *,
-        flat_curr_obs: dict[str, Any],
-        t: int,
-        env_idx: int,
-        traj_len: int,
-        bsz: int,
-        horizons: tuple[int, ...],
-        z_dim: int = 2048,
-        feature_dim: int = 256,
-        num_tokens: int = 16,
-    ) -> None:
-        """Look ahead for future appearance tokens; always write a fixed schema."""
-        attach_b1_future_targets(
-            curr_obs,
-            flat_curr_obs=flat_curr_obs,
-            t=t,
-            env_idx=env_idx,
-            traj_len=traj_len,
-            bsz=bsz,
-            horizons=horizons,
-            z_dim=z_dim,
-            feature_dim=feature_dim,
-            num_tokens=num_tokens,
-        )
-
-    def _ingest_a22_from_raw_trajectories(self, recv_list: list[Trajectory]) -> None:
-        """Commit E1∪E2 memory entries after each completed episode (MC-RTG)."""
-        self._ingest_episode_memory_banks(
-            recv_list,
-            banks=[
-                bank
-                for bank in (
-                    getattr(self, "a22_memory_bank", None),
-                    getattr(self, "a23_memory_bank", None),
-                )
-                if bank is not None
-            ],
-        )
-
-    def _ingest_episode_memory_banks(
-        self,
-        recv_list: list[Trajectory],
-        banks: list[Any],
-    ) -> None:
-        """Commit completed episodes into one or more episodic memory banks."""
-        if not banks:
-            return
-        for trajectory in recv_list:
-            if (
-                trajectory.actions is None
-                or trajectory.rewards is None
-                or trajectory.dones is None
-                or not trajectory.curr_obs
-                or "z_rl" not in trajectory.curr_obs
-            ):
-                continue
-            actions = trajectory.actions
-            rewards = trajectory.rewards
-            dones = trajectory.dones
-            z_all = trajectory.curr_obs["z_rl"]
-            # Expected shapes: actions/rewards/z [T, B, ...], dones [T+1, B, ...]
-            # ManiSkill may keep one extra final action forward; align on z length.
-            if actions.ndim < 2 or z_all.ndim < 2:
-                continue
-            traj_len = min(
-                int(actions.shape[0]),
-                int(z_all.shape[0]),
-                int(rewards.shape[0]),
-            )
-            if traj_len <= 0:
-                continue
-            bsz = int(actions.shape[1])
-            critical = None
-            if isinstance(trajectory.forward_inputs, dict):
-                critical = trajectory.forward_inputs.get("rlt_switch_flags")
-
-            for env_idx in range(bsz):
-                # Split by done boundaries within this env's time series.
-                # dones has an extra leading slot; transition t uses dones[t+1].
-                done_flags = []
-                for t in range(traj_len):
-                    done_idx = min(t + 1, int(dones.shape[0]) - 1)
-                    flag = dones[done_idx, env_idx]
-                    if isinstance(flag, torch.Tensor):
-                        flag = bool(flag.reshape(-1).to(torch.bool).any().item())
-                    else:
-                        flag = bool(flag)
-                    done_flags.append(flag)
-
-                start = 0
-                for t, is_done in enumerate(done_flags):
-                    if not is_done:
-                        continue
-                    end = t + 1  # inclusive end index for slice [start, end)
-                    z_seq = z_all[start:end, env_idx]
-                    a_seq = actions[start:end, env_idx]
-                    r_seq = rewards[start:end, env_idx]
-                    crit_seq = None
-                    if isinstance(critical, torch.Tensor) and critical.shape[0] >= end:
-                        crit_seq = critical[start:end, env_idx]
-                        if crit_seq.ndim > 1:
-                            crit_seq = crit_seq.reshape(crit_seq.shape[0], -1).any(
-                                dim=-1
-                            )
-                    # Chunk rewards are [ep_len, C]; sum>0 still marks success.
-                    success = bool(
-                        r_seq.detach().float().reshape(-1).sum().item() > 0.0
-                    )
-                    for bank in banks:
-                        bank.commit_episode(
-                            z_seq=z_seq,
-                            a_seq=a_seq,
-                            r_seq=r_seq,
-                            critical_mask=crit_seq,
-                            success=success,
-                        )
-                    start = end
 
     @staticmethod
     def _trajectory_transition_count(traj: Trajectory) -> int:
@@ -762,25 +529,6 @@ class RLTACReplayMixin:
                         "update_rlt_transitions() populated transition obs "
                         f"before replay ingestion, got row index {idx}."
                     )
-                b1_cfg = getattr(self, "b1_dynamic_config", None)
-                b1_enabled = (
-                    b1_cfg is not None
-                    and b1_cfg.enable
-                    and isinstance(flat.get("curr_obs"), dict)
-                )
-                if b1_enabled:
-                    self._attach_b1_future_targets(
-                        curr_obs,
-                        flat_curr_obs=flat["curr_obs"],
-                        t=t,
-                        env_idx=env_idx,
-                        traj_len=traj_len,
-                        bsz=bsz,
-                        horizons=b1_cfg.pred_horizons,
-                        z_dim=int(b1_cfg.z_dim),
-                        feature_dim=int(b1_cfg.feature_dim),
-                        num_tokens=int(b1_cfg.num_tokens),
-                    )
                 transition.curr_obs = curr_obs
 
                 # Dones have one extra initial slot, so transition t reads
@@ -814,17 +562,6 @@ class RLTACReplayMixin:
                     next_obs = curr_obs
                 else:
                     next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
-                    # Non-terminal next_obs must share curr_obs's B1 key set;
-                    # otherwise TrajectoryCache freezes without z_app_future_* and
-                    # terminal rows (next_obs is curr_obs) KeyError on insert.
-                    if b1_enabled and next_obs is not None:
-                        ensure_b1_obs_schema(
-                            next_obs,
-                            horizons=b1_cfg.pred_horizons,
-                            z_dim=int(b1_cfg.z_dim),
-                            feature_dim=int(b1_cfg.feature_dim),
-                            num_tokens=int(b1_cfg.num_tokens),
-                        )
                 if next_obs is not None:
                     transition.next_obs = next_obs
                 else:
@@ -875,7 +612,6 @@ class RLTACReplayMixin:
         recv_list: list[Trajectory],
     ) -> tuple[int, int]:
         self._last_replay_metrics = {}
-        self._ingest_a22_from_raw_trajectories(recv_list)
 
         if use_simulator_transition_replay(self.cfg):
             replay_list = []
@@ -953,9 +689,6 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
-        self._setup_a22_memory()
-        self._setup_a23_memory()
-        self._setup_b1_dynamic()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
 
@@ -1151,12 +884,6 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         mean_metric_dict = self.process_train_metrics(metrics)
         self.transitions_since_train = 0
         self.episodes_since_train = 0
-        bank = getattr(self, "a22_memory_bank", None)
-        if bank is not None:
-            mean_metric_dict = {**mean_metric_dict, **bank.pop_write_metrics()}
-        a23_bank = getattr(self, "a23_memory_bank", None)
-        if a23_bank is not None:
-            mean_metric_dict = {**mean_metric_dict, **a23_bank.pop_write_metrics()}
 
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -1266,10 +993,4 @@ class AsyncRLTACFSDPPolicy(RLTACFSDPPolicy, AsyncEmbodiedSACFSDPPolicy):
         replay_metrics = getattr(self, "_last_replay_metrics", {})
         if replay_metrics:
             mean_metric_dict = {**mean_metric_dict, **replay_metrics}
-        bank = getattr(self, "a22_memory_bank", None)
-        if bank is not None:
-            mean_metric_dict = {**mean_metric_dict, **bank.pop_write_metrics()}
-        a23_bank = getattr(self, "a23_memory_bank", None)
-        if a23_bank is not None:
-            mean_metric_dict = {**mean_metric_dict, **a23_bank.pop_write_metrics()}
         return mean_metric_dict

@@ -387,7 +387,10 @@ class Pi0(model.BaseModel):
         return torch.mean(torch.square(v_t - u_t), dim=-1)
 
     def build_prefix_cache(
-        self, observation: model.Observation
+        self,
+        observation: model.Observation,
+        *,
+        capture_last_attn: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple]:
         """Embed prefix tokens and run one LLM pass to build the KV cache.
 
@@ -408,6 +411,7 @@ class Pi0(model.BaseModel):
             [prefix_tokens, None],
             positions=positions,
             mask=prefix_attn_mask,
+            capture_last_attn=capture_last_attn,
         )
         return outputs[0], prefix_mask, kv_cache
 

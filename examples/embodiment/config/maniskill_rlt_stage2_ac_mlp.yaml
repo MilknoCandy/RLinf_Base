@@ -282,6 +282,8 @@ rollout:
       rlt_encoder_type: "append_self_attention"
       rlt_image_only: False
       rlt_use_mask: True
+      rlt_b2: False
+      rlt_b2_image_keep_ratio: 0.5
 
   # Optional ManiSkill expert takeover model. Enable it with
   # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point

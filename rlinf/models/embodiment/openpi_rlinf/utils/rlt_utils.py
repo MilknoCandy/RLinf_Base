@@ -66,6 +66,8 @@ class OpenPiPytorchRLTConfig:
     rlt_mlp_ratio: float = 4.0
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
+    rlt_b2: bool = False
+    rlt_b2_image_keep_ratio: float = 0.5
 
 
 def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
@@ -87,6 +89,10 @@ def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
             OmegaConf.select(model_cfg, "rlt_image_only", default=True)
         ),
         rlt_use_mask=bool(OmegaConf.select(model_cfg, "rlt_use_mask", default=False)),
+        rlt_b2=bool(OmegaConf.select(model_cfg, "rlt_b2", default=False)),
+        rlt_b2_image_keep_ratio=float(
+            OmegaConf.select(model_cfg, "rlt_b2_image_keep_ratio", default=0.5)
+        ),
     )
 
 

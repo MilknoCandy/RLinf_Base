@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 
 import torch
@@ -146,7 +148,10 @@ class RLTTokenEncoder(nn.Module):
         )
 
     def forward(
-        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+        self,
+        prefix_embs: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        rl_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
         prefix_embs = self.input_proj(prefix_embs)
         seq_len = prefix_embs.shape[-2]
@@ -161,11 +166,30 @@ class RLTTokenEncoder(nn.Module):
         )
         prefix_tokens = prefix_embs + prefix_pos
         batch_size = prefix_embs.shape[0]
-        rl_tokens = (
-            self.rl_token_embed.to(device=prefix_embs.device, dtype=prefix_embs.dtype)
-            .unsqueeze(0)
-            .expand(batch_size, -1, -1)
-        )
+        if rl_token is None:
+            rl_tokens = (
+                self.rl_token_embed.to(
+                    device=prefix_embs.device, dtype=prefix_embs.dtype
+                )
+                .unsqueeze(0)
+                .expand(batch_size, -1, -1)
+            )
+        else:
+            rl_tokens = rl_token.to(
+                device=prefix_embs.device, dtype=prefix_embs.dtype
+            )
+            if rl_tokens.dim() == 2:
+                rl_tokens = rl_tokens.unsqueeze(1)
+            if rl_tokens.shape[:2] != (batch_size, 1):
+                raise ValueError(
+                    "rl_token must have shape [B, D] or [B, 1, D], got "
+                    f"{tuple(rl_token.shape)} for batch size {batch_size}."
+                )
+            if rl_tokens.shape[-1] != self.embed_dim:
+                raise ValueError(
+                    "rl_token embed dim must be "
+                    f"{self.embed_dim}, got {rl_tokens.shape[-1]}."
+                )
         rl_pos = self.rl_token_pos_enc.to(
             device=prefix_embs.device, dtype=prefix_embs.dtype
         )
@@ -335,14 +359,22 @@ class RLTTokenTransformer(nn.Module):
         return self.embed_dim
 
     def encode(
-        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+        self,
+        prefix_embs: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        rl_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.encoder(prefix_embs, mask)
+        return self.encoder(prefix_embs, mask, rl_token=rl_token)
 
     def encode_flat(
-        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+        self,
+        prefix_embs: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        rl_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.encode(prefix_embs, mask).reshape(prefix_embs.shape[0], -1)
+        return self.encode(prefix_embs, mask, rl_token=rl_token).reshape(
+            prefix_embs.shape[0], -1
+        )
 
     def decode(
         self,

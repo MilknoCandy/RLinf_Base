@@ -1,0 +1,36 @@
+# Frozen-VLM dump of sequential I_t for B2 Loop SFT.
+# Executes OpenPI ref_chunk (not the untrained Stage2 MLP).
+#   bash evaluations/run_eval.sh maniskill maniskill_rlt_b2_dump
+
+defaults:
+  - maniskill_rlt_stage2_ac_mlp
+  - _self_
+
+runner:
+  task_type: embodied_eval
+  only_eval: True
+  max_epochs: 1
+  val_check_interval: 1
+  logger:
+    experiment_name: "maniskill_rlt_b2_dump"
+
+env:
+  eval:
+    auto_reset: True
+    total_num_envs: 16
+    rollout_epoch: 10
+    use_fixed_reset_state_ids: False
+    rlt_policy_switch:
+      expert_takeover:
+        enable: False
+
+rollout:
+  collect_transitions: False
+  rlt_b2_dump_dir: "../results/rlt_b2_dump"
+  rlt_b2_dump_use_ref_chunk: True
+  rlt_feature_model:
+    openpi:
+      rlt_b2: True
+      rlt_b2_image_keep_ratio: 0.5
+      rlt_image_only: True
+      rlt_use_mask: True

@@ -361,6 +361,8 @@ class Attention(nn.Module):
         )
 
         probs = F.softmax(masked_logits, dim=-1).to(dtype)
+        if getattr(self, "_save_attn_probs", False):
+            self.last_attn_probs = probs.detach()
 
         # einsum "BKGTS,BSKH->BTKGH"
         encoded = torch.einsum("BKGTS,BSKH->BTKGH", probs, v_r.to(dtype))
@@ -549,6 +551,7 @@ class Module(nn.Module):
         # Whether the activation checkpoint uses reentrant autograd. Configurable
         # via Pi0.gradient_checkpointing_enable(gradient_checkpointing_kwargs=...).
         self.gradient_checkpointing_use_reentrant = False
+        self.last_attn_probs: torch.Tensor | None = None
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         """Embed token indices."""
@@ -562,6 +565,7 @@ class Module(nn.Module):
         adarms_cond: Sequence[torch.Tensor | None] | None = None,
         *,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        capture_last_attn: bool = False,
     ) -> tuple[list[torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]:
         """Full transformer forward pass.
 
@@ -571,10 +575,16 @@ class Module(nn.Module):
             mask: (B, T, S) attention mask (bool)
             adarms_cond: per-expert adaptive conditioning (or None)
             kv_cache: optional KV cache for inference
+            capture_last_attn: if True, store last-layer attention probabilities
+                on ``last_attn_probs`` for B2 image-token selection
 
         Returns:
             (outputs, new_kv_cache)
         """
+        self.last_attn_probs = None
+        last_attn_layer = self.layers[-1] if capture_last_attn else None
+        if last_attn_layer is not None:
+            last_attn_layer.attn._save_attn_probs = True
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
@@ -615,6 +625,10 @@ class Module(nn.Module):
             else:
                 xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
             new_layer_kv_caches.append(new_kv)
+
+        if last_attn_layer is not None:
+            last_attn_layer.attn._save_attn_probs = False
+            self.last_attn_probs = getattr(last_attn_layer.attn, "last_attn_probs", None)
 
         # Return the list of per-layer KV caches
         kv_cache = tuple(new_layer_kv_caches)

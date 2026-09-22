@@ -1,0 +1,48 @@
+# B2 Loop SFT: train encoder + dist/success heads on dumped I_t sequences.
+# Dump first:
+#   bash evaluations/run_eval.sh maniskill maniskill_rlt_b2_dump
+# Then:
+#   python examples/sft/train_rlt_b2.py
+
+defaults:
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+runner:
+  max_steps: 2000
+  log_interval: 20
+  save_interval: 250
+  save_dir: "../results/rlt_b2_sft/checkpoints"
+
+data:
+  dump_dir: "../results/rlt_b2_dump"
+  batch_size: 4
+  num_workers: 0
+
+model:
+  encoder_ckpt: "/path/to/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
+  rlt_input_dim: 2048
+  rlt_embed_dim: 2048
+  rlt_prefix_seq_len: 1024
+  rlt_num_layers: 2
+  rlt_num_heads: 8
+  rlt_mlp_ratio: 4.0
+  rlt_dropout_rate: 0.0
+  head_hidden_dim: 512
+
+loss:
+  lambda_dist: 1.0
+  lambda_success: 1.0
+  bptt_k: 4
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  clip_grad: 1.0

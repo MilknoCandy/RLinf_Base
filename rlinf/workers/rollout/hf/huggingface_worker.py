@@ -25,6 +25,8 @@ from tqdm import tqdm
 
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt import (
+    B2DumpWriter,
+    B2LoopState,
     build_rlt_route,
     predict_rlt_actions,
 )
@@ -79,7 +81,6 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
-        self.b1_runtime = None
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -157,6 +158,43 @@ class MultiStepRolloutWorker(Worker):
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)
+        rlt_cfg = (
+            getattr(self.rlt_feature_model, "rlt_cfg", None)
+            if self.rlt_feature_model is not None
+            else None
+        )
+        self.enable_rlt_b2 = bool(getattr(rlt_cfg, "rlt_b2", False))
+        self._b2_loops: dict[int, B2LoopState] = {}
+        self._b2_dump_writer = None
+        self._b2_dump_use_ref_chunk = bool(
+            self.cfg.rollout.get("rlt_b2_dump_use_ref_chunk", False)
+        )
+        dump_dir = self.cfg.rollout.get("rlt_b2_dump_dir", None)
+        if dump_dir:
+            if not self.enable_rlt_b2:
+                self.log_warning(
+                    "rollout.rlt_b2_dump_dir is set but openpi.rlt_b2 is False; "
+                    "dump is disabled."
+                )
+            else:
+                env_key = "eval" if self.only_eval else "train"
+                auto_reset = bool(
+                    OmegaConf.select(
+                        self.cfg, f"env.{env_key}.auto_reset", default=True
+                    )
+                )
+                self._b2_dump_writer = B2DumpWriter(
+                    dump_dir,
+                    rank=self._rank,
+                    auto_reset=auto_reset,
+                )
+                if self.cfg.rollout.get("rlt_b2_dump_use_ref_chunk", True):
+                    self._b2_dump_use_ref_chunk = True
+                self.log_info(
+                    "B2 dump enabled: "
+                    f"dir={dump_dir} use_ref_chunk={self._b2_dump_use_ref_chunk} "
+                    f"auto_reset={auto_reset}"
+                )
 
         if self.cfg.rollout.get("expert_model", None) and not self.enable_opd:
             expert_model_config = build_expert_model_config(
@@ -186,12 +224,6 @@ class MultiStepRolloutWorker(Worker):
                 train_batch_size=self.per_node_train_batch_size,
                 eval_batch_size=self.per_node_eval_batch_size,
             )
-
-        b1_module = getattr(self.hf_model, "b1_dynamic", None)
-        if b1_module is not None:
-            from rlinf.algorithms.rlt.b1_dynamic import B1DynamicRuntime
-
-            self.b1_runtime = B1DynamicRuntime(config=b1_module.config)
 
         self.setup_sample_params()
         if self.enable_offload:
@@ -572,9 +604,13 @@ class MultiStepRolloutWorker(Worker):
         dones: torch.Tensor | None = None,
         rewards: torch.Tensor | None = None,
         success: torch.Tensor | None = None,
+        env_infos: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        del stage_id
         if self.rlt_feature_model is not None:
+            b2_loop = None
+            if self.enable_rlt_b2:
+                loop_stage = 0 if stage_id is None else stage_id
+                b2_loop = self._b2_loops.setdefault(loop_stage, B2LoopState())
             return predict_rlt_actions(
                 policy_model=self.hf_model,
                 feature_model=self.rlt_feature_model,
@@ -589,7 +625,10 @@ class MultiStepRolloutWorker(Worker):
                 dones=dones,
                 rewards=rewards,
                 success=success,
-                b1_runtime=self.b1_runtime,
+                env_infos=env_infos,
+                b2_loop=b2_loop,
+                dump_writer=self._b2_dump_writer,
+                dump_use_ref_chunk=self._b2_dump_use_ref_chunk,
             )
         return self.predict(env_obs, mode=mode)
 
@@ -715,6 +754,7 @@ class MultiStepRolloutWorker(Worker):
                     dones=env_output.get("dones", None),
                     rewards=env_output.get("rewards", None),
                     success=env_output.get("success", None),
+                    env_infos=env_output.get("env_infos", None),
                 )
 
                 policy_output = self._build_policy_output(
@@ -752,6 +792,7 @@ class MultiStepRolloutWorker(Worker):
                 dones=env_output.get("dones", None),
                 rewards=env_output.get("rewards", None),
                 success=env_output.get("success", None),
+                env_infos=env_output.get("env_infos", None),
             )
 
             if self.enable_opd:
@@ -786,6 +827,7 @@ class MultiStepRolloutWorker(Worker):
                 batch_size=self.train_batch_size,
                 split_fn=self._split_policy_output,
             )
+        self._flush_b2_dump()
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -835,6 +877,7 @@ class MultiStepRolloutWorker(Worker):
                     dones=env_output.get("dones", None),
                     rewards=env_output.get("rewards", None),
                     success=env_output.get("success", None),
+                    env_infos=env_output.get("env_infos", None),
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -873,6 +916,7 @@ class MultiStepRolloutWorker(Worker):
                             dones=env_output.get("dones", None),
                             rewards=env_output.get("rewards", None),
                             success=env_output.get("success", None),
+                            env_infos=env_output.get("env_infos", None),
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
@@ -886,8 +930,18 @@ class MultiStepRolloutWorker(Worker):
                             batch_size=self.eval_batch_size,
                         )
 
+            self._flush_b2_dump()
             if self.enable_offload:
                 self.offload_model()
+
+    def _flush_b2_dump(self) -> None:
+        if self._b2_dump_writer is None:
+            return
+        self._b2_dump_writer.close()
+        self.log_info(
+            f"B2 dump flushed {self._b2_dump_writer.num_written} episodes to "
+            f"{self._b2_dump_writer.dump_dir}"
+        )
 
     def offload_model(self):
         if self.enable_cuda_graph:
@@ -940,6 +994,37 @@ class MultiStepRolloutWorker(Worker):
                 filled_flags.append(flags)
         return torch.cat(filled_flags, dim=0)
 
+    def _merge_env_infos(
+        self,
+        env_infos_list: list[dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        present = [infos for infos in env_infos_list if infos]
+        if not present:
+            return None
+        merged: dict[str, Any] = {}
+        keys = present[0].keys()
+        for key in keys:
+            values = []
+            for infos in env_infos_list:
+                if infos is None or key not in infos:
+                    values.append(None)
+                else:
+                    values.append(infos[key])
+            first_tensor = next(
+                (value for value in values if torch.is_tensor(value)), None
+            )
+            if first_tensor is None:
+                continue
+            filled = []
+            for value in values:
+                if value is None:
+                    raise ValueError(
+                        f"Cannot merge env_infos[{key!r}]: missing shard tensor."
+                    )
+                filled.append(value)
+            merged[key] = torch.cat(filled, dim=0)
+        return merged or None
+
     def _merge_obs_batches(self, obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
@@ -957,6 +1042,7 @@ class MultiStepRolloutWorker(Worker):
         dones_list = [obs_batch.get("dones", None) for obs_batch in obs_batches]
         rewards_list = [obs_batch.get("rewards", None) for obs_batch in obs_batches]
         success_list = [obs_batch.get("success", None) for obs_batch in obs_batches]
+        env_infos_list = [obs_batch.get("env_infos", None) for obs_batch in obs_batches]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -996,6 +1082,7 @@ class MultiStepRolloutWorker(Worker):
             "dones": self._merge_optional_flag_tensors(obs_dicts, dones_list),
             "rewards": self._merge_optional_flag_tensors(obs_dicts, rewards_list),
             "success": self._merge_optional_flag_tensors(obs_dicts, success_list),
+            "env_infos": self._merge_env_infos(env_infos_list),
         }
 
     def _split_policy_output(
