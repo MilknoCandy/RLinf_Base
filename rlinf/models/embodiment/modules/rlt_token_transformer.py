@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 import math
 
 import torch
@@ -135,6 +133,7 @@ class RLTTokenEncoder(nn.Module):
             sinusoidal_pe_init(self.prefix_seq_len, self.embed_dim)
         )
         self.rl_token_pos_enc = nn.Parameter(sinusoidal_pe_init(1, self.embed_dim))
+        self.extra_pos_enc = nn.Parameter(sinusoidal_pe_init(4, self.embed_dim))
         self.layers = nn.ModuleList(
             [
                 RLTSelfAttentionLayer(
@@ -152,6 +151,7 @@ class RLTTokenEncoder(nn.Module):
         prefix_embs: torch.Tensor,
         mask: torch.Tensor | None = None,
         rl_token: torch.Tensor | None = None,
+        extra_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         prefix_embs = self.input_proj(prefix_embs)
         seq_len = prefix_embs.shape[-2]
@@ -166,6 +166,19 @@ class RLTTokenEncoder(nn.Module):
         )
         prefix_tokens = prefix_embs + prefix_pos
         batch_size = prefix_embs.shape[0]
+        parts = [prefix_tokens]
+        extra_len = 0
+        if extra_tokens is not None:
+            extra_len = int(extra_tokens.shape[1])
+            if extra_len > self.extra_pos_enc.shape[0]:
+                raise ValueError(
+                    f"extra_tokens length {extra_len} exceeds extra_pos_enc "
+                    f"{self.extra_pos_enc.shape[0]}."
+                )
+            extra_pos = self.extra_pos_enc[:extra_len].to(
+                device=prefix_embs.device, dtype=prefix_embs.dtype
+            )
+            parts.append(extra_tokens.to(dtype=prefix_embs.dtype) + extra_pos)
         if rl_token is None:
             rl_tokens = (
                 self.rl_token_embed.to(
@@ -177,34 +190,23 @@ class RLTTokenEncoder(nn.Module):
         else:
             rl_tokens = rl_token.to(
                 device=prefix_embs.device, dtype=prefix_embs.dtype
-            )
-            if rl_tokens.dim() == 2:
-                rl_tokens = rl_tokens.unsqueeze(1)
-            if rl_tokens.shape[:2] != (batch_size, 1):
-                raise ValueError(
-                    "rl_token must have shape [B, D] or [B, 1, D], got "
-                    f"{tuple(rl_token.shape)} for batch size {batch_size}."
-                )
-            if rl_tokens.shape[-1] != self.embed_dim:
-                raise ValueError(
-                    "rl_token embed dim must be "
-                    f"{self.embed_dim}, got {rl_tokens.shape[-1]}."
-                )
+            ).reshape(batch_size, 1, self.embed_dim)
         rl_pos = self.rl_token_pos_enc.to(
             device=prefix_embs.device, dtype=prefix_embs.dtype
         )
-        rl_tokens = rl_tokens.to(dtype=prefix_embs.dtype) + rl_pos
-        x = torch.cat([prefix_tokens, rl_tokens], dim=1)
+        rl_tokens = rl_tokens + rl_pos
+        parts.append(rl_tokens)
+        x = torch.cat(parts, dim=1)
 
         if mask is not None:
             mask = mask.to(device=prefix_embs.device, dtype=torch.bool)
-            rl_mask = torch.ones(
+            extra_ones = torch.ones(
                 batch_size,
-                1,
+                extra_len + 1,
                 device=prefix_embs.device,
                 dtype=torch.bool,
             )
-            mask = torch.cat([mask, rl_mask], dim=1)
+            mask = torch.cat([mask, extra_ones], dim=1)
 
         for layer in self.layers:
             x = layer(x, mask=mask)
@@ -363,18 +365,28 @@ class RLTTokenTransformer(nn.Module):
         prefix_embs: torch.Tensor,
         mask: torch.Tensor | None = None,
         rl_token: torch.Tensor | None = None,
+        extra_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.encoder(prefix_embs, mask, rl_token=rl_token)
+        return self.encoder(
+            prefix_embs,
+            mask,
+            rl_token=rl_token,
+            extra_tokens=extra_tokens,
+        )
 
     def encode_flat(
         self,
         prefix_embs: torch.Tensor,
         mask: torch.Tensor | None = None,
         rl_token: torch.Tensor | None = None,
+        extra_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.encode(prefix_embs, mask, rl_token=rl_token).reshape(
-            prefix_embs.shape[0], -1
-        )
+        return self.encode(
+            prefix_embs,
+            mask,
+            rl_token=rl_token,
+            extra_tokens=extra_tokens,
+        ).reshape(prefix_embs.shape[0], -1)
 
     def decode(
         self,

@@ -1,11 +1,3 @@
-# B2 Stage 2: freeze VLM/VLA, continue Stage 1 encoder as a Loop on the
-# Stage 2 MLP. Same as original RLT Stage 2: MLP is created from scratch
-# (rollout.model.model_path empty, runner.ckpt_path null). ckpt_path is only
-# for later eval/resume, not the Stage 2 training recipe.
-#   python examples/embodiment/train_embodied_agent.py --config-name maniskill_rlt_stage2_b2_loop
-# Set rollout.rlt_feature_model.model_path (and actor.model.encoder_ckpt) to
-# the trained Stage 1 checkpoint.
-
 defaults:
   - env/maniskill_rlt@env.train
   - env/maniskill_rlt@env.eval
@@ -32,8 +24,8 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_b2_loop"
-    logger_backends: ["wandb"]
+    experiment_name: "maniskill_rlt_stage2_ac_mlp_mem"
+    logger_backends: ["tensorboard"]
 
   max_epochs: 5000
   max_steps: -1
@@ -67,12 +59,12 @@ algorithm:
   gamma: 0.99
   tau: 0.005
 
-  # RLT actor objective: -q_weight * Q + bc_weight * BC.
+  # Actor BC-regularizes π toward the VLA chunk. π sees looped z, not ref.
   q_weight: 1.0
   bc_weight: 1.0
-  reference_dropout_prob: 0.5
-  # Schedule for the BC/Q weights in the actor objective. Disable it to use
-  # the fixed bc_weight and q_weight above for the entire run.
+  reference_dropout_prob: 0.0
+  pred_ref_weight: 1.0
+  pred_r_weight: 1.0
   actor_weight_schedule:
     enable: True
     warmup_updates: 20000
@@ -247,20 +239,16 @@ rollout:
     add_q_head: ${actor.model.add_q_head}
     q_head_type: ${actor.model.q_head_type}
     fixed_std: ${actor.model.fixed_std}
+    use_mem: ${actor.model.use_mem}
+    loop_prefix_len: ${actor.model.loop_prefix_len}
+    loop_num_heads: ${actor.model.loop_num_heads}
+    loop_num_layers: ${actor.model.loop_num_layers}
+    mem_unroll_len: ${actor.model.mem_unroll_len}
     is_lora: False
     lora_rank: 32
-    rlt_loop: True
-    encoder_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_dropout_rate: 0.0
 
   rlt_feature_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/path/to/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
     precision: bf16
     num_action_chunks: 10
@@ -297,17 +285,17 @@ rollout:
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
       rlt_encoder_type: "append_self_attention"
-      rlt_image_only: True
+      rlt_image_only: False
       rlt_use_mask: True
-      rlt_b2: True
-      rlt_b2_image_keep_ratio: 0.5
+      rlt_return_prefix: True
+      rlt_loop_prefix_len: ${actor.model.loop_prefix_len}
 
   # Optional ManiSkill expert takeover model. Enable it with
   # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
-  # to a stronger openpi_rlinf SFT checkpoint trained with the same task
+  # to a stronger official OpenPI SFT checkpoint trained with the same task
   # transforms; it predicts expert actions directly and does not use RLT tokens.
   expert_model:
-    model_type: "openpi_rlinf"
+    model_type: "openpi"
     model_path: "/path/to/rlt_maniskill_joint_pi05_sft_more_steps/checkpoints/global_step_<step>/actor"
     precision: bf16
     num_action_chunks: 10
@@ -357,17 +345,13 @@ actor:
     add_q_head: True
     q_head_type: "default"
     fixed_std: 0.002
+    use_mem: True
+    loop_prefix_len: 64
+    loop_num_heads: 8
+    loop_num_layers: 2
+    mem_unroll_len: 4
     is_lora: False
     lora_rank: 32
-    rlt_loop: True
-    encoder_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: 2048
-    rlt_embed_dim: 2048
-    rlt_prefix_seq_len: 1024
-    rlt_num_layers: 2
-    rlt_num_heads: 8
-    rlt_mlp_ratio: 4.0
-    rlt_dropout_rate: 0.0
 
   optim:
     clip_grad: 10.0

@@ -17,14 +17,18 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+from rlinf.models.embodiment.modules.rlt_mem_write import RLTLoopEncoder
 
 
 class RLTMLPPolicy(MLPPolicy):
     """MLP actor-critic policy for RLT Stage 2 heads.
 
-    Actor input follows RLT: reference action chunk, RL token feature, and
-    proprioceptive state. Critic input follows RLT: RL token, proprioception,
-    and optional privileged progress memory.
+    Default actor input is reference chunk + RL token + proprio. With
+    ``use_mem=True``, ``z`` is the encoder loop
+    ``Encoder([I_t; a_{t-1}; r_{t-1}; z_{t-1}])``. Rollout carries ``z``
+    across chunks. Training unrolls a same-episode window so ``π`` / ``Q``
+    are functions of recent ``(I, a, r)``, not one isolated critical frame.
+    ``ref_chunk`` is never an encoder input; it is only a BC / pred target.
     """
 
     def __init__(
@@ -37,8 +41,11 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
-        progress_dim: int = 0,
-        progress_in_actor: bool = False,
+        use_mem: bool = False,
+        loop_prefix_len: int = 64,
+        loop_num_heads: int = 8,
+        loop_num_layers: int = 2,
+        mem_unroll_len: int = 4,
     ):
         if not add_q_head:
             raise ValueError(
@@ -57,12 +64,15 @@ class RLTMLPPolicy(MLPPolicy):
                 f"{ref_chunk_len} < {chunk_len}."
             )
         flat_action_dim = chunk_len * step_action_dim
+        use_mem = bool(use_mem)
+        loop_prefix_len = int(loop_prefix_len)
 
-        progress_dim = max(int(progress_dim), 0)
-        actor_obs_dim = z_dim + proprio_dim + flat_action_dim
-        if progress_in_actor:
-            actor_obs_dim += progress_dim
-        critic_obs_dim = z_dim + proprio_dim + progress_dim
+        if use_mem:
+            actor_obs_dim = z_dim + proprio_dim
+            critic_obs_dim = z_dim + proprio_dim
+        else:
+            actor_obs_dim = z_dim + proprio_dim + flat_action_dim
+            critic_obs_dim = z_dim + proprio_dim
 
         super().__init__(
             obs_dim=actor_obs_dim,
@@ -80,11 +90,25 @@ class RLTMLPPolicy(MLPPolicy):
         self.ref_chunk_len = ref_chunk_len
         self.flat_action_dim = flat_action_dim
         self.fixed_std = float(fixed_std)
+        self.use_mem = use_mem
+        self.loop_prefix_len = loop_prefix_len
+        self.mem_unroll_len = int(mem_unroll_len)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
-        self.rlt_loop = None
-        self.progress_dim = progress_dim
-        self.progress_in_actor = bool(progress_in_actor) and progress_dim > 0
+        if use_mem:
+            # Name contains "encoder" so FSDP puts the loop on the critic
+            # optimizer with TD + pred_ref, not the actor -Q step.
+            self.loop_encoder = RLTLoopEncoder(
+                z_dim=z_dim,
+                action_dim=flat_action_dim,
+                prefix_len=loop_prefix_len,
+                num_heads=int(loop_num_heads),
+                num_layers=int(loop_num_layers),
+            )
+        else:
+            self.loop_encoder = None
+        self._rollout_mem = None
+        self._rollout_prev_action = None
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -99,85 +123,8 @@ class RLTMLPPolicy(MLPPolicy):
             return tensor
         return tensor.reshape(tensor.shape[0], -1)
 
-    @staticmethod
-    def _as_batch_tokens(tensor: torch.Tensor, feature_dim: int) -> torch.Tensor:
-        while tensor.dim() > 3:
-            tensor = tensor.reshape(
-                tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]
-            )
-        if tensor.dim() == 2:
-            return tensor.unsqueeze(1)
-        if tensor.dim() == 3:
-            if tensor.shape[-1] != feature_dim:
-                raise ValueError(
-                    "Token feature dim mismatch: "
-                    f"{tuple(tensor.shape)} vs {feature_dim}."
-                )
-            return tensor
-        raise ValueError(
-            f"Unexpected token rank {tensor.dim()} for {tuple(tensor.shape)}."
-        )
-
-    def encode_rlt(
-        self,
-        image_tokens: torch.Tensor,
-        image_mask: torch.Tensor | None,
-        z_prev: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Encode post-VLM tokens. ``z_prev`` is detached so Loop is not BPTT."""
-        if self.rlt_loop is None:
-            raise RuntimeError("encode_rlt requires rlt_loop to be attached.")
-        tokens = image_tokens.to(
-            device=next(self.rlt_loop.parameters()).device,
-            dtype=next(self.rlt_loop.parameters()).dtype,
-        )
-        tokens = self._as_batch_tokens(tokens, int(tokens.shape[-1]))
-        mask = None
-        if image_mask is not None:
-            mask = image_mask.to(device=tokens.device, dtype=torch.bool)
-            if mask.dim() > 2:
-                mask = mask.reshape(tokens.shape[0], tokens.shape[1])
-            elif mask.dim() == 1:
-                mask = mask.unsqueeze(0)
-        rl_token = None
-        if z_prev is not None:
-            rl_token = z_prev.detach()
-            while rl_token.dim() > 2:
-                rl_token = rl_token.reshape(
-                    rl_token.shape[0] * rl_token.shape[1], *rl_token.shape[2:]
-                )
-            if rl_token.dim() == 1:
-                rl_token = rl_token.unsqueeze(0)
-        encoded = self.rlt_loop(tokens, mask, rl_token=rl_token)
-        return encoded.reshape(tokens.shape[0], -1)
-
     def _get_z(self, obs: dict) -> torch.Tensor:
-        if self.rlt_loop is not None and "rlt_image_tokens" in obs:
-            return self.encode_rlt(
-                obs["rlt_image_tokens"],
-                obs.get("rlt_image_mask"),
-                obs.get("z_prev"),
-            )
         return self._flatten_batch(obs["z_rl"])
-
-    def _get_progress(self, obs: dict) -> torch.Tensor:
-        if self.progress_dim <= 0:
-            batch = next(iter(obs.values()))
-            return torch.zeros(
-                (batch.shape[0], 0), device=batch.device, dtype=batch.dtype
-            )
-        if "rlt_progress" not in obs:
-            raise ValueError(
-                "progress_dim>0 requires obs['rlt_progress']. Enable progress "
-                "memory in the rollout worker."
-            )
-        progress = self._flatten_batch(obs["rlt_progress"])
-        if progress.shape[-1] != self.progress_dim:
-            raise ValueError(
-                "rlt_progress last dim must be "
-                f"{self.progress_dim}, got {tuple(progress.shape)}."
-            )
-        return progress
 
     def _get_proprio(self, obs: dict) -> torch.Tensor:
         return self._flatten_batch(obs["proprio"])
@@ -202,6 +149,100 @@ class RLTMLPPolicy(MLPPolicy):
         )
         return ref_chunk * keep_mask.to(dtype=ref_chunk.dtype)
 
+    def _unroll_from_obs(
+        self, obs: dict
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hist_prefix = obs["hist_prefix_embs"]
+        hist_mask = obs.get("hist_prefix_mask")
+        hist_valid = obs["hist_valid"].reshape(obs["hist_valid"].shape[0], -1)
+        steps = hist_valid.shape[-1]
+        hist_action = obs["hist_action"].reshape(obs["hist_action"].shape[0], steps, -1)
+        hist_reward = obs["hist_reward"].reshape(obs["hist_reward"].shape[0], steps, -1)
+        if hist_mask is not None:
+            hist_mask = hist_mask.reshape(hist_mask.shape[0], steps, -1)
+        return self.loop_encoder.unroll(
+            hist_prefix, hist_mask, hist_action, hist_reward, hist_valid
+        )
+
+    def _write_mem(self, obs: dict, *, recompute: bool | None = None) -> torch.Tensor:
+        if self.loop_encoder is None:
+            raise RuntimeError("write_mem requires use_mem=True.")
+        if recompute is False:
+            return self._get_z(obs)
+        if "hist_prefix_embs" in obs:
+            z, _, _ = self._unroll_from_obs(obs)
+            return z
+        if "prefix_embs" not in obs:
+            raise KeyError("Encoder loop requires prefix_embs from extract_rlt_obs.")
+        prefix = obs["prefix_embs"]
+        mask = obs.get("prefix_mask")
+        batch = prefix.shape[0]
+        device, dtype = prefix.device, prefix.dtype
+        z_prev = obs.get("z_prev")
+        if z_prev is None:
+            z_prev = self.loop_encoder.initial_mem(batch, device, dtype)
+        else:
+            z_prev = self._flatten_batch(z_prev).to(device=device, dtype=dtype)
+        prev_action = obs.get("prev_action")
+        if prev_action is None:
+            prev_action = torch.zeros(
+                batch, self.flat_action_dim, device=device, dtype=dtype
+            )
+        else:
+            prev_action = self._flatten_batch(prev_action).to(device=device, dtype=dtype)
+        prev_reward = obs.get("prev_reward")
+        if prev_reward is None:
+            prev_reward = torch.zeros(batch, 1, device=device, dtype=dtype)
+        else:
+            prev_reward = self._flatten_batch(prev_reward).to(device=device, dtype=dtype)
+            if prev_reward.shape[-1] != 1:
+                prev_reward = prev_reward.mean(dim=-1, keepdim=True)
+        return self.loop_encoder.write(prefix, mask, z_prev, prev_action, prev_reward)
+
+    def bind_mem(self, obs: dict, *, detach: bool = False) -> dict:
+        """Recompute looped ``z`` from current prefix and previous write."""
+        if not self.use_mem:
+            return obs
+        z = self._write_mem(obs)
+        if detach:
+            z = z.detach()
+        bound = dict(obs)
+        bound["z_rl"] = z
+        return bound
+
+    def predictive_loss(
+        self,
+        obs: dict,
+        ref_chunk: torch.Tensor,
+        reward_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        if self.loop_encoder is None:
+            raise RuntimeError("predictive_loss requires use_mem=True.")
+        if "hist_prefix_embs" in obs:
+            z, z_seq, valid = self._unroll_from_obs(obs)
+            pred_ref_seq = self.loop_encoder.pred_ref(z_seq)
+            hist_ref = obs["hist_ref"].to(device=pred_ref_seq.device)
+            hist_ref = hist_ref.reshape(pred_ref_seq.shape[0], pred_ref_seq.shape[1], -1)
+            valid = valid.to(device=pred_ref_seq.device, dtype=pred_ref_seq.dtype)
+            sq = torch.square(pred_ref_seq - hist_ref).mean(dim=-1)
+            ref_loss = sq.mul(valid).sum() / torch.clamp(valid.sum(), min=1.0)
+            pred_ref = pred_ref_seq[:, -1]
+        else:
+            z = self._write_mem(obs)
+            pred_ref, _ = self.loop_encoder.predict(z)
+            ref_loss = F.mse_loss(pred_ref, self._flatten_batch(ref_chunk))
+        _, pred_r = self.loop_encoder.predict(z)
+        reward_target = self._flatten_batch(reward_target).to(dtype=pred_r.dtype)
+        if reward_target.shape[-1] != 1:
+            reward_target = reward_target.mean(dim=-1, keepdim=True)
+        reward_loss = F.mse_loss(pred_r, reward_target)
+        metrics = {
+            "pred_ref_loss": ref_loss.detach().item(),
+            "pred_r_loss": reward_loss.detach().item(),
+            "pred_ref_abs_mean": pred_ref.detach().abs().mean().item(),
+        }
+        return ref_loss, reward_loss, metrics
+
     def _actor_state(
         self,
         obs: dict,
@@ -209,19 +250,19 @@ class RLTMLPPolicy(MLPPolicy):
         apply_reference_dropout: bool = False,
         reference_dropout_prob: float = 0.0,
     ) -> torch.Tensor:
+        if self.use_mem:
+            obs = self.bind_mem(obs, detach=True)
+            return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
         ref_chunk = self._get_ref_chunk(obs)
         if apply_reference_dropout:
             ref_chunk = self._maybe_drop_reference(ref_chunk, reference_dropout_prob)
         parts = [ref_chunk, self._get_z(obs), self._get_proprio(obs)]
-        if self.progress_in_actor:
-            parts.append(self._get_progress(obs))
         return torch.cat(parts, dim=-1)
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
-        parts = [self._get_z(obs), self._get_proprio(obs)]
-        if self.progress_dim > 0:
-            parts.append(self._get_progress(obs))
-        return torch.cat(parts, dim=-1)
+        if self.use_mem:
+            obs = self.bind_mem(obs, detach=False)
+        return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
 
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)
@@ -294,6 +335,78 @@ class RLTMLPPolicy(MLPPolicy):
         pred_actions = self.actor_mean(self.backbone(actor_state))
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
+    def _chunk_reward_scalar(
+        self, rewards: torch.Tensor | None, batch: int, device, dtype
+    ) -> torch.Tensor:
+        if rewards is None:
+            return torch.zeros(batch, 1, device=device, dtype=dtype)
+        reward = rewards.to(device=device, dtype=dtype).reshape(batch, -1)
+        return reward.sum(dim=-1, keepdim=True)
+
+    def _done_mask(
+        self, dones: torch.Tensor | None, batch: int, device
+    ) -> torch.Tensor:
+        if dones is None:
+            return torch.zeros(batch, 1, device=device, dtype=torch.bool)
+        return dones.to(device=device).reshape(batch, -1).any(dim=-1, keepdim=True)
+
+    def reset_rollout_mem(self, batch: int, device, dtype) -> None:
+        if self.loop_encoder is None:
+            return
+        self._rollout_mem = self.loop_encoder.initial_mem(batch, device, dtype).clone()
+        self._rollout_prev_action = torch.zeros(
+            batch, self.flat_action_dim, device=device, dtype=dtype
+        )
+
+    def commit_rollout_action(self, actions: torch.Tensor) -> None:
+        if self._rollout_prev_action is None:
+            return
+        flat = self._flatten_batch(actions).to(
+            device=self._rollout_prev_action.device,
+            dtype=self._rollout_prev_action.dtype,
+        )
+        self._rollout_prev_action = flat
+
+    def _prepare_rollout_mem(
+        self,
+        obs: dict,
+        *,
+        dones: torch.Tensor | None,
+        rewards: torch.Tensor | None,
+    ) -> dict:
+        if not self.use_mem or self.loop_encoder is None:
+            return obs
+        if "prefix_embs" not in obs:
+            raise KeyError("Encoder loop requires prefix_embs from extract_rlt_obs.")
+        prefix = obs["prefix_embs"]
+        batch = prefix.shape[0]
+        device, dtype = prefix.device, prefix.dtype
+        if (
+            self._rollout_mem is None
+            or self._rollout_mem.shape[0] != batch
+            or self._rollout_mem.device != device
+        ):
+            self.reset_rollout_mem(batch, device, dtype)
+        done_mask = self._done_mask(dones, batch, device)
+        if done_mask.any():
+            init = self.loop_encoder.initial_mem(batch, device, dtype)
+            self._rollout_mem = torch.where(done_mask, init, self._rollout_mem)
+            self._rollout_prev_action = torch.where(
+                done_mask,
+                torch.zeros_like(self._rollout_prev_action),
+                self._rollout_prev_action,
+            )
+        prev_reward = self._chunk_reward_scalar(rewards, batch, device, dtype)
+        prev_reward = torch.where(done_mask, torch.zeros_like(prev_reward), prev_reward)
+        obs = dict(obs)
+        obs["z_prev"] = self._rollout_mem
+        obs["prev_action"] = self._rollout_prev_action
+        obs["prev_reward"] = prev_reward
+        z = self._write_mem(obs, recompute=True)
+        obs["z_rl"] = z
+        self._rollout_mem = z.detach()
+        return obs
+
     @torch.inference_mode()
     def predict_action_batch(
         self,
@@ -302,10 +415,13 @@ class RLTMLPPolicy(MLPPolicy):
         calculate_values=True,
         return_obs=True,
         mode="train",
+        dones=None,
+        rewards=None,
         **kwargs,
     ):
-        del calculate_logprobs, calculate_values
+        del calculate_logprobs, calculate_values, kwargs
         obs = self.preprocess_env_obs(env_obs=env_obs)
+        obs = self._prepare_rollout_mem(obs, dones=dones, rewards=rewards)
         action, chunk_logprobs, _ = self.sac_forward(
             obs, deterministic=(mode == "eval")
         )

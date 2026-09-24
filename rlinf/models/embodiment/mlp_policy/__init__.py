@@ -35,17 +35,12 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
-            progress_dim=int(cfg.get("progress_dim", 0) or 0),
-            progress_in_actor=bool(cfg.get("progress_in_actor", False)),
+            use_mem=cfg.get("use_mem", False),
+            loop_prefix_len=cfg.get("loop_prefix_len", 64),
+            loop_num_heads=cfg.get("loop_num_heads", 8),
+            loop_num_layers=cfg.get("loop_num_layers", 2),
+            mem_unroll_len=cfg.get("mem_unroll_len", 4),
         )
-        encoder_ckpt = cfg.get("encoder_ckpt", None)
-        use_rlt_loop = bool(cfg.get("rlt_loop", False) or encoder_ckpt)
-        if use_rlt_loop:
-            from rlinf.algorithms.rlt.b2_sft import build_encoder, load_encoder_weights
-
-            model.rlt_loop = build_encoder(cfg)
-            if encoder_ckpt:
-                load_encoder_weights(model.rlt_loop, encoder_ckpt)
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(
             z_dim=cfg.z_dim,

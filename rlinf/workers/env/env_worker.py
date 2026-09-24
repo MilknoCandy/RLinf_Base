@@ -22,7 +22,6 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
-from rlinf.algorithms.rlt.b2_feedback import select_b2_env_infos
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.schema.embodied_trajectory_builder import (
     EmbodiedLerobotTrajectoryBuilder,
@@ -82,23 +81,6 @@ class EnvWorker(Worker):
         self.enable_rlt = OmegaConf.select(
             self.cfg, "algorithm.loss_type", default=""
         ) in {"rlt_ac", "rlt_td3"}
-        self.enable_rlt_b2 = bool(
-            OmegaConf.select(
-                self.cfg, "rollout.rlt_feature_model.openpi.rlt_b2", default=False
-            )
-        )
-        self.enable_rlt_b2_dump = bool(
-            OmegaConf.select(self.cfg, "rollout.rlt_b2_dump_dir", default=None)
-        )
-        self.enable_rlt_progress = (
-            int(
-                OmegaConf.select(
-                    self.cfg, "actor.model.progress_dim", default=0
-                )
-                or 0
-            )
-            > 0
-        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -979,9 +961,8 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
-        if self.enable_rlt_b2 or self.enable_rlt_b2_dump or self.enable_rlt_progress:
             data["dones"] = env_batch.get("dones", None)
-            data["env_infos"] = select_b2_env_infos(env_batch.get("env_infos"))
+            data["rewards"] = env_batch.get("rewards", None)
         return data
 
     def _send_train_bootstrap(
@@ -1404,22 +1385,9 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
-                    eval_dones = None
-                    if (
-                        self.enable_rlt_b2
-                        or self.enable_rlt_b2_dump
-                        or self.enable_rlt_progress
-                    ):
-                        eval_dones = (
-                            torch.zeros(
-                                (self.eval_num_envs_per_stage,), dtype=torch.bool
-                            )
-                            .unsqueeze(1)
-                            .repeat(1, self.model_cfg.num_action_chunks)
-                        )
                     env_output = EnvOutput(
                         obs=extracted_obs,
-                        dones=eval_dones,
+                        dones=None,
                         final_obs=(
                             infos["final_observation"]
                             if "final_observation" in infos

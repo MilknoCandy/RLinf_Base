@@ -358,56 +358,33 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
     def extract_rlt_obs(
         self,
         env_obs: dict[str, Any],
-        *,
-        rl_token: torch.Tensor | None = None,
-        feedback_sentences: list[str] | None = None,
-        return_image_tokens: bool = False,
-        encode_z: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Extract RLT observations from one frozen VLM prefix pass.
 
         The prefix produces both the RL token and the VLA reference:
 
-        - encoder([image tokens, ``rl_token``]) → ``z_rl``
+        - encoder(prefix tokens) → ``z_rl``
         - VLA action expert on the same KV cache → ``ref_chunk``
 
         Stage 2 MLP residual-adjusts ``ref_chunk`` using ``z_rl``. ``z`` is not
-        injected into the VLA. Dump requests ``return_image_tokens`` to store
-        TopK image tokens from this same prefix; it must not change the prompt.
+        injected into the VLA.
         """
         self._require_rlt()
         repacked = self._repack_env_obs(env_obs)
-        if feedback_sentences:
-            from rlinf.algorithms.rlt.b2_feedback import append_feedback_to_prompts
-
-            prompts = repacked.get("prompt")
-            if isinstance(prompts, list):
-                repacked["prompt"] = append_feedback_to_prompts(
-                    [str(item) for item in prompts],
-                    feedback_sentences,
-                )
         processed = self.input_transform(repacked, transpose=False)
         observation = self._observation_dict_to_device(processed)
 
         prepared_observation = pi0_model_module.preprocess_observation(
             observation, train=False
         )
-        capture_last_attn = bool(self.rlt_cfg.rlt_b2) or return_image_tokens
         prefix_output, prefix_mask, kv_cache = self.model.build_prefix_cache(
             prepared_observation,
-            capture_last_attn=capture_last_attn,
-        )
-        attn_probs = (
-            getattr(self.model.llm, "last_attn_probs", None)
-            if capture_last_attn
-            else None
         )
         lang_tokens = prepared_observation.tokenized_prompt
         rlt_prefix_output, rlt_prefix_mask = self._select_rlt_prefix_embeddings(
             prefix_output,
             prefix_mask,
             lang_tokens,
-            attn_probs=attn_probs,
         )
 
         raw_proprio = self._select_configured_state(env_obs["states"])
@@ -434,34 +411,25 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         ref_chunk = self.output_transform(
             {"actions": model_actions, "state": observation.state}
         )["actions"]
-        out: dict[str, torch.Tensor] = {
+        out = {
             "proprio": proprio,
             "ref_chunk": ref_chunk.to(
                 device=rlt_prefix_output.device, dtype=torch.float32
             ),
+            "z_rl": self._encode_rlt_flat(
+                rlt_prefix_output, rlt_prefix_mask
+            ).to(dtype=torch.float32),
         }
-        if encode_z:
-            out["z_rl"] = self._encode_rlt_flat(
-                rlt_prefix_output, rlt_prefix_mask, rl_token=rl_token
-            ).to(dtype=torch.float32)
-        if return_image_tokens:
-            dump_tokens, dump_mask = rlt_prefix_output, rlt_prefix_mask
-            if attn_probs is not None:
-                from rlinf.models.embodiment.modules.rlt_b2_select import (
-                    select_topk_image_tokens,
-                )
+        if self.rlt_cfg.rlt_return_prefix:
+            from rlinf.models.embodiment.modules.rlt_mem_write import pool_rlt_prefix
 
-                lang_len = 0 if lang_tokens is None else int(lang_tokens.shape[1])
-                dump_tokens, dump_mask = select_topk_image_tokens(
-                    prefix_output,
-                    prefix_mask,
-                    attn_probs=attn_probs,
-                    num_image_tokens=prefix_output.shape[1] - lang_len,
-                    keep_ratio=self.rlt_cfg.rlt_b2_image_keep_ratio,
-                    lang_len=lang_len,
-                )
-            out["rlt_image_tokens"] = dump_tokens
-            out["rlt_image_mask"] = dump_mask
+            prefix_embs, prefix_mask = pool_rlt_prefix(
+                rlt_prefix_output,
+                rlt_prefix_mask,
+                self.rlt_cfg.rlt_loop_prefix_len,
+            )
+            out["prefix_embs"] = prefix_embs.to(dtype=torch.float32)
+            out["prefix_mask"] = prefix_mask
         return out
 
     def _sample_actions_from_prefix_cache(

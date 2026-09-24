@@ -111,28 +111,9 @@ class OpenPiPytorchActionModel(nn.Module):
         prefix_output: torch.Tensor,
         prefix_mask: torch.Tensor,
         lang_tokens: torch.Tensor | None,
-        attn_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         lang_len = 0 if lang_tokens is None else int(lang_tokens.shape[1])
         num_image_tokens = prefix_output.shape[1] - lang_len
-        if self.rlt_cfg.rlt_b2:
-            if attn_probs is None:
-                raise ValueError(
-                    "B2 image-token selection requires last-layer attention "
-                    "probabilities from the VLM prefix pass."
-                )
-            from rlinf.models.embodiment.modules.rlt_b2_select import (
-                select_topk_image_tokens,
-            )
-
-            return select_topk_image_tokens(
-                prefix_output,
-                prefix_mask,
-                attn_probs=attn_probs,
-                num_image_tokens=num_image_tokens,
-                keep_ratio=self.rlt_cfg.rlt_b2_image_keep_ratio,
-                lang_len=lang_len,
-            )
         if self.rlt_cfg.rlt_image_only and lang_tokens is not None:
             prefix_output = prefix_output[:, :num_image_tokens]
             prefix_mask = prefix_mask[:, :num_image_tokens]
@@ -142,19 +123,12 @@ class OpenPiPytorchActionModel(nn.Module):
         self,
         prefix_output: torch.Tensor,
         prefix_mask: torch.Tensor,
-        rl_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._require_rlt()
         rlt_param = next(self.rlt_module.parameters())
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
-        rlt_mask = (
-            prefix_mask
-            if (self.rlt_cfg.rlt_use_mask or self.rlt_cfg.rlt_b2)
-            else None
-        )
-        return self.rlt_module.encode_flat(
-            prefix_output, rlt_mask, rl_token=rl_token
-        )
+        rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
+        return self.rlt_module.encode_flat(prefix_output, rlt_mask)
 
     def _rlt_forward(
         self,

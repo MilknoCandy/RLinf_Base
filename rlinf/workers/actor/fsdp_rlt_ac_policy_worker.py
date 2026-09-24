@@ -36,19 +36,6 @@ from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
 
-def _pearson_corr(left: torch.Tensor, right: torch.Tensor) -> float:
-    left = left.reshape(-1).float()
-    right = right.reshape(-1).float()
-    if left.numel() < 2 or right.numel() != left.numel():
-        return 0.0
-    left = left - left.mean()
-    right = right - right.mean()
-    denom = left.norm() * right.norm()
-    if float(denom.item()) < 1.0e-8:
-        return 0.0
-    return float((left * right).sum().item() / denom.item())
-
-
 class RLTACLossMixin:
     """RLT actor-critic losses on top of RLinf replay-buffer worker plumbing.
 
@@ -291,12 +278,7 @@ class RLTACLossMixin:
             else:
                 raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 
-        # Loop encoder sits on the actor optimizer. Detach critic TD so those
-        # unused encoder grads are not computed; actor Q keeps the graph.
-        detach_encoder = bool(
-            self.cfg.actor.model.get("rlt_loop", False)
-            or self.cfg.actor.model.get("encoder_ckpt", None)
-        )
+        detach_encoder = False
         if not use_crossq:
             all_data_q_values = self.model(
                 forward_type=ForwardType.SAC_Q,
@@ -319,45 +301,21 @@ class RLTACLossMixin:
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
         critic_metrics = {"q_data": all_data_q_values.mean().item()}
-        critic_metrics.update(
-            self._progress_critic_metrics(curr_obs, all_data_q_values)
-        )
+        if getattr(self.model, "use_mem", False):
+            pred_ref_weight = float(self.cfg.algorithm.get("pred_ref_weight", 1.0))
+            pred_r_weight = float(self.cfg.algorithm.get("pred_r_weight", 1.0))
+            pred_ref_loss, pred_r_loss, pred_metrics = self.model.predictive_loss(
+                curr_obs,
+                self._ref_chunk(curr_obs),
+                reward_target,
+            )
+            pred_loss = pred_ref_weight * pred_ref_loss + pred_r_weight * pred_r_loss
+            critic_loss = critic_loss + pred_loss
+            critic_metrics.update(pred_metrics)
+            critic_metrics["pred_loss"] = pred_loss.detach().item()
+            critic_metrics["pred_ref_weight"] = pred_ref_weight
+            critic_metrics["pred_r_weight"] = pred_r_weight
         return critic_loss, critic_metrics
-
-    @staticmethod
-    def _progress_critic_metrics(curr_obs, all_q_values) -> dict[str, float]:
-        progress = curr_obs.get("rlt_progress") if isinstance(curr_obs, dict) else None
-        if not torch.is_tensor(progress):
-            return {}
-        progress = progress.detach().float().reshape(progress.shape[0], -1)
-        if progress.shape[-1] < 4:
-            return {}
-        q = all_q_values.detach().float()
-        q = q.reshape(q.shape[0], -1).mean(dim=-1)
-        distance = progress[:, 0]
-        delta = progress[:, 1]
-        success = progress[:, 2]
-        has_history = progress[:, 3]
-        metrics = {
-            "progress_d": float(distance.mean().item()),
-            "progress_delta": float(delta.mean().item()),
-            "progress_success": float(success.mean().item()),
-            "progress_has_history": float(has_history.mean().item()),
-        }
-        if q.numel() == distance.numel() and q.numel() > 1:
-            metrics["q_corr_neg_d"] = _pearson_corr(q, -distance)
-            closer = delta < 0
-            farther = delta > 0
-            if bool(closer.any()) and bool(farther.any()):
-                metrics["q_closer_minus_farther"] = float(
-                    q[closer].mean().item() - q[farther].mean().item()
-                )
-            success_mask = success > 0.5
-            if bool(success_mask.any()) and bool((~success_mask).any()):
-                metrics["q_success_gap"] = float(
-                    q[success_mask].mean().item() - q[~success_mask].mean().item()
-                )
-        return metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -377,12 +335,7 @@ class RLTACLossMixin:
             log_pi = log_pi.unsqueeze(-1)
         log_pi = log_pi.sum(dim=-1, keepdim=True)
 
-        # Default SAC detaches Q from the encoder. With a Loop encoder the
-        # actor optimizer owns those weights, so -Q must flow through them.
-        detach_encoder = not bool(
-            self.cfg.actor.model.get("rlt_loop", False)
-            or self.cfg.actor.model.get("encoder_ckpt", None)
-        )
+        detach_encoder = True
         if not use_crossq:
             all_qf_pi = self.model(
                 forward_type=ForwardType.SAC_Q,
@@ -501,6 +454,163 @@ class RLTACReplayMixin:
             if isinstance(value, torch.Tensor) and idx < value.shape[0]:
                 row_dict[key] = self._row_tensor(value, idx)
         return row_dict
+
+    def _mem_unroll_len(self) -> int:
+        if not getattr(self.model, "use_mem", False):
+            return 0
+        return int(self.cfg.actor.model.get("mem_unroll_len", 4))
+
+    @staticmethod
+    def _same_episode_steps(
+        trajectory: Trajectory, start_t: int, end_t: int, env_idx: int
+    ) -> bool:
+        if start_t < 0:
+            return False
+        dones = trajectory.dones
+        if not isinstance(dones, torch.Tensor):
+            return True
+        for step in range(start_t, end_t):
+            done_idx = min(step + 1, int(dones.shape[0]) - 1)
+            if dones[done_idx, env_idx].reshape(-1).to(torch.bool).any():
+                return False
+        return True
+
+    @staticmethod
+    def _squeeze_leading_ones(tensor: torch.Tensor, ndim: int) -> torch.Tensor:
+        value = tensor.detach()
+        while value.dim() > ndim and value.shape[0] == 1:
+            value = value.squeeze(0)
+        return value
+
+    def _loop_hist_window(
+        self,
+        flat: dict,
+        trajectory: Trajectory,
+        *,
+        end_t: int,
+        env_idx: int,
+        traj_len: int,
+        bsz: int,
+        last_prefix: torch.Tensor,
+        last_mask: torch.Tensor | None,
+        last_ref: torch.Tensor,
+        last_action: torch.Tensor,
+        last_reward: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        unroll_len = self._mem_unroll_len()
+        prefix = self._squeeze_leading_ones(last_prefix, 2)
+        mask = (
+            self._squeeze_leading_ones(last_mask, 1)
+            if last_mask is not None
+            else torch.ones(prefix.shape[0], dtype=torch.bool)
+        )
+        ref_flat = self._squeeze_leading_ones(last_ref, 2).reshape(-1)
+        action_flat = self._squeeze_leading_ones(last_action, 2).reshape(-1)
+        reward_flat = self._squeeze_leading_ones(last_reward, 1).reshape(-1)
+        if reward_flat.numel() != 1:
+            reward_flat = reward_flat.sum().reshape(1)
+        curr_obs_flat = flat.get("curr_obs", {})
+        prefixes = []
+        masks = []
+        actions = []
+        rewards = []
+        refs = []
+        valids = []
+        for offset in range(unroll_len):
+            tau = end_t - (unroll_len - 1 - offset)
+            is_last = offset == unroll_len - 1
+            valid = is_last or (
+                0 <= tau < traj_len
+                and self._same_episode_steps(trajectory, tau, end_t, env_idx)
+            )
+            if is_last:
+                prefixes.append(prefix)
+                masks.append(mask)
+                actions.append(action_flat)
+                rewards.append(reward_flat.to(dtype=prefix.dtype))
+                refs.append(ref_flat.to(dtype=prefix.dtype))
+                valids.append(True)
+                continue
+            if not valid:
+                prefixes.append(torch.zeros_like(prefix))
+                masks.append(torch.zeros_like(mask))
+                actions.append(torch.zeros_like(action_flat))
+                rewards.append(torch.zeros(1, dtype=prefix.dtype))
+                refs.append(torch.zeros_like(ref_flat))
+                valids.append(False)
+                continue
+            idx = tau * bsz + env_idx
+            prefixes.append(curr_obs_flat["prefix_embs"][idx].detach().clone())
+            if "prefix_mask" in curr_obs_flat:
+                masks.append(curr_obs_flat["prefix_mask"][idx].detach().clone())
+            else:
+                masks.append(torch.ones_like(mask))
+            actions.append(flat["actions"][idx].detach().clone().reshape(-1))
+            step_reward = flat["rewards"][idx].detach().clone().reshape(-1)
+            rewards.append(step_reward.sum().reshape(1).to(dtype=prefix.dtype))
+            refs.append(curr_obs_flat["ref_chunk"][idx].detach().clone().reshape(-1))
+            valids.append(True)
+        return {
+            "hist_prefix_embs": torch.stack(prefixes, dim=0),
+            "hist_prefix_mask": torch.stack(masks, dim=0),
+            "hist_action": torch.stack(actions, dim=0),
+            "hist_reward": torch.stack(rewards, dim=0),
+            "hist_ref": torch.stack(refs, dim=0),
+            "hist_valid": torch.tensor(valids, dtype=torch.bool),
+        }
+
+    def _attach_loop_history(
+        self,
+        curr_obs: dict[str, torch.Tensor],
+        next_obs: dict[str, torch.Tensor],
+        flat: dict,
+        trajectory: Trajectory,
+        *,
+        t: int,
+        env_idx: int,
+        traj_len: int,
+        bsz: int,
+        is_done: bool,
+    ) -> None:
+        if self._mem_unroll_len() <= 0 or "prefix_embs" not in curr_obs:
+            return
+        idx = t * bsz + env_idx
+        curr_hist = self._loop_hist_window(
+            flat,
+            trajectory,
+            end_t=t,
+            env_idx=env_idx,
+            traj_len=traj_len,
+            bsz=bsz,
+            last_prefix=curr_obs["prefix_embs"],
+            last_mask=curr_obs.get("prefix_mask"),
+            last_ref=curr_obs["ref_chunk"],
+            last_action=flat["actions"][idx],
+            last_reward=flat["rewards"][idx],
+        )
+        next_hist = curr_hist
+        if not is_done and "prefix_embs" in next_obs:
+            next_hist = self._loop_hist_window(
+                flat,
+                trajectory,
+                end_t=t + 1,
+                env_idx=env_idx,
+                traj_len=traj_len,
+                bsz=bsz,
+                last_prefix=next_obs["prefix_embs"],
+                last_mask=next_obs.get("prefix_mask"),
+                last_ref=next_obs["ref_chunk"],
+                last_action=torch.zeros_like(flat["actions"][idx]),
+                last_reward=torch.zeros_like(flat["rewards"][idx]),
+            )
+        for key, value in curr_hist.items():
+            curr_obs[key] = (
+                value.detach().clone().unsqueeze(0).unsqueeze(0).cpu().contiguous()
+            )
+        for key, value in next_hist.items():
+            next_obs[key] = (
+                value.detach().clone().unsqueeze(0).unsqueeze(0).cpu().contiguous()
+            )
 
     def _rlt_obs_from_flat_dict(
         self,
@@ -635,6 +745,17 @@ class RLTACReplayMixin:
                         "transitions. Ensure update_rlt_transitions() populated "
                         f"transition obs before replay ingestion, got row index {idx}."
                     )
+                self._attach_loop_history(
+                    curr_obs,
+                    next_obs,
+                    flat,
+                    trajectory,
+                    t=t,
+                    env_idx=env_idx,
+                    traj_len=traj_len,
+                    bsz=bsz,
+                    is_done=is_done,
+                )
 
                 replay_trajectories.append(transition)
                 if is_done:

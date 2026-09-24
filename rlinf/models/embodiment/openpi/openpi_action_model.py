@@ -110,6 +110,8 @@ class OpenPi0Config(Pi0Config):
     rlt_mlp_ratio: float = 4.0
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
+    rlt_return_prefix: bool = False
+    rlt_loop_prefix_len: int = 64
     state_indices: list[int] | None = None
 
 
@@ -606,11 +608,22 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if not torch.is_tensor(proprio):
             proprio = torch.as_tensor(proprio)
 
-        return {
+        out = {
             "z_rl": z_rl,
             "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
             "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
         }
+        if self.config.rlt_return_prefix:
+            from rlinf.models.embodiment.modules.rlt_mem_write import pool_rlt_prefix
+
+            prefix_embs, prefix_mask = pool_rlt_prefix(
+                rlt_prefix_output,
+                rlt_mask if rlt_mask is not None else rlt_prefix_mask,
+                self.config.rlt_loop_prefix_len,
+            )
+            out["prefix_embs"] = prefix_embs.to(dtype=torch.float32)
+            out["prefix_mask"] = prefix_mask
+        return out
 
     def prepare_dagger_sft_batch(self, batch):
         """Prepare replay-buffer samples for DAgger SFT updates."""
