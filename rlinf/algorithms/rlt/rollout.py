@@ -90,6 +90,11 @@ def predict_rlt_actions(
         ):
             result["forward_inputs"]["rlt_switch_flags"] = rlt_switch_flags
 
+        clone_ready = True
+        is_ready = getattr(policy_model, "is_student_clone_ready", None)
+        if callable(is_ready):
+            clone_ready = bool(is_ready())
+
         route_output = rlt_route.route(
             RLTRouteContext(
                 env_obs=env_obs,
@@ -101,6 +106,7 @@ def predict_rlt_actions(
                 intervene_requested=intervene_requested,
                 expert_model=expert_model,
                 version=version,
+                clone_ready=clone_ready,
             )
         )
         actions = route_output.actions

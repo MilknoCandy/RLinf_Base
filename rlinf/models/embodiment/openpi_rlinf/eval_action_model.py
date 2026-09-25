@@ -416,9 +416,18 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             "ref_chunk": ref_chunk.to(
                 device=rlt_prefix_output.device, dtype=torch.float32
             ),
-            "z_rl": self._encode_rlt_flat(
-                rlt_prefix_output, rlt_prefix_mask
-            ).to(dtype=torch.float32),
+            "z_rl": (
+                torch.zeros(
+                    rlt_prefix_output.shape[0],
+                    int(self.rlt_cfg.rlt_embed_dim),
+                    device=rlt_prefix_output.device,
+                    dtype=torch.float32,
+                )
+                if self.rlt_cfg.rlt_return_prefix
+                else self._encode_rlt_flat(
+                    rlt_prefix_output, rlt_prefix_mask
+                ).to(dtype=torch.float32)
+            ),
         }
         if self.rlt_cfg.rlt_return_prefix:
             from rlinf.models.embodiment.modules.rlt_mem_write import pool_rlt_prefix
@@ -428,7 +437,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
                 rlt_prefix_mask,
                 self.rlt_cfg.rlt_loop_prefix_len,
             )
-            out["prefix_embs"] = prefix_embs.to(dtype=torch.float32)
+            out["prefix_embs"] = prefix_embs.to(dtype=torch.float16)
             out["prefix_mask"] = prefix_mask
         return out
 

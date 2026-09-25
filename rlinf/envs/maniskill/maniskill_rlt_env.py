@@ -40,6 +40,10 @@ from rlinf.envs.maniskill.peg_insertion_side_variants import (
     snapshot_peg_insertion_event_state,
     wrap_rlt_openpi_joint_obs,
 )
+from rlinf.envs.maniskill.rlt_potential import (
+    peg_insertion_potential,
+    success_potential_step_reward,
+)
 from rlinf.envs.maniskill.utils import allow_pci_render_backend
 
 __all__ = ["ManiskillRLTEnv"]
@@ -152,6 +156,12 @@ class ManiskillRLTEnv(ManiskillEnv):
         self.env: BaseEnv = gym.make(**env_args)
         self.prev_step_reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
             self.device
+        )
+        self._potential_prev_phi = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._potential_prev_valid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
         )
         self.record_metrics = record_metrics
         self._is_start = True
@@ -800,6 +810,7 @@ class ManiskillRLTEnv(ManiskillEnv):
             ),
         )
 
+        self._copy_scalar_info_to_episode(infos, ("rlt_potential",))
         if self.policy_mode == "eval":
             self._copy_scalar_info_to_episode(infos, self._RLT_EVAL_PEG_EPISODE_KEYS)
             if "success" in infos:
@@ -837,6 +848,67 @@ class ManiskillRLTEnv(ManiskillEnv):
         ):
             if key in switch_info:
                 infos[key] = switch_info[key]
+
+    def _reset_metrics(self, env_idx=None):
+        super()._reset_metrics(env_idx)
+        if not hasattr(self, "_potential_prev_phi"):
+            return
+        if env_idx is not None:
+            mask = torch.zeros(self.num_envs, dtype=bool, device=self.device)
+            mask[env_idx] = True
+            self._potential_prev_phi[mask] = 0.0
+            self._potential_prev_valid[mask] = False
+        else:
+            self._potential_prev_phi.zero_()
+            self._potential_prev_valid.zero_()
+
+    def _calc_step_reward(self, reward, info):
+        if getattr(self.cfg, "reward_mode", "default") != "success_potential":
+            return super()._calc_step_reward(reward, info)
+        if not self._is_peg_insertion_side or "peg_head_hole_x" not in info:
+            success = info.get("success")
+            if success is None:
+                return super()._calc_step_reward(reward, info)
+            return torch.as_tensor(success, device=self.device, dtype=torch.float32) * 1.0
+        pot_cfg = getattr(self.cfg, "reward_potential", None) or {}
+        device = self.device
+        hole_x = self._rlt_info_float(info, "peg_head_hole_x", device)
+        if "peg_head_hole_abs_y" in info and "peg_head_hole_abs_z" in info:
+            abs_y = self._rlt_info_float(info, "peg_head_hole_abs_y", device)
+            abs_z = self._rlt_info_float(info, "peg_head_hole_abs_z", device)
+        else:
+            yz = self._rlt_info_float(info, "peg_head_goal_yz_dist", device)
+            abs_y = yz
+            abs_z = torch.zeros_like(yz)
+        phi = peg_insertion_potential(
+            hole_x,
+            abs_y,
+            abs_z,
+            yz_weight=float(pot_cfg.get("yz_weight", 1.0)),
+        )
+        success = info.get("success")
+        if success is None:
+            success = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        else:
+            success = torch.as_tensor(success, device=device)
+            if success.numel() == 1:
+                success = success.reshape(1).repeat(self.num_envs)
+            success = success.reshape(self.num_envs, -1)[:, -1]
+        step_reward = success_potential_step_reward(
+            success,
+            phi,
+            self._potential_prev_phi,
+            self._potential_prev_valid,
+            coef=float(pot_cfg.get("coef", 1.0)),
+            gamma=float(pot_cfg.get("gamma", 0.99)),
+        )
+        info["rlt_potential"] = phi.detach()
+        self._potential_prev_phi = phi.detach()
+        self._potential_prev_valid = torch.ones(
+            self.num_envs, dtype=torch.bool, device=device
+        )
+        self.prev_step_reward = step_reward.detach()
+        return step_reward
 
     def reset(
         self,
@@ -921,6 +993,8 @@ class ManiskillRLTEnv(ManiskillEnv):
     def _snapshot_episode_state(self):
         state = {
             "prev_step_reward": self.prev_step_reward.clone(),
+            "potential_prev_phi": self._potential_prev_phi.clone(),
+            "potential_prev_valid": self._potential_prev_valid.clone(),
         }
         if self.record_metrics:
             state.update(
@@ -938,6 +1012,9 @@ class ManiskillRLTEnv(ManiskillEnv):
 
     def _restore_episode_state(self, state, mask):
         self.prev_step_reward[mask] = state["prev_step_reward"][mask]
+        if "potential_prev_phi" in state:
+            self._potential_prev_phi[mask] = state["potential_prev_phi"][mask]
+            self._potential_prev_valid[mask] = state["potential_prev_valid"][mask]
         if self.record_metrics:
             self.success_once[mask] = state["success_once"][mask]
             self.fail_once[mask] = state["fail_once"][mask]

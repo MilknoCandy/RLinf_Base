@@ -34,6 +34,7 @@ class RLTRouteContext:
     expert_model: Any | None = None
     version: int = 0
     default_actor_switch: bool = False
+    clone_ready: bool = True
 
 
 @dataclass(kw_only=True)
@@ -147,18 +148,31 @@ class RealworldRLTRoute(RLTRoute):
 class SimulatorRLTRoute(RLTRoute):
     """Actor/ref/expert routing for ManiSkill RLT with schedule warmup."""
 
-    def __init__(self, *, use_schedule: bool, warmup_updates: int):
+    def __init__(
+        self,
+        *,
+        use_schedule: bool,
+        warmup_updates: int,
+        collect_student_when_ready: bool = False,
+    ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
+        self.collect_student_when_ready = bool(collect_student_when_ready)
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
+
+    def _student_on(self, ctx: RLTRouteContext) -> bool:
+        ready_for_online = self._ready_for_online(ctx.version)
+        if ctx.mode == "train" and self.collect_student_when_ready:
+            return ready_for_online and bool(ctx.clone_ready)
+        return ready_for_online
 
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
         actions = ctx.student_actions
         result = ctx.result
         batch_size, chunk_len, action_dim = actions.shape
-        ready_for_online = self._ready_for_online(ctx.version)
+        ready_for_online = self._student_on(ctx)
 
         critical_phase = _last_info_bool(
             ctx.rlt_switch_flags,
@@ -250,5 +264,8 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+            collect_student_when_ready=bool(
+                schedule_cfg.get("collect_student_when_ready", False)
+            ),
         )
     return RealworldRLTRoute()

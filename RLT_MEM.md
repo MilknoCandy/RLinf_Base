@@ -27,8 +27,8 @@
 | --- | --- |
 | 冻结 VLA（官方 OpenPI / Pi0.5） | 当前 \(I_t\) + instruction → `ref_chunk`；并给出 VLM prefix embeddings |
 | \(z\) 不注入 VLA | 记忆只在 Stage 2 的 loop encoder + MLP 里 |
-| Route | 进入关键阶段前执行 VLA；之后执行 actor |
-| Critic 结构 | Twin-Q，chunk 级 TD，`only_success` 的折现回报 + bootstrap |
+| Route | 进入关键阶段前执行 VLA。原版之后执行 actor；mem 的 train 采集在 \(\mathrm{EMA}(\|\pi-\tilde a\|_1)\) 降到阈值前仍执行 VLA，eval 过 warmup 后看学生 |
+| Critic 结构 | Twin-Q，chunk 级 TD。原版 `only_success`；mem 训练用 `success_potential`（\(1[\mathrm{success}]+\mathrm{coef}(\gamma\Phi'-\Phi)\)），\(\Phi\) 只进 \(r\) 不进 \(Q\) |
 | Actor 形式 | 固定标准差的 \(\tanh\) MLP，损失里仍有 \(-Q+\beta\,\mathrm{BC}\) |
 
 冻结特征模型**不再**把已经独立算完的 \(z_{\mathrm{rl}}\) 交给 policy 当状态。它只提供本帧 \(I_t\)（pool 后的 prefix）和 `ref_chunk`。跨 chunk 的 \(z\) 由可训 encoder 递推。
@@ -117,7 +117,7 @@ ManiSkill 默认：\(z\in\mathbb{R}^{2048}\)，proprio 9。Actor / critic 输入
 1. 冻结 OpenPI：`extract_rlt_obs` → `prefix_embs`, `ref_chunk`, `proprio`。
 2. `_prepare_rollout_mem`：若上一 chunk `dones` 为真，该 env 的 \(z\)、\(a\) 置回 \(z_{\mathrm{init}}\) / 0，\(r\) 也置 0；否则 \(r_{t-1}\) = 上一 chunk reward 求和。然后 \(z_t=\mathrm{Enc}([I_t;a_{t-1};r_{t-1};z_{t-1}])\)，写回 `_rollout_mem`。
 3. \(\pi(z_t,\mathrm{proprio})\) 出学生动作。
-4. route 在关键阶段前换成 `ref`，之后用学生动作。
+4. route 在关键阶段前换成 `ref`。mem 的 train 在 clone 未就绪时关键阶段也继续执行 `ref`；eval 过 warmup 后执行学生。
 5. `commit_rollout_action(实际执行的 a)`：下一 chunk 的 \(a_{t-1}\) 必须是环境里真正走的。
 
 `dones` / `rewards` 来自 **上一** 次 env step。本步的 \(r_t\) 要等环境走完，下一次 predict 才进入写。
@@ -147,7 +147,9 @@ for chunk_t in 0 .. 49:          # 同一 env、同一局
 
 `EmbodiedTrajectoryBuilder` 每个 chunk `append` 一次。送到 actor 的那条 `Trajectory` 的时间维是 **50，不是 1**。原版训练再把它 **拆成 50 条单步 replay**，所以看起来像「关键阶段只预测一次」。数据里其实已经有「上一 chunk 插偏了、这一 chunk 再试」的顺序。
 
-`K=4` 不是把一个 chunk 拆成 4 步，也不是另造一条多步轨迹。它是：当训练第 \(t\) 个 chunk（例如关键阶段第 37 段）时，把 **同一局里** 的第 \(t-3,t-2,t-1,t\) 段 \(I,a,r\) 拿回来，用当前 encoder 按顺序再写一遍 \(z\)。那 4 段都是已经在环境里执行过的 chunk。
+默认 **不在 replay 里再存 K 段图像**（`mem_unroll_len: 1`）。采集时 \(z\) 仍沿 50 个 chunk 递推；训练只对当前 \(I_t\) 和存下来的 \(z_{t-1},a_{t-1},r_{t-1}\) 写一次。把 4 段 `64×2048` prefix 拷进每一行、再在 critic/actor/预测里各展开一遍，单步会到小时级。
+
+若要训练期反传多段视觉，把 `mem_unroll_len` 调到 2–4，并接受更慢、更大的 replay。默认 prefix pool 到 16 token；encoder **2 层**（与 Stage 1 相同），不要用 1 层。
 
 记忆就是这个递推：
 
@@ -250,6 +252,8 @@ actor（可训）
 - \(\beta=0\)：输出可以完全离开 VLA。
 - 重建 \(I_t\)：Stage 2 要的是从历史推出 `ref`，不是再做一遍 Stage 1 reconstruction。
 - `ref_chunk` 进 encoder。
+- 残差 \(a=\tilde a+\Delta(z)\)：那是原文 pass-through，不是 mem。
+- 特权 \(d\) 进 \(Q\) 特征。势函数只允许出现在 \(r\)。
 
 ---
 
@@ -265,11 +269,24 @@ actor（可训）
 | `rlinf/algorithms/rlt/transition.py` | replay 可选 prefix / \(z_{\mathrm{prev}}\) 键 |
 | `rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py` | critic：TD + 预测 ref/\(r\)；actor：\(-Q+\mathrm{BC}\) |
 | `examples/embodiment/config/maniskill_rlt_stage2_ac_mlp_mem.yaml` | 完整 Stage 2 配置（官方 OpenPI + TensorBoard，不继承） |
+| `rlinf/envs/maniskill/rlt_potential.py` | \(\Phi\) 只进 \(r\) |
 | `tests/unit_tests/test_rlt_mem.py` | actor 维数、历史改变动作、encoder 不看 ref、预测 ref、done 重置 |
+| `tests/unit_tests/test_rlt_route.py` | train 在 clone 未就绪时继续执行 VLA |
+| `tests/unit_tests/test_rlt_potential.py` | 接近 hole 时 \(r>0\)，首步无 shaping |
 
 原版配置保持 `use_mem` 默认关，也不开 `rlt_return_prefix`。
 
-建议看的 TensorBoard 标（`train/` 前缀）：`action_ref_abs_mean`、`bc_loss` / `pred_ref_loss` / `pred_r_loss`、`q_pi`。`mem_unroll_len` 过小会退回「只看当前帧」。
+建议看的 TensorBoard 标：
+
+| 标 | 含义 |
+| --- | --- |
+| `env/` train success | VLA 采集是否还在成功。clone 未就绪时应接近原版 warmup |
+| `eval/` success（warmup 之后） | \(\pi(z)\) 自己插得进不算。未过 `student_action_ref_max` 前允许为 0 |
+| `action_ref_abs_mean` / `action_ref_ema` / `student_clone_ready` | 克隆是否够格切学生采集 |
+| `replay/reward_mean`、`reward_positive_rate` | 势函数是否让 \(r\) 在成功前就有正负，而不是全 0 |
+| `pred_ref_loss`、`bc_loss`、`q_data` / `q_pi` | \(z\) 是否在恢复 `ref`；\(Q\) 是否不再贴 0 |
+
+`mem_unroll_len` 过小会退回「只看当前帧」。
 
 ---
 
@@ -278,3 +295,16 @@ actor（可训）
 - **原版 RLT：** 条件生成 + BC，在 `ref` 附近局部编辑。本方案保留 BC 和冻结 VLA，把「看见 `ref`」改成「从 loop 后的 \(z\) 恢复 `ref`」，并让 \(z\) 带上 \((a,r)\) 历史。
 - **原文消融：** w/o Pass-Through（去掉 actor 里的 `ref`）仍能收敛但更慢；\(\beta=0\) 掉点最大。本方案对应前者 + encoder loop，**不**对应后者。
 - **DSRL：** SAC 的动作是扩散初始噪声。本方案仍在真实动作空间里做 BC。
+
+---
+
+## 11. 为了让 mem 的优点能被看见
+
+原版成功率曲线比的是「当前帧能不能贴住 VLA」。那条曲线上 mem 没有优势，残差也只是复现 RLT。
+
+mem 只多 \(z_t(I_t,z_{t-1},a_{t-1},r_{t-1})\)。要让这段历史有用：
+
+1. **\(r_{t-1}\) 在成功前就要有差别。** 训练 `reward_mode: success_potential`，\(\Phi=x_{\mathrm{hole}}-w\cdot d_{yz}\)，\(r=1[\mathrm{success}]+\mathrm{coef}(\gamma\Phi'-\Phi)\)。eval 仍是 `only_success`，成功率口径不变。
+2. **采集不能被学生写死。** `collect_student_when_ready: True`：train 关键阶段继续走 VLA，直到 `action_ref_ema <= 0.03` 才切学生。eval 过 `warmup_post_collect_updates`（默认 2000）后看学生，用来量克隆，不是拿来填 replay。单步更新上限 80，不加载 expert OpenPI。
+
+主指标应是：同一局里 miss 后再插、以及 `Enc(I)` vs `Enc(I,a,r,z)` 的消融；不是第一段关键阶段超过原版 RLT。

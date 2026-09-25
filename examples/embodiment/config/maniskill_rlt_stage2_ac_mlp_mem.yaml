@@ -31,20 +31,25 @@ runner:
   max_steps: -1
   only_eval: False
   weight_sync_interval: 1
-  val_check_interval: 25
-  save_interval: 50
+  val_check_interval: 50
+  save_interval: 100
   resume_dir: null
   ckpt_path: null
 
 algorithm:
-  update_epoch: 5
+  update_epoch: 1
   rlt_schedule:
     enable: True
-    max_updates_per_train_step: 400
-    warmup_min_size: 10000
-    warmup_post_collect_updates: 30000
+    max_updates_per_train_step: 80
+    warmup_min_size: 2000
+    # Eval student gate only. Train collect is VLA until clone_ready; do not
+    # create a 30k-update backlog before the first online cycle.
+    warmup_post_collect_updates: 2000
+    collect_student_when_ready: True
+    student_action_ref_max: 0.03
+    student_clone_ema: 0.9
     train_every_episodes: 0
-    train_every_transitions: 5
+    train_every_transitions: 16
   group_size: 1
 
   adv_type: embodied_sac
@@ -67,8 +72,8 @@ algorithm:
   pred_r_weight: 1.0
   actor_weight_schedule:
     enable: True
-    warmup_updates: 20000
-    ramp_updates: 50000
+    warmup_updates: 4000
+    ramp_updates: 12000
     warmup_bc_weight: 7.0
     warmup_q_weight: 0.05
     online_bc_weight: 2.5
@@ -84,16 +89,16 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 10000
-    sample_window_size: 50000
-    max_num_samples: 50000
-    min_buffer_size: 1000
+    cache_size: 4000
+    sample_window_size: 20000
+    max_num_samples: 20000
+    min_buffer_size: 500
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
   train_actor_steps: 1000
-  critic_actor_ratio: 4
+  critic_actor_ratio: 2
   critic_subsample_size: 0
   backup_entropy: False
 
@@ -101,13 +106,17 @@ env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    total_num_envs: 64
+    total_num_envs: 32
     seed: 2026
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: False
     wrap_obs_mode: rlt_openpi_joint
-    reward_mode: only_success
+    reward_mode: success_potential
+    reward_potential:
+      coef: 1.0
+      yz_weight: 1.0
+      gamma: 0.99
     rlt_policy_switch:
       enable: True
       task_mode: full_task
@@ -120,11 +129,9 @@ env:
         near_hole_yz_margin: 1.5
         fallback_hole_radius: 0.03
       expert_takeover:
-        enable: True
-        # Simulated real-world takeover: only request expert after the RLT actor
-        # is already in critical phase and has made no measurable insertion
-        # progress for several action chunks. Rollout still masks this during
-        # warmup, and eval disables expert completely.
+        enable: False
+        # Collect already executes VLA until clone_ready. A second OpenPI expert
+        # would double rollout memory without helping mem.
         trigger_mode: stalled_progress
         gate:
           require_grasp: True
@@ -160,7 +167,7 @@ env:
         height: 384
   eval:
     rollout_epoch: 1
-    total_num_envs: 256
+    total_num_envs: 64
     seed: 2026
     auto_reset: False
     ignore_terminations: False
@@ -290,35 +297,8 @@ rollout:
       rlt_return_prefix: True
       rlt_loop_prefix_len: ${actor.model.loop_prefix_len}
 
-  # Optional ManiSkill expert takeover model. Enable it with
-  # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
-  # to a stronger official OpenPI SFT checkpoint trained with the same task
-  # transforms; it predicts expert actions directly and does not use RLT tokens.
-  expert_model:
-    model_type: "openpi"
-    model_path: "/path/to/rlt_maniskill_joint_pi05_sft_more_steps/checkpoints/global_step_<step>/actor"
-    precision: bf16
-    num_action_chunks: 10
-    action_dim: 8
-    num_steps: 5
-    add_value_head: False
-    openpi:
-      task: eval
-      config_name: "pi05_rlt_maniskill_joint"
-      num_images_in_input: 2
-      action_chunk: 10
-      action_horizon: 10
-      action_env_dim: 8
-      num_steps: 5
-      model_action_dim: 32
-      paligemma_variant: "gemma_2b"
-      action_expert_variant: "gemma_300m"
-      max_token_len: 200
-      discrete_state_input: True
-      train_expert_only: False
-      add_value_head: False
-      detach_critic_input: True
-      use_rlt: False
+  # Do not load a second OpenPI. Train collect is VLA until clone_ready.
+  expert_model: null
 
   enable_torch_compile: False
   enable_cuda_graph: False
@@ -326,8 +306,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 128
-  global_batch_size: 512
+  micro_batch_size: 64
+  global_batch_size: 256
   seed: 1234
   enable_offload: False
 
@@ -346,10 +326,10 @@ actor:
     q_head_type: "default"
     fixed_std: 0.002
     use_mem: True
-    loop_prefix_len: 64
+    loop_prefix_len: 16
     loop_num_heads: 8
     loop_num_layers: 2
-    mem_unroll_len: 4
+    mem_unroll_len: 1
     is_lora: False
     lora_rank: 32
 

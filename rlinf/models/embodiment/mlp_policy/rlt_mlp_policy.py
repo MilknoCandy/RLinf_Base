@@ -42,10 +42,10 @@ class RLTMLPPolicy(MLPPolicy):
         q_head_type: str = "default",
         fixed_std: float = 0.002,
         use_mem: bool = False,
-        loop_prefix_len: int = 64,
+        loop_prefix_len: int = 16,
         loop_num_heads: int = 8,
         loop_num_layers: int = 2,
-        mem_unroll_len: int = 4,
+        mem_unroll_len: int = 1,
     ):
         if not add_q_head:
             raise ValueError(
@@ -105,10 +105,25 @@ class RLTMLPPolicy(MLPPolicy):
                 num_heads=int(loop_num_heads),
                 num_layers=int(loop_num_layers),
             )
+            # Weight-synced latch: train collect stays on VLA until the actor
+            # marks |π − ref| as small enough.
+            self.register_buffer("student_clone_ready", torch.zeros(1))
         else:
             self.loop_encoder = None
         self._rollout_mem = None
         self._rollout_prev_action = None
+
+    def set_student_clone_ready(self, ready: bool) -> None:
+        flag = getattr(self, "student_clone_ready", None)
+        if flag is None:
+            return
+        flag.fill_(1.0 if ready else 0.0)
+
+    def is_student_clone_ready(self) -> bool:
+        flag = getattr(self, "student_clone_ready", None)
+        if flag is None:
+            return True
+        return bool(flag.detach().reshape(-1)[0].item() > 0.5)
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -203,7 +218,12 @@ class RLTMLPPolicy(MLPPolicy):
         """Recompute looped ``z`` from current prefix and previous write."""
         if not self.use_mem:
             return obs
-        z = self._write_mem(obs)
+        if obs.get("_loop_z_ready") and "z_rl" in obs:
+            z = obs["z_rl"]
+        else:
+            z = self._write_mem(obs)
+            obs["_loop_z_ready"] = True
+            obs["z_rl"] = z
         if detach:
             z = z.detach()
         bound = dict(obs)
@@ -218,7 +238,11 @@ class RLTMLPPolicy(MLPPolicy):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         if self.loop_encoder is None:
             raise RuntimeError("predictive_loss requires use_mem=True.")
-        if "hist_prefix_embs" in obs:
+        if obs.get("_loop_z_ready") and "z_rl" in obs:
+            z = obs["z_rl"]
+            pred_ref, _ = self.loop_encoder.predict(z)
+            ref_loss = F.mse_loss(pred_ref, self._flatten_batch(ref_chunk))
+        elif "hist_prefix_embs" in obs:
             z, z_seq, valid = self._unroll_from_obs(obs)
             pred_ref_seq = self.loop_encoder.pred_ref(z_seq)
             hist_ref = obs["hist_ref"].to(device=pred_ref_seq.device)
@@ -227,10 +251,14 @@ class RLTMLPPolicy(MLPPolicy):
             sq = torch.square(pred_ref_seq - hist_ref).mean(dim=-1)
             ref_loss = sq.mul(valid).sum() / torch.clamp(valid.sum(), min=1.0)
             pred_ref = pred_ref_seq[:, -1]
+            obs["z_rl"] = z
+            obs["_loop_z_ready"] = True
         else:
             z = self._write_mem(obs)
             pred_ref, _ = self.loop_encoder.predict(z)
             ref_loss = F.mse_loss(pred_ref, self._flatten_batch(ref_chunk))
+            obs["z_rl"] = z
+            obs["_loop_z_ready"] = True
         _, pred_r = self.loop_encoder.predict(z)
         reward_target = self._flatten_batch(reward_target).to(dtype=pred_r.dtype)
         if reward_target.shape[-1] != 1:

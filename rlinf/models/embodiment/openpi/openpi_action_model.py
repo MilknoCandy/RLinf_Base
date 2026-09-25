@@ -577,9 +577,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             device=rlt_param.device, dtype=rlt_param.dtype
         )
         rlt_mask = rlt_prefix_mask if self.config.rlt_use_mask else None
-        z_rl = self.rlt_module.encode_flat(rlt_prefix_output, rlt_mask).to(
-            dtype=torch.float32
-        )
+        if self.config.rlt_return_prefix:
+            z_rl = torch.zeros(
+                rlt_prefix_output.shape[0],
+                int(self.config.rlt_embed_dim),
+                device=rlt_prefix_output.device,
+                dtype=torch.float32,
+            )
+        else:
+            z_rl = self.rlt_module.encode_flat(rlt_prefix_output, rlt_mask).to(
+                dtype=torch.float32
+            )
 
         outputs = self._sample_actions_with_prefix_cache(
             state,
@@ -621,7 +629,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 rlt_mask if rlt_mask is not None else rlt_prefix_mask,
                 self.config.rlt_loop_prefix_len,
             )
-            out["prefix_embs"] = prefix_embs.to(dtype=torch.float32)
+            out["prefix_embs"] = prefix_embs.to(dtype=torch.float16)
             out["prefix_mask"] = prefix_mask
         return out
 

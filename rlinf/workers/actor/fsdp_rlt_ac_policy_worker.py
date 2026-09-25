@@ -381,11 +381,43 @@ class RLTACLossMixin:
             .detach()
             .item()
         )
+        metrics.update(self._update_student_clone_ready(metrics["action_ref_abs_mean"]))
         metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
         metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
 
         return actor_loss, entropy, metrics
+
+    def _policy_module(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            return None
+        return getattr(model, "module", model)
+
+    def _update_student_clone_ready(self, action_ref_abs_mean: float) -> dict[str, float]:
+        schedule = getattr(self, "rlt_schedule_cfg", {}) or {}
+        max_ref = schedule.get("student_action_ref_max", None)
+        if max_ref is None:
+            return {}
+        ema_decay = float(schedule.get("student_clone_ema", 0.95))
+        value = float(action_ref_abs_mean)
+        if getattr(self, "_action_ref_ema", None) is None:
+            self._action_ref_ema = value
+        else:
+            self._action_ref_ema = (
+                ema_decay * float(self._action_ref_ema) + (1.0 - ema_decay) * value
+            )
+        if self._action_ref_ema <= float(max_ref):
+            self._student_clone_ready = True
+        ready = bool(getattr(self, "_student_clone_ready", False))
+        module = self._policy_module()
+        setter = getattr(module, "set_student_clone_ready", None)
+        if callable(setter):
+            setter(ready)
+        return {
+            "action_ref_ema": float(self._action_ref_ema),
+            "student_clone_ready": float(ready),
+        }
 
     @Worker.timer("forward_alpha")
     def forward_alpha(self, batch):
@@ -458,7 +490,7 @@ class RLTACReplayMixin:
     def _mem_unroll_len(self) -> int:
         if not getattr(self.model, "use_mem", False):
             return 0
-        return int(self.cfg.actor.model.get("mem_unroll_len", 4))
+        return int(self.cfg.actor.model.get("mem_unroll_len", 1))
 
     @staticmethod
     def _same_episode_steps(
@@ -572,7 +604,7 @@ class RLTACReplayMixin:
         bsz: int,
         is_done: bool,
     ) -> None:
-        if self._mem_unroll_len() <= 0 or "prefix_embs" not in curr_obs:
+        if self._mem_unroll_len() <= 1 or "prefix_embs" not in curr_obs:
             return
         idx = t * bsz + env_idx
         curr_hist = self._loop_hist_window(
@@ -871,6 +903,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         self._warmup_ready_total_transitions: int | None = None
         self._warmup_ready_total_episodes: int | None = None
         self.pending_update_budget = 0
+        self._action_ref_ema: float | None = None
+        self._student_clone_ready = False
 
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""

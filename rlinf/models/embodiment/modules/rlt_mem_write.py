@@ -114,6 +114,7 @@ class RLTLoopEncoder(nn.Module):
     ) -> torch.Tensor:
         if detach_prev:
             z_prev = z_prev.detach()
+        prefix_embs = prefix_embs.to(dtype=z_prev.dtype)
         encoded = self.encoder(
             prefix_embs,
             prefix_mask,

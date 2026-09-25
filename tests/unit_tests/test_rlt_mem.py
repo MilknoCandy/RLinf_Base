@@ -31,6 +31,14 @@ def _obs(batch: int, prefix_len: int = 8, z_dim: int = 32):
     }
 
 
+def test_clone_ready_buffer_starts_off():
+    policy = _policy()
+    assert hasattr(policy, "student_clone_ready")
+    assert not policy.is_student_clone_ready()
+    policy.set_student_clone_ready(True)
+    assert policy.is_student_clone_ready()
+
+
 def test_actor_state_is_looped_z_and_proprio():
     policy = _policy()
     batch = 3
