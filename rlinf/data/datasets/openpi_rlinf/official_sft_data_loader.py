@@ -71,7 +71,42 @@ def build_official_openpi_sft_dataloader(
     data_loader = openpi_data_loader.create_data_loader(
         config, framework="pytorch", shuffle=not eval_dataset
     )
+    data_loader = _maybe_attach_rlt_chunk_window(cfg, data_loader)
     return data_loader, data_loader.data_config()
+
+
+def _maybe_attach_rlt_chunk_window(cfg: Any, data_loader: Any) -> Any:
+    """Load a same-episode chunk window when stage-1 memory training is on."""
+    use_rlt = bool(OmegaConf.select(cfg, "actor.model.openpi.use_rlt", default=False))
+    mem_len_max = int(
+        OmegaConf.select(cfg, "actor.model.openpi.rlt_mem_len_max", default=1)
+    )
+    if not use_rlt or mem_len_max <= 1:
+        return data_loader
+    mem_len_min = int(
+        OmegaConf.select(cfg, "actor.model.openpi.rlt_mem_len_min", default=1)
+    )
+    if mem_len_min < 0 or mem_len_min > mem_len_max:
+        raise ValueError(
+            "actor.model.openpi.rlt_mem_len_min must lie in "
+            f"[0, rlt_mem_len_max]; got min={mem_len_min} max={mem_len_max}."
+        )
+    stride = OmegaConf.select(cfg, "actor.model.openpi.rlt_mem_stride", default=None)
+    if stride is None:
+        stride = int(cfg.actor.model.num_action_chunks)
+    else:
+        stride = int(stride)
+    if stride < 1:
+        raise ValueError(
+            f"actor.model.openpi.rlt_mem_stride must be positive, got {stride}."
+        )
+    from rlinf.data.datasets.openpi_rlinf.rlt_chunk_window import (
+        attach_rlt_chunk_window,
+    )
+
+    return attach_rlt_chunk_window(
+        data_loader, mem_len_max=mem_len_max, stride=stride
+    )
 
 
 def get_official_openpi_sft_num_batches(data_loader: Any) -> int:

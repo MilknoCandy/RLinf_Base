@@ -74,6 +74,16 @@ actor:
       rlt_encoder_type: "append_self_attention"
       rlt_image_only: False
       rlt_use_mask: True
+      # Fraction of image tokens rebuilt. 1.0 keeps every image token.
+      rlt_recon_topk_ratio: 0.5
+      # Reconstruction is mem. Training draws a suffix length in
+      # [rlt_mem_len_min, rlt_mem_len_max], carries z, and reconstructs
+      # only the last chunk. Length 0 skips reconstruction for that row.
+      # There is no separate single-frame rlt_loss.
+      # Stride null means one action chunk.
+      rlt_mem_len_min: 0
+      rlt_mem_len_max: 10
+      rlt_mem_stride: null
 
     openpi_data:
       repo_id: "maniskill_peginsertionside_joint"

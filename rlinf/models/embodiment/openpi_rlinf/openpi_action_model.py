@@ -50,7 +50,7 @@ class OpenPiPytorchActionModel(nn.Module):
                 RLTTokenTransformer,
             )
 
-            self.rlt_module = RLTTokenTransformer(
+            token_module = RLTTokenTransformer(
                 input_dim=self.rlt_cfg.rlt_input_dim,
                 embed_dim=self.rlt_cfg.rlt_embed_dim,
                 prefix_seq_len=self.rlt_cfg.rlt_prefix_seq_len,
@@ -58,6 +58,10 @@ class OpenPiPytorchActionModel(nn.Module):
                 num_heads=self.rlt_cfg.rlt_num_heads,
                 mlp_ratio=self.rlt_cfg.rlt_mlp_ratio,
             ).to(dtype=next(self.model.parameters()).dtype)
+            if int(self.rlt_cfg.rlt_mem_len_max) > 1:
+                self.mem = token_module
+            else:
+                self.rlt_module = token_module
 
         self._mark_fsdp_wrap_names()
 
@@ -134,9 +138,12 @@ class OpenPiPytorchActionModel(nn.Module):
         self,
         prefix_output: torch.Tensor,
         prefix_mask: torch.Tensor,
+        recon_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         self._require_rlt()
         rlt_param = next(self.rlt_module.parameters())
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
-        return self.rlt_module(prefix_output, rlt_mask)
+        if recon_mask is not None and not self.rlt_cfg.rlt_use_mask:
+            recon_mask = None
+        return self.rlt_module.loss(prefix_output, rlt_mask, recon_mask=recon_mask)

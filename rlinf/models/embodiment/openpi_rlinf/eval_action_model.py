@@ -430,15 +430,11 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             ),
         }
         if self.rlt_cfg.rlt_return_prefix:
-            from rlinf.models.embodiment.modules.rlt_mem_write import pool_rlt_prefix
-
-            prefix_embs, prefix_mask = pool_rlt_prefix(
-                rlt_prefix_output,
-                rlt_prefix_mask,
-                self.rlt_cfg.rlt_loop_prefix_len,
-            )
-            out["prefix_embs"] = prefix_embs.to(dtype=torch.float16)
-            out["prefix_mask"] = prefix_mask
+            rlt_mask = rlt_prefix_mask if self.rlt_cfg.rlt_use_mask else None
+            out["prefix_embs"] = rlt_prefix_output.detach().to(dtype=torch.float16)
+            out["prefix_mask"] = (
+                rlt_mask if rlt_mask is not None else rlt_prefix_mask
+            ).detach()
         return out
 
     def _sample_actions_from_prefix_cache(

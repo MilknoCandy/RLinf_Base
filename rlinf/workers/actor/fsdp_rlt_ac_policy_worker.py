@@ -13,11 +13,21 @@
 # limitations under the License.
 
 import asyncio
+import os
 import queue
 
 import torch
 import torch.nn.functional as F
 
+from rlinf.algorithms.rlt.ac_memory import (
+    ACMemoryWriter,
+    CriticReturnBank,
+    MemoryStep,
+    discounted_chunk_reward,
+    memory_confidence,
+    mix_q_values,
+    retrieve_returns,
+)
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -224,6 +234,55 @@ class RLTACLossMixin:
         }
         return bc_weight, q_weight, metrics
 
+    def _use_actor_mem(self) -> bool:
+        return bool(self.cfg.actor.model.get("use_actor_mem", False))
+
+    def _use_critic_mem(self) -> bool:
+        return bool(self.cfg.actor.model.get("use_critic_mem", False))
+
+    def _ac_mem_active(self) -> bool:
+        return self._use_actor_mem() or self._use_critic_mem()
+
+    def _ac_lambda_max(self) -> float:
+        cfg = self.cfg.algorithm.get("ac_memory", {}) or {}
+        return float(cfg.get("lambda_max", 0.5))
+
+    def _ac_sigma0(self) -> float:
+        cfg = self.cfg.algorithm.get("ac_memory", {}) or {}
+        return float(cfg.get("sigma0", 1.0))
+
+    def _mem_ids_from_obs(self, obs: dict, batch: int, device: torch.device):
+        episode = obs.get("mem_episode_id") if isinstance(obs, dict) else None
+        time = obs.get("mem_time") if isinstance(obs, dict) else None
+        if not isinstance(episode, torch.Tensor):
+            episode = torch.full((batch,), -1, device=device, dtype=torch.long)
+        else:
+            episode = episode.reshape(batch).to(device=device, dtype=torch.long)
+        if not isinstance(time, torch.Tensor):
+            time = torch.zeros(batch, device=device, dtype=torch.long)
+        else:
+            time = time.reshape(batch).to(device=device, dtype=torch.long)
+        return episode, time
+
+    def _mix_critic_return(self, q_values: torch.Tensor, z: torch.Tensor, id_obs: dict):
+        if not self._use_critic_mem() or q_values.numel() == 0:
+            return q_values, None
+        self._ensure_ac_memory()
+        writer = getattr(self, "ac_memory_writer", None)
+        if writer is None:
+            return q_values, None
+        z_rows = z.reshape(z.shape[0], -1)
+        episode, time = self._mem_ids_from_obs(id_obs, z_rows.shape[0], z_rows.device)
+        topk = int(self.cfg.actor.model.get("ac_mem_topk", 8))
+        tau = float(self.cfg.actor.model.get("ac_mem_tau", 0.1))
+        mean, std, count = retrieve_returns(
+            writer.critic_bank, z_rows, episode, time, topk, tau
+        )
+        confidence = memory_confidence(
+            std, count, self._ac_lambda_max(), self._ac_sigma0()
+        )
+        return mix_q_values(q_values, mean, confidence), confidence
+
     def _next_actions_for_critic_target(self, next_obs):
         return self.model(
             forward_type=ForwardType.SAC,
@@ -271,6 +330,11 @@ class RLTACLossMixin:
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
             bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
 
+            if self._use_critic_mem():
+                q_next, _ = self._mix_critic_return(
+                    q_next, next_obs["z_rl"], curr_obs
+                )
+
             if bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
             elif bootstrap_type == "standard":
@@ -297,24 +361,17 @@ class RLTACLossMixin:
             )
 
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
+        critic_confidence = None
+        if self._use_critic_mem():
+            all_data_q_values, critic_confidence = self._mix_critic_return(
+                all_data_q_values, curr_obs["z_rl"], curr_obs
+            )
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
         critic_metrics = {"q_data": all_data_q_values.mean().item()}
-        if getattr(self.model, "use_mem", False):
-            pred_ref_weight = float(self.cfg.algorithm.get("pred_ref_weight", 1.0))
-            pred_r_weight = float(self.cfg.algorithm.get("pred_r_weight", 1.0))
-            pred_ref_loss, pred_r_loss, pred_metrics = self.model.predictive_loss(
-                curr_obs,
-                self._ref_chunk(curr_obs),
-                reward_target,
-            )
-            pred_loss = pred_ref_weight * pred_ref_loss + pred_r_weight * pred_r_loss
-            critic_loss = critic_loss + pred_loss
-            critic_metrics.update(pred_metrics)
-            critic_metrics["pred_loss"] = pred_loss.detach().item()
-            critic_metrics["pred_ref_weight"] = pred_ref_weight
-            critic_metrics["pred_r_weight"] = pred_r_weight
+        if critic_confidence is not None:
+            critic_metrics["ac_mem/lambda_mean"] = critic_confidence.mean().item()
         return critic_loss, critic_metrics
 
     @Worker.timer("forward_actor")
@@ -325,7 +382,7 @@ class RLTACLossMixin:
         reference_dropout_prob = float(
             self.cfg.algorithm.get("reference_dropout_prob", 0.0)
         )
-        pi, log_pi, _ = self.model(
+        pi, log_pi, residual = self.model(
             forward_type=ForwardType.SAC,
             obs=curr_obs,
             apply_reference_dropout=True,
@@ -359,16 +416,27 @@ class RLTACLossMixin:
             for q_id in range(num_q_values)
         }
         qf_pi = self._q1(all_qf_pi)
+        if self._use_critic_mem():
+            qf_pi, actor_confidence = self._mix_critic_return(
+                qf_pi, curr_obs["z_rl"], curr_obs
+            )
+            if actor_confidence is not None:
+                metrics["ac_mem/actor_lambda_mean"] = actor_confidence.mean().item()
         metrics["q_pi"] = qf_pi.mean().item()
 
         ref_chunk = self._ref_chunk(curr_obs)
-        bc_loss, rlt_metrics = self._bc_metrics(
-            pi=pi,
-            actions=batch["actions"],
-            ref_chunk=ref_chunk,
-            intervene_flags=batch.get("intervene_flags", None),
-        )
-        metrics.update(rlt_metrics)
+        if residual is not None:
+            bc_loss = residual.square().mean()
+            metrics["bc_loss"] = bc_loss.detach().item()
+            metrics["actor_residual_abs_mean"] = residual.detach().abs().mean().item()
+        else:
+            bc_loss, rlt_metrics = self._bc_metrics(
+                pi=pi,
+                actions=batch["actions"],
+                ref_chunk=ref_chunk,
+                intervene_flags=batch.get("intervene_flags", None),
+            )
+            metrics.update(rlt_metrics)
 
         entropy = -log_pi.mean()
         bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
@@ -525,6 +593,7 @@ class RLTACReplayMixin:
         bsz: int,
         last_prefix: torch.Tensor,
         last_mask: torch.Tensor | None,
+        last_recon: torch.Tensor | None,
         last_ref: torch.Tensor,
         last_action: torch.Tensor,
         last_reward: torch.Tensor,
@@ -544,6 +613,7 @@ class RLTACReplayMixin:
         curr_obs_flat = flat.get("curr_obs", {})
         prefixes = []
         masks = []
+        recons = []
         actions = []
         rewards = []
         refs = []
@@ -558,6 +628,7 @@ class RLTACReplayMixin:
             if is_last:
                 prefixes.append(prefix)
                 masks.append(mask)
+                recons.append(last_recon)
                 actions.append(action_flat)
                 rewards.append(reward_flat.to(dtype=prefix.dtype))
                 refs.append(ref_flat.to(dtype=prefix.dtype))
@@ -566,6 +637,7 @@ class RLTACReplayMixin:
             if not valid:
                 prefixes.append(torch.zeros_like(prefix))
                 masks.append(torch.zeros_like(mask))
+                recons.append(None)
                 actions.append(torch.zeros_like(action_flat))
                 rewards.append(torch.zeros(1, dtype=prefix.dtype))
                 refs.append(torch.zeros_like(ref_flat))
@@ -577,14 +649,48 @@ class RLTACReplayMixin:
                 masks.append(curr_obs_flat["prefix_mask"][idx].detach().clone())
             else:
                 masks.append(torch.ones_like(mask))
+            if "recon_mask" in curr_obs_flat:
+                recons.append(curr_obs_flat["recon_mask"][idx].detach().clone())
+            else:
+                recons.append(None)
             actions.append(flat["actions"][idx].detach().clone().reshape(-1))
             step_reward = flat["rewards"][idx].detach().clone().reshape(-1)
             rewards.append(step_reward.sum().reshape(1).to(dtype=prefix.dtype))
             refs.append(curr_obs_flat["ref_chunk"][idx].detach().clone().reshape(-1))
             valids.append(True)
+        width = max(int(item.shape[0]) for item in prefixes)
+        padded_prefixes = []
+        padded_masks = []
+        padded_recons = []
+        keep_recon = any(item is not None for item in recons)
+        for item, item_mask, item_recon in zip(prefixes, masks, recons, strict=True):
+            seq = int(item.shape[0])
+            pad = width - seq
+            if pad > 0:
+                item = torch.nn.functional.pad(item, (0, 0, 0, pad))
+                item_mask = torch.nn.functional.pad(
+                    item_mask.reshape(-1).to(dtype=torch.bool), (0, pad), value=False
+                )
+            padded_prefixes.append(item)
+            padded_masks.append(item_mask.reshape(-1).to(dtype=torch.bool))
+            if keep_recon:
+                if item_recon is None:
+                    item_recon = torch.ones(seq, dtype=torch.bool)
+                else:
+                    item_recon = item_recon.reshape(-1).to(dtype=torch.bool)
+                if pad > 0:
+                    item_recon = torch.nn.functional.pad(
+                        item_recon, (0, pad), value=False
+                    )
+                padded_recons.append(item_recon)
+        hist = {
+            "hist_prefix_embs": torch.stack(padded_prefixes, dim=0),
+            "hist_prefix_mask": torch.stack(padded_masks, dim=0),
+        }
+        if keep_recon:
+            hist["hist_recon_mask"] = torch.stack(padded_recons, dim=0)
         return {
-            "hist_prefix_embs": torch.stack(prefixes, dim=0),
-            "hist_prefix_mask": torch.stack(masks, dim=0),
+            **hist,
             "hist_action": torch.stack(actions, dim=0),
             "hist_reward": torch.stack(rewards, dim=0),
             "hist_ref": torch.stack(refs, dim=0),
@@ -616,6 +722,7 @@ class RLTACReplayMixin:
             bsz=bsz,
             last_prefix=curr_obs["prefix_embs"],
             last_mask=curr_obs.get("prefix_mask"),
+            last_recon=curr_obs.get("recon_mask"),
             last_ref=curr_obs["ref_chunk"],
             last_action=flat["actions"][idx],
             last_reward=flat["rewards"][idx],
@@ -631,6 +738,7 @@ class RLTACReplayMixin:
                 bsz=bsz,
                 last_prefix=next_obs["prefix_embs"],
                 last_mask=next_obs.get("prefix_mask"),
+                last_recon=next_obs.get("recon_mask"),
                 last_ref=next_obs["ref_chunk"],
                 last_action=torch.zeros_like(flat["actions"][idx]),
                 last_reward=torch.zeros_like(flat["rewards"][idx]),
@@ -667,6 +775,111 @@ class RLTACReplayMixin:
         if idx >= record_transition.shape[0]:
             return False
         return bool(record_transition[idx].detach().to(torch.bool).reshape(-1).all())
+
+    def _ensure_ac_memory(self) -> None:
+        if not self._ac_mem_active():
+            return
+        module = self._policy_module()
+        actor_bank = None
+        if module is not None:
+            actor_bank = getattr(module, "actor_correction_bank", None)
+        writer = getattr(self, "ac_memory_writer", None)
+        if writer is None:
+            z_dim = int(self.cfg.actor.model.z_dim)
+            flat_action = int(self.cfg.actor.model.num_action_chunks) * int(
+                self.cfg.actor.model.action_dim
+            )
+            capacity = int(self.cfg.actor.model.get("ac_mem_capacity", 4096))
+            critic_bank = CriticReturnBank(capacity, z_dim, flat_action)
+            self.ac_memory_writer = ACMemoryWriter(
+                critic_bank=critic_bank,
+                actor_bank=actor_bank,
+                discount=float(self.cfg.algorithm.gamma),
+            )
+            return
+        if actor_bank is not None:
+            writer.actor_bank = actor_bank
+
+    def _row_is_done(
+        self, trajectory: Trajectory, t: int, env_idx: int, traj_len: int
+    ) -> bool:
+        dones = trajectory.dones
+        if not isinstance(dones, torch.Tensor):
+            return False
+        done_idx = min(t + 1, int(dones.shape[0]) - 1)
+        if done_idx >= dones.shape[0] or env_idx >= dones.shape[1]:
+            return False
+        return bool(dones[done_idx, env_idx].reshape(-1).to(torch.bool).any())
+
+    def _ingest_ac_memory(
+        self,
+        trajectory: Trajectory,
+        flat: dict,
+        traj_len: int,
+        bsz: int,
+        num_rows: int,
+        auto_reset: bool,
+    ) -> dict[tuple[int, int], object]:
+        if not self._ac_mem_active():
+            return {}
+        curr_obs = flat.get("curr_obs")
+        if not isinstance(curr_obs, dict) or "z_rl" not in curr_obs:
+            return {}
+        if "actions" not in flat or "rewards" not in flat or "ref_chunk" not in curr_obs:
+            return {}
+        self._ensure_ac_memory()
+        writer = self.ac_memory_writer
+        gamma = float(self.cfg.algorithm.gamma)
+        flat_action = int(self.cfg.actor.model.num_action_chunks) * int(
+            self.cfg.actor.model.action_dim
+        )
+        discount = float(gamma)
+        stamps: dict[tuple[int, int], object] = {}
+        for env_idx in range(bsz):
+            steps: list[MemoryStep] = []
+            for t in range(traj_len):
+                idx = t * bsz + env_idx
+                if idx >= num_rows:
+                    break
+                if not self._flat_record_transition(flat, idx):
+                    continue
+                reward_tensor = flat["rewards"][idx]
+                horizon = max(int(reward_tensor.detach().reshape(-1).numel()), 1)
+                discount = float(gamma) ** horizon
+                action = flat["actions"][idx].detach().float().reshape(-1)
+                ref = curr_obs["ref_chunk"][idx].detach().float().reshape(-1)
+                width = min(flat_action, int(action.numel()), int(ref.numel()))
+                delta = torch.zeros(flat_action)
+                delta[:width] = action[:width] - ref[:width]
+                steps.append(
+                    MemoryStep(
+                        traj_t=t,
+                        z=curr_obs["z_rl"][idx].detach().float().reshape(-1).cpu(),
+                        delta=delta,
+                        reward=discounted_chunk_reward(reward_tensor, gamma),
+                        done=self._row_is_done(trajectory, t, env_idx, traj_len),
+                    )
+                )
+                if steps[-1].done and not auto_reset:
+                    break
+            writer.discount = discount
+            written = writer.ingest_env(env_idx, steps)
+            for step, stamp in zip(steps, written, strict=True):
+                stamps[(env_idx, step.traj_t)] = stamp
+        critic_size = float((writer.critic_bank.valid > 0.5).sum())
+        actor_size = 0.0
+        if writer.actor_bank is not None:
+            actor_size = float((writer.actor_bank.valid > 0.5).sum())
+        self._ac_memory_metrics = {
+            "ac_mem/critic_size": critic_size,
+            "ac_mem/actor_size": actor_size,
+        }
+        return stamps
+
+    @staticmethod
+    def _stamp_mem_ids(obs: dict[str, torch.Tensor], episode_id: int, time: int) -> None:
+        obs["mem_episode_id"] = torch.tensor([[int(episode_id)]], dtype=torch.long)
+        obs["mem_time"] = torch.tensor([[int(time)]], dtype=torch.long)
 
     def _transition_replay_trajectories(
         self,
@@ -705,6 +918,9 @@ class RLTACReplayMixin:
         bsz = int(trajectory.actions.shape[1])
         num_rows = int(actions.shape[0])
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+        ac_stamps = self._ingest_ac_memory(
+            trajectory, flat, traj_len, bsz, num_rows, auto_reset
+        )
 
         for env_idx in range(bsz):
             for t in range(traj_len):
@@ -769,14 +985,15 @@ class RLTACReplayMixin:
                     next_obs = curr_obs
                 else:
                     next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
-                if next_obs is not None:
-                    transition.next_obs = next_obs
-                else:
+                if next_obs is None:
                     raise ValueError(
                         "RLT transition replay requires next_obs for non-terminal "
                         "transitions. Ensure update_rlt_transitions() populated "
                         f"transition obs before replay ingestion, got row index {idx}."
                     )
+                if self._ac_mem_active() and next_obs is curr_obs:
+                    next_obs = dict(curr_obs)
+                transition.next_obs = next_obs
                 self._attach_loop_history(
                     curr_obs,
                     next_obs,
@@ -788,6 +1005,11 @@ class RLTACReplayMixin:
                     bsz=bsz,
                     is_done=is_done,
                 )
+                stamp = ac_stamps.get((env_idx, t))
+                if stamp is not None:
+                    self._stamp_mem_ids(curr_obs, stamp.episode_id, stamp.time)
+                    next_time = stamp.time if is_done else stamp.time + 1
+                    self._stamp_mem_ids(next_obs, stamp.episode_id, next_time)
 
                 replay_trajectories.append(transition)
                 if is_done:
@@ -823,6 +1045,9 @@ class RLTACReplayMixin:
             metrics["replay/done_rate"] = float(
                 sum(bool(done) for done in done_values) / len(done_values)
             )
+        extra = getattr(self, "_ac_memory_metrics", None)
+        if extra:
+            metrics.update(extra)
         return metrics
 
     def _ingest_rollout_trajectories(
@@ -905,6 +1130,36 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         self.pending_update_budget = 0
         self._action_ref_ema: float | None = None
         self._student_clone_ready = False
+        if bool(self.cfg.actor.model.get("use_mem", False)) and self._ac_mem_active():
+            raise ValueError(
+                "use_mem loops history into z. Actor memory and critic memory "
+                "are a separate write/read path. Enable only one of them."
+            )
+
+    def save_checkpoint(self, save_base_path, step):
+        super().save_checkpoint(save_base_path, step)
+        writer = getattr(self, "ac_memory_writer", None)
+        if writer is None:
+            return
+        memory_dir = os.path.join(save_base_path, "ac_memory")
+        os.makedirs(memory_dir, exist_ok=True)
+        torch.save(
+            writer.state_dict(),
+            os.path.join(memory_dir, f"critic_bank_rank_{self._rank}.pt"),
+        )
+
+    def load_checkpoint(self, load_base_path):
+        super().load_checkpoint(load_base_path)
+        path = os.path.join(
+            load_base_path, "ac_memory", f"critic_bank_rank_{self._rank}.pt"
+        )
+        if not os.path.exists(path):
+            return
+        self._ensure_ac_memory()
+        writer = getattr(self, "ac_memory_writer", None)
+        if writer is None:
+            return
+        writer.load_state_dict(torch.load(path))
 
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""

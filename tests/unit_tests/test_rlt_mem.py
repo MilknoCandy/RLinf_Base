@@ -39,13 +39,13 @@ def test_clone_ready_buffer_starts_off():
     assert policy.is_student_clone_ready()
 
 
-def test_actor_state_is_looped_z_and_proprio():
+def test_actor_state_includes_ref_chunk():
     policy = _policy()
     batch = 3
     obs = _obs(batch)
     policy.train()
     state = policy._actor_state(obs)
-    assert state.shape == (batch, 32 + 4)
+    assert state.shape == (batch, 16 + 32 + 4)
     action, _, _ = policy.sac_forward(obs)
     assert action.shape == (batch, 16)
     assert action.shape[-1] == policy._get_ref_chunk(obs).shape[-1]
@@ -73,13 +73,87 @@ def _hist_obs(batch: int = 2, steps: int = 3, prefix_len: int = 8, z_dim: int = 
     return obs
 
 
-def test_unroll_uses_earlier_chunk_not_just_current_ref():
+def test_recon_target_is_topk_while_image_span_stays_full():
+    from rlinf.models.embodiment.modules.rlt_mem_write import (
+        full_image_tokens_and_recon_mask,
+    )
+
+    image = torch.zeros(1, 4, 8)
+    image[0, 0] = 1
+    text = image[:, :1]
+    prefix = torch.cat([image, text], dim=1)
+    tokens, mask, recon = full_image_tokens_and_recon_mask(prefix, None, 1, 0.5)
+    assert tokens.shape == (1, 4, 8)
+    torch.testing.assert_close(tokens, image)
+    assert mask.shape == (1, 4)
+    assert bool(mask.all())
+    assert recon.shape == (1, 4)
+    assert int(recon.sum()) == 2
+    assert bool(recon[0, 0])
+
+
+def test_scheme2_alternates_cross_and_self_and_returns_z():
+    policy = RLTMLPPolicy(
+        z_dim=32,
+        proprio_dim=4,
+        action_dim=8,
+        num_action_chunks=2,
+        use_mem=True,
+        loop_prefix_len=8,
+        loop_num_heads=4,
+        loop_num_layers=2,
+        mem_scheme=2,
+    )
+    encoder = policy.loop_encoder
+    assert encoder.block_kinds == ("cross", "self")
+    assert len(encoder.cross_layers) == 1
+    assert len(encoder.self_layers) == 1
+    obs = _obs(2)
+    z = policy._write_mem(obs)
+    assert z.shape == (2, 32)
+    other = dict(obs)
+    other["prefix_embs"] = torch.randn_like(obs["prefix_embs"])
+    z_other = policy._write_mem(other)
+    assert not torch.allclose(z, z_other, atol=1e-5)
+
+
+def test_train_loop_samples_suffix_length():
+    policy = RLTMLPPolicy(
+        z_dim=32,
+        proprio_dim=4,
+        action_dim=8,
+        num_action_chunks=2,
+        use_mem=True,
+        loop_prefix_len=8,
+        loop_num_heads=4,
+        loop_num_layers=1,
+        mem_len_min=1,
+        mem_unroll_len=10,
+    )
+    policy.train()
+    obs = _hist_obs(steps=10)
+    policy._crop_hist_to_random_len(obs)
+    lengths = obs["_mem_loop_len"]
+    assert lengths.shape == (2,)
+    assert int(lengths.min()) >= 1
+    assert int(lengths.max()) <= 10
+    valid = obs["hist_valid"]
+    for row, length in enumerate(lengths.tolist()):
+        assert valid[row, -length:].all()
+        if length < 10:
+            assert not valid[row, : 10 - length].any()
+    again = valid.clone()
+    policy._crop_hist_to_random_len(obs)
+    torch.testing.assert_close(obs["hist_valid"].to(torch.int), again.to(torch.int))
+
+
+def test_unroll_uses_earlier_chunk_not_just_current_prefix():
     policy = _policy()
     policy.eval()
     obs = _hist_obs()
     other = dict(obs)
-    other["hist_action"] = torch.randn_like(obs["hist_action"])
-    other["hist_action"][:, -1] = obs["hist_action"][:, -1]
+    other["hist_prefix_embs"] = obs["hist_prefix_embs"].clone()
+    other["hist_prefix_embs"][:, 0] = torch.randn_like(obs["hist_prefix_embs"][:, 0])
     action_a, _, _ = policy.sac_forward(obs, deterministic=True)
     action_b, _, _ = policy.sac_forward(other, deterministic=True)
     assert not torch.allclose(action_a, action_b, atol=1e-5)
@@ -97,18 +171,43 @@ def test_encoder_ignores_ref_chunk():
     assert torch.allclose(z1, z2)
 
 
-def test_predictive_loss_fits_ref_not_image():
+def test_reconstruction_ignores_unselected_tokens():
     policy = _policy()
     batch = 2
     obs = _obs(batch)
-    ref = policy._get_ref_chunk(obs)
-    pred_ref, pred_r, metrics = policy.predictive_loss(obs, ref, torch.zeros(batch, 1))
-    assert pred_ref.ndim == 0
-    assert pred_r.ndim == 0
-    assert "pred_ref_loss" in metrics
-    assert "pred_rec_loss" not in metrics
-    action, _, _ = policy.sac_forward(obs)
-    assert not torch.allclose(action, torch.tanh(ref), atol=1e-3)
+    recon_mask = torch.zeros(batch, 8, dtype=torch.bool)
+    recon_mask[:, :4] = True
+    obs["recon_mask"] = recon_mask
+    loss, metrics = policy.reconstruction_loss(obs)
+    assert loss.ndim == 0
+    assert "recon_loss" in metrics
+    changed = dict(obs)
+    changed["prefix_embs"] = obs["prefix_embs"].clone()
+    changed["prefix_embs"][:, 4:] += 10
+    changed_loss, _ = policy.reconstruction_loss(changed)
+    torch.testing.assert_close(loss, changed_loss)
+
+
+def test_write_scale_does_not_grow_z():
+    policy = _policy()
+    obs = _obs(1)
+    z_small = policy._write_mem(obs)
+    obs["prefix_embs"] = obs["prefix_embs"] * 50
+    obs["z_prev"] = z_small
+    z_large = policy._write_mem(dict(obs))
+    assert z_large.norm().item() < z_small.norm().item() * 5
+
+
+def test_different_tokens_change_z_direction():
+    policy = _policy()
+    policy.eval()
+    obs = _obs(1)
+    z_a = policy._write_mem(obs)
+    other = dict(obs)
+    other["prefix_embs"] = torch.randn_like(obs["prefix_embs"])
+    z_b = policy._write_mem(other)
+    cosine = torch.nn.functional.cosine_similarity(z_a, z_b, dim=-1)
+    assert cosine.item() < 0.99
 
 
 def test_rollout_mem_resets_on_done():
@@ -133,3 +232,67 @@ def test_rollout_mem_resets_on_done():
     assert torch.allclose(result2["forward_inputs"]["z_prev"][0], init[0])
     assert not torch.allclose(result2["forward_inputs"]["z_prev"][1], init[1])
     assert result2["forward_inputs"]["z_rl"].shape == first_z.shape
+
+
+def test_stage1_ckpt_writes_z_and_resets_done_rows():
+    import tempfile
+    from pathlib import Path
+
+    from rlinf.models.embodiment.modules.rlt_token_transformer import (
+        RLTTokenTransformer,
+    )
+
+    module = RLTTokenTransformer(
+        input_dim=32,
+        embed_dim=32,
+        prefix_seq_len=8,
+        num_layers=1,
+        num_heads=4,
+        mlp_ratio=2.0,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        _run_stage1_ckpt_policy(module, Path(tmp) / "full_weights.pt")
+
+
+def _run_stage1_ckpt_policy(module, ckpt):
+    torch.save(
+        {f"mem.{key}": value for key, value in module.state_dict().items()},
+        ckpt,
+    )
+    policy = RLTMLPPolicy(
+        z_dim=32,
+        proprio_dim=4,
+        action_dim=8,
+        num_action_chunks=2,
+        use_mem=True,
+        mem_ckpt=str(ckpt),
+        rlt_input_dim=32,
+        rlt_prefix_seq_len=8,
+        rlt_mlp_ratio=2.0,
+        loop_num_heads=4,
+        loop_num_layers=1,
+    )
+    policy.eval()
+    assert policy.loop_encoder is None
+    assert policy.mem is not None
+    assert not any(param.requires_grad for param in policy.mem.parameters())
+    batch = 2
+    obs = {
+        "z_rl": torch.zeros(batch, 32),
+        "proprio": torch.randn(batch, 4),
+        "ref_chunk": torch.randn(batch, 2, 8),
+        "prefix_embs": torch.randn(batch, 8, 32),
+        "prefix_mask": torch.ones(batch, 8, dtype=torch.bool),
+    }
+    _, result = policy.predict_action_batch(obs, mode="eval")
+    expected = module.step_memory(obs["prefix_embs"], obs["prefix_mask"], None)
+    assert torch.allclose(
+        result["forward_inputs"]["z_rl"], expected.to(dtype=torch.float32)
+    )
+    dones = torch.tensor([[True], [False]])
+    _, result2 = policy.predict_action_batch(
+        obs, mode="eval", dones=dones, rewards=torch.ones(batch, 2)
+    )
+    init = policy.mem.encoder.z_init.detach().reshape(1, -1)
+    assert torch.allclose(result2["forward_inputs"]["z_prev"][0], init[0])
+    assert not torch.allclose(result2["forward_inputs"]["z_prev"][1], init[0])

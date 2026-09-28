@@ -275,6 +275,7 @@ class Attention(nn.Module):
         positions: torch.Tensor,
         attn_mask: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        score_span: tuple[int, int] | None = None,
     ) -> tuple[list[torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]:
         """Multi-expert attention forward.
 
@@ -361,6 +362,13 @@ class Attention(nn.Module):
         )
 
         probs = F.softmax(masked_logits, dim=-1).to(dtype)
+        if score_span is not None:
+            image_len, prefix_len = score_span
+            if prefix_len > image_len > 0:
+                text_on_image = probs[:, :, :, image_len:prefix_len, :image_len]
+                self.last_text_image_scores = text_on_image.mean(dim=(1, 2, 3)).detach()
+            else:
+                self.last_text_image_scores = None
 
         # einsum "BKGTS,BSKH->BTKGH"
         encoded = torch.einsum("BKGTS,BSKH->BTKGH", probs, v_r.to(dtype))
@@ -478,8 +486,12 @@ class Block(nn.Module):
                 pre_attn.append(None)
                 gates.append(None)
 
-        # Attention
-        post_attn, kv_cache = self.attn(pre_attn, positions, attn_mask, kv_cache)
+        # Attention. The last block records text-to-image scores when stage 1
+        # asks for a top-k reconstruction target.
+        score_span = getattr(self, "capture_text_image_span", None)
+        post_attn, kv_cache = self.attn(
+            pre_attn, positions, attn_mask, kv_cache, score_span=score_span
+        )
         post_attn = [self.dropout(p) if p is not None else None for p in post_attn]
 
         # Gated residual for attention
@@ -582,6 +594,11 @@ class Module(nn.Module):
         mask = mask.unsqueeze(1)
 
         xs = list(embedded)
+        span = getattr(self, "capture_text_image_span", None)
+        for layer in self.layers:
+            layer.capture_text_image_span = None
+        if span is not None:
+            self.layers[-1].capture_text_image_span = span
 
         # Cast all embedded tokens to embed_dtype, matching JAX:
         #   embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)

@@ -22,7 +22,7 @@ from rlinf.utils.nested_dict_process import copy_dict_tensor
 RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
 # Current-frame I_t from the frozen VLA. Training also stores a same-episode
 # window so the encoder can be unrolled; rollout still carries z on the policy.
-RLT_PREFIX_OBS_KEYS = ("prefix_embs", "prefix_mask")
+RLT_PREFIX_OBS_KEYS = ("prefix_embs", "prefix_mask", "recon_mask")
 RLT_MEM_OBS_KEYS = ("z_prev", "prev_action", "prev_reward")
 RLT_HIST_OBS_KEYS = (
     "hist_prefix_embs",
@@ -31,6 +31,7 @@ RLT_HIST_OBS_KEYS = (
     "hist_reward",
     "hist_ref",
     "hist_valid",
+    "hist_recon_mask",
 )
 RLT_TRANSITION_PREFIX = "rlt_transition_"
 

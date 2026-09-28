@@ -36,10 +36,20 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
             use_mem=cfg.get("use_mem", False),
+            mem_ckpt=cfg.get("mem_ckpt", None),
+            rlt_input_dim=cfg.get("rlt_input_dim", 2048),
+            rlt_prefix_seq_len=cfg.get("rlt_prefix_seq_len", 1024),
+            rlt_mlp_ratio=cfg.get("rlt_mlp_ratio", 4.0),
             loop_prefix_len=cfg.get("loop_prefix_len", 16),
             loop_num_heads=cfg.get("loop_num_heads", 8),
             loop_num_layers=cfg.get("loop_num_layers", 2),
             mem_unroll_len=cfg.get("mem_unroll_len", 1),
+            mem_len_min=cfg.get("mem_len_min", None),
+            mem_scheme=cfg.get("mem_scheme", 1),
+            use_actor_mem=cfg.get("use_actor_mem", False),
+            ac_mem_capacity=cfg.get("ac_mem_capacity", 4096),
+            ac_mem_topk=cfg.get("ac_mem_topk", 8),
+            ac_mem_tau=cfg.get("ac_mem_tau", 0.1),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

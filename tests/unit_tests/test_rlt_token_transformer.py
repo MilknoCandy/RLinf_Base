@@ -31,6 +31,27 @@ def _make_model(*, prefix_seq_len: int = 5) -> RLTTokenTransformer:
     )
 
 
+def test_stage1_encoder_depth_matches_rlt_layers():
+    model = RLTTokenTransformer(
+        input_dim=8,
+        embed_dim=8,
+        prefix_seq_len=5,
+        num_layers=2,
+        num_heads=2,
+        dropout_rate=0.0,
+    )
+    attentions = [
+        module
+        for module in model.encoder.modules()
+        if module.__class__.__name__ == "MultiheadAttention"
+    ]
+    assert len(attentions) == 2
+    assert len(model.encoder.layers) == 2
+    prefix = torch.randn(2, model.prefix_seq_len, model.input_dim)
+    z = model.encode(prefix)
+    assert z.shape == (2, 1, model.embed_dim)
+
+
 def test_decoder_causal_mask_blocks_future_teacher_targets():
     model = _make_model()
     model.eval()
@@ -52,6 +73,113 @@ def test_decoder_causal_mask_blocks_future_teacher_targets():
         atol=1e-6,
     )
     assert not torch.allclose(original_output[:, 3:], changed_output[:, 3:])
+
+
+def test_window_write_keeps_earlier_chunks():
+    model = _make_model(prefix_seq_len=4)
+    model.eval()
+    hist = torch.randn(1, 2, 4, model.input_dim)
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    z_full, _ = model.encode_window(hist, None, valid)
+
+    changed = hist.clone()
+    changed[:, 0] = changed[:, 0] + 4
+    z_changed, _ = model.encode_window(changed, None, valid)
+    assert not torch.allclose(z_full, z_changed)
+
+    last_only = torch.tensor([[False, True]])
+    z_last, _ = model.encode_window(hist, None, last_only)
+    torch.testing.assert_close(z_last, model.encode(hist[:, 1]))
+
+
+def test_sequence_loss_reconstructs_only_the_last_chunk():
+    model = _make_model(prefix_seq_len=4)
+    model.train()
+    hist = torch.randn(2, 3, 4, model.input_dim)
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    calls = []
+    original = model.decode
+
+    def _count(rl_tokens, target_embeddings, mask=None):
+        calls.append(tuple(target_embeddings.shape))
+        return original(rl_tokens, target_embeddings, mask)
+
+    model.decode = _count
+    loss, _ = model.sequence_loss(hist, None, valid, mem_len_min=3, mem_len_max=3)
+    loss.backward()
+    assert calls == [(2, 4, model.input_dim)]
+    assert model.encoder.z_init.grad is not None
+
+
+def test_step_memory_resets_done_rows():
+    model = _make_model(prefix_seq_len=4)
+    model.eval()
+    prefix = torch.randn(2, 4, model.input_dim)
+    first = model.step_memory(prefix, None, None, None)
+    second = model.step_memory(prefix, None, first, torch.tensor([False, True]))
+    restarted = model.step_memory(prefix[1:], None, None, None)
+    torch.testing.assert_close(second[1], restarted[0])
+    assert not torch.allclose(second[0], first[0])
+
+
+def test_sequence_loss_trains_across_the_window():
+    model = _make_model(prefix_seq_len=4)
+    model.train()
+    hist = torch.randn(2, 3, 4, model.input_dim)
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    loss, metrics = model.sequence_loss(
+        hist, None, valid, mem_len_min=3, mem_len_max=3
+    )
+    loss.backward()
+    assert model.encoder.z_init.grad is not None
+    assert float(model.encoder.z_init.grad.abs().sum()) > 0
+    assert float(metrics["mem_loop_len"]) == 3
+
+
+def test_sequence_loss_samples_suffix_length():
+    model = _make_model(prefix_seq_len=4)
+    model.train()
+    torch.manual_seed(0)
+    valid = torch.ones(32, 10, dtype=torch.bool)
+    counts = []
+    for _ in range(30):
+        cropped = model._crop_window_valid(valid, 1, 10)
+        counts.append(cropped.sum(dim=-1))
+    counts = torch.cat(counts)
+    assert int(counts.min()) == 1
+    assert int(counts.max()) == 10
+
+
+def test_crop_draws_zero_length_and_skips_that_row():
+    model = _make_model(prefix_seq_len=4)
+    model.train()
+    torch.manual_seed(0)
+    valid = torch.ones(64, 10, dtype=torch.bool)
+    counts = []
+    for _ in range(40):
+        cropped = model._crop_window_valid(valid, 0, 10)
+        counts.append(cropped.sum(dim=-1))
+    counts = torch.cat(counts)
+    assert int(counts.min()) == 0
+    assert int(counts.max()) == 10
+
+    hist = torch.randn(2, 3, 4, model.input_dim)
+    row_valid = torch.tensor(
+        [[False, False, False], [True, True, True]], dtype=torch.bool
+    )
+    calls = []
+    original = model.decode
+
+    def _count(rl_tokens, target_embeddings, mask=None):
+        calls.append(tuple(target_embeddings.shape))
+        return original(rl_tokens, target_embeddings, mask)
+
+    model.decode = _count
+    loss, metrics = model.sequence_loss(hist, None, row_valid)
+    loss.backward()
+    assert calls == [(1, 4, model.input_dim)]
+    assert float(metrics["mem_loop_len"]) == 1.5
+    assert model.encoder.z_init.grad is not None
 
 
 def test_loss_masks_trailing_padding():

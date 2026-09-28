@@ -68,6 +68,9 @@ class OpenPiPytorchRLTConfig:
     rlt_use_mask: bool = False
     rlt_return_prefix: bool = False
     rlt_loop_prefix_len: int = 64
+    rlt_recon_topk_ratio: float = 1.0
+    rlt_mem_len_min: int = 1
+    rlt_mem_len_max: int = 1
 
 
 def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
@@ -94,6 +97,15 @@ def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
         ),
         rlt_loop_prefix_len=int(
             OmegaConf.select(model_cfg, "rlt_loop_prefix_len", default=64)
+        ),
+        rlt_recon_topk_ratio=float(
+            OmegaConf.select(model_cfg, "rlt_recon_topk_ratio", default=1.0)
+        ),
+        rlt_mem_len_min=int(
+            OmegaConf.select(model_cfg, "rlt_mem_len_min", default=1)
+        ),
+        rlt_mem_len_max=int(
+            OmegaConf.select(model_cfg, "rlt_mem_len_max", default=1)
         ),
     )
 
@@ -140,7 +152,10 @@ def _normalize_wrapper_state_dict(state_dict):
         normalized[key] = tensor
 
     has_wrapper_key = any(
-        key.startswith("model.") or key.startswith("rlt_module.") for key in normalized
+        key.startswith("model.")
+        or key.startswith("rlt_module.")
+        or key.startswith("mem.")
+        for key in normalized
     )
     if has_wrapper_key:
         return normalized
@@ -158,9 +173,11 @@ def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> Non
 
     loaded = torch.load(str(weights_path), map_location="cpu", weights_only=False)
     state_dict = _normalize_wrapper_state_dict(as_state_dict(loaded))
-    if expect_rlt and not any(key.startswith("rlt_module.") for key in state_dict):
+    has_rlt = any(key.startswith("rlt_module.") for key in state_dict)
+    has_mem = any(key.startswith("mem.") for key in state_dict)
+    if expect_rlt and not has_rlt and not has_mem:
         raise ValueError(
-            "openpi_rlinf RLT checkpoint has no rlt_module.* weights. "
+            "openpi_rlinf RLT checkpoint has no rlt_module.* or mem.* weights. "
             "Stage2 must consume a Stage1 checkpoint trained with openpi.use_rlt=True."
         )
 
@@ -174,7 +191,7 @@ def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> Non
             "This usually means the checkpoint is still in the legacy official "
             "OpenPI PyTorch key layout."
         )
-    if expect_rlt and any(key.startswith("rlt_module.") for key in missing):
+    if expect_rlt and has_rlt and any(key.startswith("rlt_module.") for key in missing):
         raise RuntimeError(
             f"RLT checkpoint {weights_path} did not load all rlt_module weights; "
             f"missing={missing[:8]}"

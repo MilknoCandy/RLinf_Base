@@ -1,310 +1,1099 @@
-# RLT 记忆扩展：同场景关键阶段的可迁移精细调整
+# RLT 历史经验记忆扩展：Actor Memory 与 Critic Memory
 
-本文描述当前 Stage 2 记忆方案（相对原版 RLT），以及它和已撤回路径（B2 反馈句、特权 progress 进 \(Q\)、GRU、256 维 sidecar）的差别。实现入口是 `use_mem: True` 的 `examples/embodiment/config/maniskill_rlt_stage2_ac_mlp_mem.yaml`。原版 `maniskill_rlt_stage2_ac_mlp.yaml` 不改。
+## 1. 研究动机
+
+原始 RLT（RL Token）通过将 VLA 的高维内部表征压缩为紧凑的 RL token，使轻量 Actor-Critic 能够利用 VLA 的知识进行在线强化学习。
+
+原始 RLT 在当前决策时主要依赖当前 chunk 的信息：
+
+$$
+z_t = E_{\mathrm{VLA}}(o_t)
+$$
+
+Actor 根据当前 RL token 和 VLA reference action 产生 action chunk：
+
+$$
+a_t =
+\pi_\theta(z_t,a_t^{ref},s_t)
+$$
+
+Critic 根据当前状态和 action 估计价值：
+
+$$
+Q_\phi(z_t,a_t,s_t)
+$$
+
+这种设计对于短时程任务有效，但对于长时程任务存在一个根本问题：
+
+> 当前 chunk 的决策可能依赖过去多个 chunk 中已经发生的行为和反馈，而当前 RL token 本身并不包含这些历史经验。
+
+因此，仅仅将历史观测直接拼接到当前输入，或者将历史信息强行压缩到原有 \(z_t\) 中，并不能保证 Actor-Critic 真正使用历史信息。
+
+核心原因是：
+
+* Actor 需要的是**过去什么行为有效**；
+* Critic 需要的是**过去行为产生了什么结果以及反馈模式如何**；
+* 两者需要的历史信息具有不同的功能。
+
+因此提出双通路历史经验记忆：
+
+$$
+\boxed{
+\text{Actor Memory}
++
+\text{Critic Memory}
+}
+$$
+
+两者均采用与 RL token 类似的低维 latent 表征作为信息载体，但分别服务于 Actor 和 Critic。
 
 ---
 
-## 1. 要解决什么
+# 2. 总体框架
 
-原版 RLT 只在**关键阶段**对冻结 VLA 做精细调整，不重训 Pi0。Stage 1 把当前 prefix 压成 \(z_{\mathrm{rl}}\)；Stage 2 小 MLP 在 \(z\)、proprio 和 VLA 的 `ref_chunk` 上出动作，并用 BC 拉向 `ref`。
+在原始 RLT 的基础上增加两个历史经验 token：
 
-两个限制：
+$$
+m_t^A
+$$
 
-1. **短视。** 冻结 Stage 1 的 \(z_{\mathrm{rl}}\) 只压缩当前帧。Peg 上像素几乎不变，「上一 chunk 更近了 / 插偏了」进不去。
-2. **`ref → a` 短路。** Actor 输入里就有整段 `ref_chunk`，再加 \(\|\pi-\tilde a\|^2\)，最容易的解是抄提案。后面再拼任何历史向量也很难改到 \(a\)。
+表示 Actor Memory；
 
-优化目标不是「让 VLA 自己会记」，而是：
+$$
+m_t^C
+$$
 
-> 同一套可训的 **encoder loop**，在**同一个 ManiSkill 场景**里换 instruction 后不训还能用；新 episode 重置 \(z\)；VLA 继续出同分布 `ref_chunk`。
+表示 Critic Memory。
 
-能 zero-shot 的是**写法**（当前 \(I_t\) 如何和上一 \(z\)、上一执行 \((a,r)\) 一起压成新的 \(z_t\)），不是某条轨迹里的 \(z\) 向量。
+当前 RL token 保持：
+
+$$
+z_t
+$$
+
+最终形成：
+
+$$
+\boxed{
+z_t + m_t^A + m_t^C
+}
+$$
+
+但三者承担不同职责。
+
+### Actor
+
+$$
+\boxed{
+a_t =
+\pi_\theta
+(z_t,m_t^A,a_t^{ref},s_t)
+}
+$$
+
+其中：
+
+* \(z_t\)：当前 VLA 的 RL token；
+* \(m_t^A\)：历史行为经验；
+* \(a_t^{ref}\)：VLA reference action chunk；
+* \(s_t\)：机器人 proprioception；
+* \(a_t\)：RL Actor 输出的 action chunk。
+
+### Critic
+
+$$
+\boxed{
+Q_t =
+Q_\phi
+(z_t,m_t^C,a_t,s_t)
+}
+$$
+
+其中：
+
+* \(z_t\)：当前 RL token；
+* \(m_t^C\)：历史反馈经验；
+* \(a_t\)：当前候选 action chunk；
+* \(s_t\)：当前机器人状态。
+
+因此整体结构为：
+
+```text
+                         Current Observation
+                                │
+                                ▼
+                              VLA
+                                │
+                                ▼
+                              z_t
+                                │
+              ┌─────────────────┴─────────────────┐
+              │                                   │
+              ▼                                   ▼
+       Actor Memory                         Critic Memory
+           m_A                                  m_C
+              │                                   │
+              ▼                                   ▼
+       ┌──────────────┐                    ┌──────────────┐
+       │    Actor     │                    │    Critic    │
+       │ z + m_A + ref│                    │ z + m_C + a  │
+       └──────┬───────┘                    └──────┬───────┘
+              │                                   │
+              ▼                                   ▼
+         Action Chunk                         Q Value
+              │                                   │
+              └───────────────┬───────────────────┘
+                              ▼
+                         Environment
+                              │
+                         reward / next state
+                              │
+                              ▼
+                         Experience
+```
 
 ---
 
-## 2. 和原版 RLT 的分工（没改的部分）
+# 3. Actor Memory
 
-| 模块 | 仍然做什么 |
-| --- | --- |
-| 冻结 VLA（官方 OpenPI / Pi0.5） | 当前 \(I_t\) + instruction → `ref_chunk`；并给出 VLM prefix embeddings |
-| \(z\) 不注入 VLA | 记忆只在 Stage 2 的 loop encoder + MLP 里 |
-| Route | 进入关键阶段前执行 VLA。原版之后执行 actor；mem 的 train 采集在 \(\mathrm{EMA}(\|\pi-\tilde a\|_1)\) 降到阈值前仍执行 VLA，eval 过 warmup 后看学生 |
-| Critic 结构 | Twin-Q，chunk 级 TD。原版 `only_success`；mem 训练用 `success_potential`（\(1[\mathrm{success}]+\mathrm{coef}(\gamma\Phi'-\Phi)\)），\(\Phi\) 只进 \(r\) 不进 \(Q\) |
-| Actor 形式 | 固定标准差的 \(\tanh\) MLP，损失里仍有 \(-Q+\beta\,\mathrm{BC}\) |
+## 3.1 定义
 
-冻结特征模型**不再**把已经独立算完的 \(z_{\mathrm{rl}}\) 交给 policy 当状态。它只提供本帧 \(I_t\)（pool 后的 prefix）和 `ref_chunk`。跨 chunk 的 \(z\) 由可训 encoder 递推。
+Actor Memory 用于保存和编码过去的**行为经验**。
+
+核心问题是：
+
+> 在过去类似状态下，我采取了什么行为？这个行为相对于 VLA 做了什么调整？最终是否有效？
+
+因此 Actor Memory 不应该只是历史观测，而应该是：
+
+$$
+\boxed{
+\text{State}
++
+\text{Action}
++
+\text{Outcome}
+}
+$$
+
+即历史交互经验。
 
 ---
 
-## 3. 改了什么
+## 3.2 Actor Memory 的历史单元
 
-原版：
-
-$$
-z_t=\mathrm{Enc}_{\mathrm{S1}}(I_t),\qquad
-\pi([\tilde a,\,z_t,\,\mathrm{proprio}]),\qquad
-Q([z_t,\,\mathrm{proprio}],\,a)
-$$
-每一步的 \(z_t\) 和 \(z_{t-1}\) 无关。Policy 即使拼一个 sidecar 向量，输入里仍有已经完成的 \(z_t\) 和整段 \(\tilde a\)，历史进不去动作。
-
-现在：
+对于过去第 \(i\) 个 chunk，可以定义：
 
 $$
-z_t=\mathrm{Enc}\big([I_t;\,a_{t-1};\,r_{t-1};\,z_{t-1}]\big)
+e_i^A =
+[
+z_i,
+a_i^{ref},
+a_i,
+r_i
+]
 $$
 
+其中：
+
+* \(z_i\)：过去时刻的 RL token；
+* \(a_i^{ref}\)：VLA reference action；
+* \(a_i\)：实际执行的 action；
+* \(r_i\)：该 chunk 获得的 reward。
+
+由于 RLT 本身具有 reference action，因此可以进一步使用 action correction：
+
 $$
-\pi([z_t,\,\mathrm{proprio}]),\qquad
-Q([z_t,\,\mathrm{proprio}],\,a)
+\Delta a_i
+=
+a_i-a_i^{ref}
 $$
 
-`ref_chunk` **不进入** encoder，也 **不进入** \(\pi\) 和 \(Q\)。它只当预测头和 BC 的拟合目标。Encoder 的输入只有当前 \(I_t\)、上一时刻写出的 \(z_{t-1}\)、上一 chunk **实际执行**的 \(a_{t-1}\) 和 \(r_{t-1}\)。Stage 1 从未见过 `ref`，把 `ref` 拼进 encoder 会让写函数抄提案，历史进不去。
+于是更紧凑的经验表示可以写成：
+
+$$
+\boxed{
+e_i^A =
+[
+z_i,
+\Delta a_i,
+r_i
+]
+}
+$$
+
+相比直接保存 action，\(\Delta a_i\) 更直接描述：
+
+> RL 相对于原始 VLA 做了什么修正。
 
 ---
 
-## 4. `mem` 就是这条 encoder loop
+## 3.3 Actor Memory Encoder
 
-没有单独的 256 维记忆槽。记忆状态就是 Stage 1 同构的 RL token 
+过去 \(K\) 个 chunk 构成：
+
 $$
-z\in\mathbb{R}^{2048}
+\mathcal M_t^A
+=
+\{
+e_{t-K}^A,
+\dots,
+e_{t-1}^A
+\}
 $$
-。第一步没有历史时，\(z_{0}=z_{\mathrm{init}}\)（可学习），\(a_{0}=0\)，\(r_{0}=0\)。
 
-### 4.1 冻结特征模型只出 \(I_t\) 和 `ref`
+通过 Actor Memory Encoder：
 
-`extract_rlt_obs`（官方 `openpi`）在 `rlt_return_prefix: True` 时额外返回：
+$$
+m_t^A
+=
+E_A(
+e_{t-K}^A,\dots,e_{t-1}^A
+)
+$$
 
-- `prefix_embs`：当前 VLM prefix，用 `adaptive_avg_pool1d` 收到 `loop_prefix_len=64`（整段 1024×2048 无法进 replay）
-- `prefix_mask`
-- `ref_chunk`、`proprio`（与原版相同）
+得到固定维度的 memory token：
 
-冻结 Stage 1 encoder 仍会算一个 \(z_{\mathrm{rl}}\) 以兼容原版键；`use_mem=True` 时 policy **丢掉**这个值，用 loop 重写。
+$$
+\boxed{
+m_t^A\in\mathbb R^d
+}
+$$
 
-### 4.2 可训 loop：`RLTLoopEncoder`
+其中 \(d\) 与 RLT token 的维度保持一致或处于相同数量级。
 
-类：`rlinf/models/embodiment/modules/rlt_mem_write.py`，挂在 `RLTMLPPolicy.loop_encoder`。名字含 `encoder`，FSDP 把它和 Q 头放进 **critic 优化器**。
+第一版可以使用非常轻量的 Transformer、MLP + pooling 或其他简单序列编码器，不需要引入复杂 memory bank。
 
-内部是和 Stage 1 同构的 `RLTTokenEncoder`（默认 2 层、8 head，`prefix_seq_len=64`，没有 decoder），外加：
+---
 
-| token | 来源 |
-| --- | --- |
-| \(I_t\) | pool 后的 `prefix_embs`（冻结 VLM，不反传进 Pi0） |
-| \(a_{t-1}\) | `action_proj`，上一 chunk **route 之后实际执行**的动作，展平 80 维 |
-| \(r_{t-1}\) | `reward_proj`，上一 chunk 各步 reward 的和 |
-| \(z_{t-1}\) | 当作 encoder 的 RL token（不再用 Stage 1 那个与历史无关的 learnable embed） |
+## 3.4 Actor Memory 学习什么？
 
-序列是 \([I_1\ldots I_{64};\,a;\,r;\,z]\)。Encoder 读出最后一位得到 \(z_t\)。这和 Stage 1「一个 RL token 去读 prefix」是同一条计算，只是 token 换成上一时刻的 \(z\)，并多了执行反馈 \((a,r)\)。**没有 decoder，不重建 \(I_t\)。**
+Actor Memory 的核心目标不是记住完整历史，而是提取：
 
-同一模块上的约束头（只在训练用）：
+$$
+\boxed{
+\text{过去哪些行为在类似情况下有效}
+}
+$$
 
-- `pred_ref`：\(z_t\to\) 当前 `ref_chunk` 展平。这是 Stage 2 里 encoder 的主监督：\(z\) 必须能从 \(I_t\) 和历史推出 VLA 提案。
-- `pred_r`：\(z_t\to\) 当前 chunk 的折现/加总回报。
+例如：
 
-### 4.3 Policy 只看见 loop 后的 \(z\)
-
-ManiSkill 默认：\(z\in\mathbb{R}^{2048}\)，proprio 9。Actor / critic 输入是 `[z | proprio]` = 2057，**不再拼** 80 维 `ref`，也**不再拼**冻结 Stage 1 的 \(z\)。
-
-因此 \(\pi\) 要出接近 VLA 的动作，必须从 \(z_t\) 里读出提案；而 \(z_t\) 只有在 encoder 真正融合了 \(I_t\) 和历史时才稳定。这就是 history 进入 action 的路径。
-
-### 4.4 Rollout：\(z\) 存在 policy 上，不进 checkpoint
-
-`RLTMLPPolicy` 上两份 **非参数** 状态（每个 env 一行）：
-
-- `_rollout_mem`：上一步写出的 \(z_t\)，下一步当 \(z_{t-1}\)
-- `_rollout_prev_action`：上一步 commit 的执行动作
-
-一次 `predict_rlt_actions` 的顺序：
-
-1. 冻结 OpenPI：`extract_rlt_obs` → `prefix_embs`, `ref_chunk`, `proprio`。
-2. `_prepare_rollout_mem`：若上一 chunk `dones` 为真，该 env 的 \(z\)、\(a\) 置回 \(z_{\mathrm{init}}\) / 0，\(r\) 也置 0；否则 \(r_{t-1}\) = 上一 chunk reward 求和。然后 \(z_t=\mathrm{Enc}([I_t;a_{t-1};r_{t-1};z_{t-1}])\)，写回 `_rollout_mem`。
-3. \(\pi(z_t,\mathrm{proprio})\) 出学生动作。
-4. route 在关键阶段前换成 `ref`。mem 的 train 在 clone 未就绪时关键阶段也继续执行 `ref`；eval 过 warmup 后执行学生。
-5. `commit_rollout_action(实际执行的 a)`：下一 chunk 的 \(a_{t-1}\) 必须是环境里真正走的。
-
-`dones` / `rewards` 来自 **上一** 次 env step。本步的 \(r_t\) 要等环境走完，下一次 predict 才进入写。
-
-### 4.5 一条轨迹里已经有很多个 chunk，K 是其中最近几段
-
-这里的「一步」不是环境里的 1 个 `env.step`，也不是整条 episode，而是 **一次 policy 调用 = 一个 action chunk**。
-
-当前 ManiSkill 配置：
-
-| 单位 | 多长 | 对应什么 |
-| --- | --- | --- |
-| env step | 1 个关节指令 | `env.step(a)` |
-| chunk（记忆的 1 步） | 10 个 env step | 一次 `predict`，`num_action_chunks: 10` |
-| episode | 最多 500 个 env step | 同一颗 peg、同一局，约 **50 个 chunk** |
-| 一次 rollout epoch | `max_steps_per_rollout_epoch: 500` | `500/10=50` 次 chunk 循环；`auto_reset: False`，每个 env 正好走完一局 |
-
-采集循环是：
-
-```
-for chunk_t in 0 .. 49:          # 同一 env、同一局
-    看 I_t，出 10 维动作 chunk
-    环境连续 step 10 次
-    记下 (I_t, a_t, r_t, done)
-    下一圈用新的图像 I_{t+1}
+```text
+过去状态 z_i
+      ↓
+VLA 给出 action
+      ↓
+RL 对 action 向右修正
+      ↓
+任务成功
+      ↓
+形成正向经验
 ```
 
-`EmbodiedTrajectoryBuilder` 每个 chunk `append` 一次。送到 actor 的那条 `Trajectory` 的时间维是 **50，不是 1**。原版训练再把它 **拆成 50 条单步 replay**，所以看起来像「关键阶段只预测一次」。数据里其实已经有「上一 chunk 插偏了、这一 chunk 再试」的顺序。
+当未来出现相似的：
 
-默认 **不在 replay 里再存 K 段图像**（`mem_unroll_len: 1`）。采集时 \(z\) 仍沿 50 个 chunk 递推；训练只对当前 \(I_t\) 和存下来的 \(z_{t-1},a_{t-1},r_{t-1}\) 写一次。把 4 段 `64×2048` prefix 拷进每一行、再在 critic/actor/预测里各展开一遍，单步会到小时级。
+$$
+z_t\approx z_i
+$$
 
-若要训练期反传多段视觉，把 `mem_unroll_len` 调到 2–4，并接受更慢、更大的 replay。默认 prefix pool 到 16 token；encoder **2 层**（与 Stage 1 相同），不要用 1 层。
+Actor 可以通过：
 
-记忆就是这个递推：
+$$
+m_t^A
+$$
 
-```
-chunk 34: Enc(I_34, z_init, 0, 0)     → z_34
-chunk 35: Enc(I_35, z_34, a_34, r_34) → z_35
-chunk 36: Enc(I_36, z_35, a_35, r_35) → z_36
-chunk 37: Enc(I_37, z_36, a_36, r_36) → z_37   ← π 和 Q 用这个
-```
-
-\(z_{37}\) 里有「前几段实际怎么走、回报怎样」。只看 \(I_{37}\) 的原版 RLT 没有这段。局与局之间 `done` 断开，窗口不跨 episode。
-
-### 4.6 为什么训练也要展开，而不是只在 rollout 里记 \(z\)
-
-原版 Stage 2 是一步 TD：关键阶段拿当前 \(I_t\) / `ref` 预测一次 \(a\)。如果训练也只做
-\(z_t=\mathrm{Enc}(I_t,z_{t-1}^{\mathrm{detach}})\)，再让 \(D_{\mathrm{ref}}(z_t)\approx\tilde a_t\)，encoder 可以完全丢掉 \((a,r)\) 历史——当前 `ref` 本来就由 \(I_t\) 决定。那样 actor 仍是「关键阶段一次动作预测」，和原版没有区别。
+获得过去的行为经验，并倾向于复用有效的 action correction。
 
 因此：
 
-1. **采集**仍按 chunk 顺序走。Policy 上的 `_rollout_mem` 跨 chunk 递推 \(z\)，`done` 清掉。这是推理时的 loop。
-2. **写入 replay 时**，同一条 episode 上把最近 `mem_unroll_len`（默认 4）步的 \(I,a,r,\mathrm{ref}\) 拷到这一行（`hist_*`）。中间遇到 `done` 的步标成 invalid。
-3. **训练**用当前 encoder **展开**这个窗口（步与步之间不 detach）：
-
-\[
-z_k=\mathrm{Enc}(I_k,z_{k-1},a_{k-1},r_{k-1}),\quad k=t-K+1,\ldots,t
-\]
-
-然后 \(\pi(z_t)\)、\(Q(z_t,a_t)\)、以及窗口内每一步的 \(D_{\mathrm{ref}}(z_k)\approx\tilde a_k\)。TD 仍是一步，但 **状态 \(z_t\) 是这段历史的函数**，改早期的执行 \(a\) 会改现在的 \(\pi/Q\)。
-
-`ref` 只当每一步的预测目标，不进 encoder。Actor 的 \(-Q\) 仍 detach 最终 \(z_t\)，encoder 由 critic 的 TD 和 `pred_ref` 更新。
+$$
+\boxed{
+m_t^A
+=
+\text{Behavioral Experience}
+}
+$$
 
 ---
 
-## 5. 两条约束：BC 在动作上，预测 `ref` 在 \(z\) 上
+# 4. Actor 的输入与优化
 
-\[
-\mathcal L_{\pi}=-q\,Q(z,\pi)+\beta\,\|\pi-\tilde a\|^2
-\]
+Actor 最终变为：
 
-\[
-\mathcal L_{Q}=\underbrace{\|Q-y\|^2}_{\mathrm{TD}}
-+\lambda_{\mathrm{ref}}\|D_{\mathrm{ref}}(z)-\tilde a\|^2
-+\lambda_{r}\|D_{r}(z)-r\|^2
-\]
+$$
+\boxed{
+a_t=
+\pi_\theta
+(z_t,m_t^A,a_t^{ref},s_t)
+}
+$$
 
-| 约束 | 打在谁身上 | 作用 |
-| --- | --- | --- |
-| BC \(\|\pi-\tilde a\|\) | **执行动作** | 输出必须还在 VLA 先验里 |
-| \(D_{\mathrm{ref}}(z)\approx\tilde a\) | **loop encoder** | Stage 2 的主辅助：\(z\) 要根据 \(I_t\) 和历史推出当前 `ref_chunk` |
-| \(D_r(z)\approx r\) | **loop encoder** | \(z\) 里要留得住上一段结果 |
-| \(-Q\) / TD | \(\pi\) 和 \(Q\) | 只在 BC 附近做对任务更好的微调 |
+相比原始 RLT：
 
-`ref` 只做三件事：route 提案、BC 目标、\(D_{\mathrm{ref}}\) 标签。不进 encoder，不进 \(\pi\)，不进 \(Q\)。不重建 \(I_t\)。
+$$
+a_t=
+\pi_\theta(z_t,a_t^{ref},s_t)
+$$
 
-ManiSkill mem yaml 的 BC / \(Q\) 日程与原版相同（warmup \(\beta=7,q=0.05\)，online \(\beta=2.5,q=0.45\)）。`reference_dropout` 关掉：输入里已经没有 `ref`。
+唯一新增的是：
 
----
+$$
+m_t^A
+$$
 
-## 6. 数据流（一个 chunk）
-
-```
-冻结 OpenPI
-    I_t, ℓ  →  prefix_embs (pool 64), ref_chunk
-
-loop encoder（可训）
-    Enc([I_t; a_{t-1}; r_{t-1}; z_{t-1}])  →  z_t
-
-actor（可训）
-    (z_t, proprio)  →  π
-    route：关键阶段前用 ref；之后用 π
-
-环境
-    执行 a_t  →  r_t, done, I_{t+1}
-
-训练（同一 episode 展开 K 步）
-    z_t = Enc(I_{t-K+1:t}, a, r)
-    π：-Q(z_t) + BC(π, ref_t)
-    Q：TD(z_t, a_t) + 预测(z_k → ref_k)
-```
+因此它并不改变 RLT 的基本 action refinement 机制。
 
 ---
 
-## 7. 同场景 zero-shot 怎么成立
+## 4.1 Actor Loss
 
-| 随任务变 | 固定、可迁 | 每条 episode 清掉 |
-| --- | --- | --- |
-| \(\ell\) → VLA → 新的 `ref` 和新的 \(I_t\) | loop 写法、\(D_{\mathrm{ref}}\)、残差 MLP | \(z\) 内容 |
-| 当前目标上的 \(r\)（训练用） | BC：输出跟**当时**的 `ref` | 本局 \(a,r\) 历史 |
+保持 RLT 原有的 RL objective：
 
-换任务只换 instruction。VLA 出新提案和新 prefix；BC 和 \(D_{\mathrm{ref}}\) 跟着新 `ref` 走；encoder 权重不动。不要把任务名或当前 success 写进 \(Q\)。
+$$
+\mathcal L_A
+=
+-Q_\phi(z_t,m_t^C,a_t,s_t)
++
+\beta
+\left\|
+a_t-a_t^{ref}
+\right\|^2
+$$
 
----
+其中：
 
-## 8. 明确不做
+第一项：
 
-- \(z\) 注入 Stage 1 VLA。
-- 自然语言反馈进冻结 VLM（B2）。
-- 特权 \(d\) / success 拼进 \(Q\)。
-- GRU 或 256 维 sidecar 去混合**已经算完**的 Stage 1 \(z\)：当前 \(z\) 与历史无关，policy 也仍在抄 `ref`。
-- \(\beta=0\)：输出可以完全离开 VLA。
-- 重建 \(I_t\)：Stage 2 要的是从历史推出 `ref`，不是再做一遍 Stage 1 reconstruction。
-- `ref_chunk` 进 encoder。
-- 残差 \(a=\tilde a+\Delta(z)\)：那是原文 pass-through，不是 mem。
-- 特权 \(d\) 进 \(Q\) 特征。势函数只允许出现在 \(r\)。
+$$
+-Q_\phi
+$$
 
----
+鼓励 Actor 选择高价值 action。
 
-## 9. 文件与配置
+第二项：
 
-| 路径 | 作用 |
-| --- | --- |
-| `rlinf/models/embodiment/modules/rlt_mem_write.py` | `pool_rlt_prefix` + `RLTLoopEncoder` |
-| `rlinf/models/embodiment/modules/rlt_token_transformer.py` | encoder 可传入 `rl_token` / `extra_tokens` |
-| `rlinf/models/embodiment/mlp_policy/rlt_mlp_policy.py` | `use_mem` 时 \(\pi/Q\) 只吃 loop 后的 \(z\) |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | 官方 OpenPI：`rlt_return_prefix` 出 pool 后的 \(I_t\) |
-| `rlinf/algorithms/rlt/rollout.py` | 跨 chunk 携带 \(z,a,r\)；`done` 重置 |
-| `rlinf/algorithms/rlt/transition.py` | replay 可选 prefix / \(z_{\mathrm{prev}}\) 键 |
-| `rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py` | critic：TD + 预测 ref/\(r\)；actor：\(-Q+\mathrm{BC}\) |
-| `examples/embodiment/config/maniskill_rlt_stage2_ac_mlp_mem.yaml` | 完整 Stage 2 配置（官方 OpenPI + TensorBoard，不继承） |
-| `rlinf/envs/maniskill/rlt_potential.py` | \(\Phi\) 只进 \(r\) |
-| `tests/unit_tests/test_rlt_mem.py` | actor 维数、历史改变动作、encoder 不看 ref、预测 ref、done 重置 |
-| `tests/unit_tests/test_rlt_route.py` | train 在 clone 未就绪时继续执行 VLA |
-| `tests/unit_tests/test_rlt_potential.py` | 接近 hole 时 \(r>0\)，首步无 shaping |
+$$
+\left\|
+a_t-a_t^{ref}
+\right\|^2
+$$
 
-原版配置保持 `use_mem` 默认关，也不开 `rlt_return_prefix`。
+使 RL policy 保持在 VLA 行为先验附近。
 
-建议看的 TensorBoard 标：
+因此 Actor Memory 并不替换 reference action，而是：
 
-| 标 | 含义 |
-| --- | --- |
-| `env/` train success | VLA 采集是否还在成功。clone 未就绪时应接近原版 warmup |
-| `eval/` success（warmup 之后） | \(\pi(z)\) 自己插得进不算。未过 `student_action_ref_max` 前允许为 0 |
-| `action_ref_abs_mean` / `action_ref_ema` / `student_clone_ready` | 克隆是否够格切学生采集 |
-| `replay/reward_mean`、`reward_positive_rate` | 势函数是否让 \(r\) 在成功前就有正负，而不是全 0 |
-| `pred_ref_loss`、`bc_loss`、`q_data` / `q_pi` | \(z\) 是否在恢复 `ref`；\(Q\) 是否不再贴 0 |
-
-`mem_unroll_len` 过小会退回「只看当前帧」。
+$$
+\boxed{
+\text{利用历史经验帮助 Actor 决定如何修正 reference action}
+}
+$$
 
 ---
 
-## 10. 和原文 RLT、DSRL 的位置
+# 5. Critic Memory
 
-- **原版 RLT：** 条件生成 + BC，在 `ref` 附近局部编辑。本方案保留 BC 和冻结 VLA，把「看见 `ref`」改成「从 loop 后的 \(z\) 恢复 `ref`」，并让 \(z\) 带上 \((a,r)\) 历史。
-- **原文消融：** w/o Pass-Through（去掉 actor 里的 `ref`）仍能收敛但更慢；\(\beta=0\) 掉点最大。本方案对应前者 + encoder loop，**不**对应后者。
-- **DSRL：** SAC 的动作是扩散初始噪声。本方案仍在真实动作空间里做 BC。
+## 5.1 定义
+
+Critic Memory 与 Actor Memory 的目的不同。
+
+Critic 并不主要需要知道：
+
+> “过去应该怎么做？”
+
+而需要知道：
+
+> “过去发生了什么，以及这些行为产生了什么反馈？”
+
+因此 Critic Memory 表示：
+
+$$
+\boxed{
+\text{Historical Feedback Experience}
+}
+$$
 
 ---
 
-## 11. 为了让 mem 的优点能被看见
+## 5.2 Critic Memory 的历史单元
 
-原版成功率曲线比的是「当前帧能不能贴住 VLA」。那条曲线上 mem 没有优势，残差也只是复现 RLT。
+对于过去第 \(i\) 个 chunk，可以定义：
 
-mem 只多 \(z_t(I_t,z_{t-1},a_{t-1},r_{t-1})\)。要让这段历史有用：
+$$
+e_i^C=
+[
+z_i,
+a_i,
+r_i,
+z_{i+1},
+d_i
+]
+$$
 
-1. **\(r_{t-1}\) 在成功前就要有差别。** 训练 `reward_mode: success_potential`，\(\Phi=x_{\mathrm{hole}}-w\cdot d_{yz}\)，\(r=1[\mathrm{success}]+\mathrm{coef}(\gamma\Phi'-\Phi)\)。eval 仍是 `only_success`，成功率口径不变。
-2. **采集不能被学生写死。** `collect_student_when_ready: True`：train 关键阶段继续走 VLA，直到 `action_ref_ema <= 0.03` 才切学生。eval 过 `warmup_post_collect_updates`（默认 2000）后看学生，用来量克隆，不是拿来填 replay。单步更新上限 80，不加载 expert OpenPI。
+其中：
 
-主指标应是：同一局里 miss 后再插、以及 `Enc(I)` vs `Enc(I,a,r,z)` 的消融；不是第一段关键阶段超过原版 RLT。
+* \(z_i\)：当前状态 RL token；
+* \(a_i\)：实际执行的 action；
+* \(r_i\)：reward；
+* \(z_{i+1}\)：下一状态 RL token；
+* \(d_i\)：episode 是否结束。
+
+因此 Critic Memory 比 Actor Memory 更强调：
+
+$$
+\boxed{
+(state,action,reward,next\ state)
+}
+$$
+
+即完整的 value transition。
+
+---
+
+## 5.3 Critic Memory Encoder
+
+历史反馈序列：
+
+$$
+\mathcal M_t^C
+=
+\{
+e_{t-K}^C,
+\dots,
+e_{t-1}^C
+\}
+$$
+
+通过独立的 Critic Memory Encoder：
+
+$$
+m_t^C
+=
+E_C(
+e_{t-K}^C,\dots,e_{t-1}^C
+)
+$$
+
+得到：
+
+$$
+\boxed{
+m_t^C\in\mathbb R^d
+}
+$$
+
+这里：
+
+$$
+E_A\neq E_C
+$$
+
+即 Actor Memory 和 Critic Memory 使用不同的 encoder。
+
+这样可以避免将不同功能的历史信息强行压缩到同一个 latent。
+
+---
+
+# 6. Critic 的输入
+
+Critic 变为：
+
+$$
+\boxed{
+Q_t
+=
+Q_\phi(
+z_t,m_t^C,a_t,s_t
+)
+}
+$$
+
+相比原始 RLT：
+
+$$
+Q_t=Q_\phi(z_t,a_t,s_t)
+$$
+
+新增：
+
+$$
+m_t^C
+$$
+
+因此 Critic 可以利用过去的反馈经验判断当前 action 的价值。
+
+---
+
+# 7. Critic Target
+
+Critic 使用 TD learning。
+
+当前 TD target：
+
+$$
+y_t
+=
+r_t+
+\gamma
+Q_{\bar\phi}
+(
+z_{t+1},
+m_{t+1}^C,
+a_{t+1},
+s_{t+1}
+)
+$$
+
+因此：
+
+$$
+\boxed{
+\mathcal L_C
+=
+\left[
+Q_\phi(z_t,m_t^C,a_t,s_t)
+-
+y_t
+\right]^2
+}
+$$
+
+一个非常重要的设计原则是：
+
+$$
+\boxed{
+Q_t\rightarrow m_t^C
+}
+$$
+
+而 target value：
+
+$$
+\boxed{
+Q_{t+1}\rightarrow m_{t+1}^C
+}
+$$
+
+不能简单地在整个 trajectory 中复用同一个 memory token，否则会产生时间错位。
+
+---
+
+# 8. Actor Memory 与 Critic Memory 的区别
+
+| 维度      | Actor Memory              | Critic Memory               |
+| ------- | ------------------------- | --------------------------- |
+| 核心问题    | 过去什么行为有效？                 | 过去发生了什么？                    |
+| 服务对象    | Actor                     | Critic                      |
+| 核心信息    | 行为经验                      | 反馈经验                        |
+| 历史单元    | \(z_i,a_i^{ref},a_i,r_i\) | \(z_i,a_i,r_i,z_{i+1},d_i\) |
+| 推荐压缩    | \(z_i,\Delta a_i,r_i\)    | \(z_i,a_i,r_i,z_{i+1},d_i\) |
+| Encoder | \(E_A\)                   | \(E_C\)                     |
+| 输出      | \(m_A\)                   | \(m_C\)                     |
+| 主要作用    | 改善 action refinement      | 改善 value estimation         |
+| 关注重点    | Policy experience         | Value experience            |
+| 是否共享    | 不建议第一版共享                  | 不建议第一版共享                    |
+
+可以概括为：
+
+$$
+\boxed{
+m_A=\text{What worked?}
+}
+$$
+
+$$
+\boxed{
+m_C=\text{What happened?}
+}
+$$
+
+---
+
+# 9. 为什么不直接共享一个 Memory？
+
+不建议第一版设计：
+
+$$
+m=f(E_{history})
+$$
+
+然后：
+
+$$
+Actor(z,m)
+$$
+
+和：
+
+$$
+Critic(z,m,a)
+$$
+
+共同使用。
+
+原因是 Actor 和 Critic 对历史信息的需求不同。
+
+Actor 更关注：
+
+$$
+(z_i,\Delta a_i,r_i)
+$$
+
+即：
+
+> 什么行为在过去产生了好的结果。
+
+Critic 更关注：
+
+$$
+(z_i,a_i,r_i,z_{i+1})
+$$
+
+即：
+
+> 一个状态-动作转移产生了什么反馈。
+
+如果强行共享，很容易重新出现原来的问题：
+
+> 历史信息虽然进入网络，但没有形成针对 Actor 或 Critic 的有效功能表征。
+
+因此第一版建议：
+
+$$
+\boxed{
+E_A\neq E_C
+}
+$$
+
+但：
+
+$$
+\boxed{
+m_A,m_C\in\mathbb R^d
+}
+$$
+
+保持与 RL token 相近的维度。
+
+---
+
+# 10. 与原始 RLT 的关系
+
+这个方法不改变 RLT 的核心框架。
+
+原始 RLT：
+
+$$
+z_t
+\rightarrow
+Actor/Critic
+\rightarrow
+a_t
+$$
+
+扩展后：
+
+$$
+\boxed{
+z_t+
+m_t^A+
+m_t^C
+\rightarrow
+Actor/Critic
+}
+$$
+
+其中：
+
+$$
+z_t
+$$
+
+仍然负责当前 VLA 表征；
+
+$$
+m_t^A
+$$
+
+负责历史行为经验；
+
+$$
+m_t^C
+$$
+
+负责历史反馈经验。
+
+因此该方法不是重新设计一个新的 RL policy，而是：
+
+> **在 RLT 的 RL interface 上增加历史经验表征。**
+
+---
+
+# 11. 推荐的最小可行版本
+
+第一版不要加入复杂机制。
+
+推荐：
+
+### Current RL Token
+
+$$
+z_t
+$$
+
+保持原始 RLT 不变。
+
+### Actor Memory
+
+$$
+e_i^A=
+[
+z_i,
+\Delta a_i,
+r_i
+]
+$$
+
+$$
+m_t^A
+=
+E_A(e_{t-K}^A,\dots,e_{t-1}^A)
+$$
+
+### Critic Memory
+
+$$
+e_i^C=
+[
+z_i,
+a_i,
+r_i,
+z_{i+1},
+d_i
+]
+$$
+
+$$
+m_t^C
+=
+E_C(e_{t-K}^C,\dots,e_{t-1}^C)
+$$
+
+### Actor
+
+$$
+a_t=
+\pi_\theta
+(z_t,m_t^A,a_t^{ref},s_t)
+$$
+
+### Critic
+
+$$
+Q_t=
+Q_\phi
+(z_t,m_t^C,a_t,s_t)
+$$
+
+---
+
+# 12. 实验设计
+
+建议首先在 ManiSkill 上验证，不立即引入长时程任务。
+
+设置历史长度：
+
+$$
+K\in\{0,1,2,4,8\}
+$$
+
+比较：
+
+| 方法        | Actor Memory | Critic Memory |
+| --------- | -----------: | ------------: |
+| RLT       |            × |             × |
+| History-z |            ✓ |             ✓ |
+| RLT-A     |            ✓ |             × |
+| RLT-C     |            × |             ✓ |
+| RLT-AC    |            ✓ |             ✓ |
+
+其中：
+
+### RLT
+
+原始方法：
+
+$$
+\pi(z_t,a_t^{ref})
+$$
+
+### History-z
+
+将历史直接压缩进当前表示：
+
+$$
+z_t'=E(o_{t-K:t})
+$$
+
+用于验证：
+
+> 简单增加历史输入是否足够。
+
+### RLT-A
+
+只增加：
+
+$$
+m_A
+$$
+
+用于验证：
+
+> 历史行为经验是否真正帮助 Actor。
+
+### RLT-C
+
+只增加：
+
+$$
+m_C
+$$
+
+用于验证：
+
+> 历史反馈经验是否真正帮助 Critic。
+
+### RLT-AC
+
+同时使用：
+
+$$
+m_A+m_C
+$$
+
+用于验证：
+
+> Actor/Critic 双通路是否产生互补作用。
+
+---
+
+# 13. 最重要的验证指标
+
+不能只看最终 success rate。
+
+还应该验证 Memory 是否真的被使用。
+
+## 13.1 Actor Memory Effect
+
+在相似当前状态：
+
+$$
+z_t\approx z_j
+$$
+
+下，比较不同历史：
+
+$$
+m_A^{good}
+$$
+
+和：
+
+$$
+m_A^{bad}
+$$
+
+是否导致不同 action：
+
+$$
+\pi(z,m_A^{good})
+\neq
+\pi(z,m_A^{bad})
+$$
+
+如果几乎完全相同，说明 Actor 没有使用 Memory。
+
+---
+
+## 13.2 Critic Memory Effect
+
+固定：
+
+$$
+z_t,a_t
+$$
+
+改变历史反馈：
+
+$$
+m_C^{good}
+$$
+
+与：
+
+$$
+m_C^{bad}
+$$
+
+观察：
+
+$$
+Q(z,m_C^{good},a)
+$$
+
+与：
+
+$$
+Q(z,m_C^{bad},a)
+$$
+
+是否产生系统性差异。
+
+如果：
+
+$$
+Q(z,m_C^{good},a)
+\approx
+Q(z,m_C^{bad},a)
+$$
+
+说明 Critic 同样忽略了 Memory。
+
+---
+
+# 14. 最终研究假设
+
+整个方法可以归纳为两个核心假设。
+
+### 假设一：Actor Memory
+
+历史经验能够帮助 Actor 学习：
+
+$$
+\boxed{
+\text{过去有效的行为修正模式}
+}
+$$
+
+从而：
+
+$$
+\pi(a_t|z_t,m_t^A)
+$$
+
+比：
+
+$$
+\pi(a_t|z_t)
+$$
+
+更适合存在跨 chunk 行为依赖的任务。
+
+---
+
+### 假设二：Critic Memory
+
+历史反馈能够帮助 Critic 学习：
+
+$$
+\boxed{
+\text{当前决策所处的历史价值上下文}
+}
+$$
+
+从而：
+
+$$
+Q(z_t,m_t^C,a_t)
+$$
+
+比：
+
+$$
+Q(z_t,a_t)
+$$
+
+能够更准确地估计长时程任务中的 action value。
+
+---
+
+# 15. 核心思想总结
+
+最终可以将整个方法浓缩成：
+
+$$
+\boxed{
+\text{Current State}
++
+\text{Behavioral Experience}
++
+\text{Feedback Experience}
+}
+$$
+
+分别对应：
+
+$$
+\boxed{
+z_t
+}
+$$
+
+$$
+\boxed{
+m_t^A
+}
+$$
+
+$$
+\boxed{
+m_t^C
+}
+$$
+
+并形成：
+
+$$
+\boxed{
+a_t=
+\pi_\theta(z_t,m_t^A,a_t^{ref},s_t)
+}
+$$
+
+$$
+\boxed{
+Q_t=
+Q_\phi(z_t,m_t^C,a_t,s_t)
+}
+$$
+
+其中：
+
+> **Actor Memory 记住“过去什么行为有效”，Critic Memory 记住“过去行为产生了什么反馈”。**
+
+最终目标不是让 RLT 获得一个更大的历史输入，而是让历史经验成为**能够真正改变 Actor 行为和 Critic 价值判断的 RL latent representation**。
+
+因此整个扩展的核心可以概括为：
+
+$$
+\boxed{
+\text{RLT}
++
+\text{Actor Behavioral Memory}
++
+\text{Critic Feedback Memory}
+}
+$$
+
+而不是：
+
+$$
+\text{RLT}+\text{History Concatenation}
+$$
+
+也不是：
+
+$$
+\text{RLT}+\text{History-enhanced }z
+$$
+
+这一区别是该方法设计的核心。

@@ -112,6 +112,7 @@ class OpenPi0Config(Pi0Config):
     rlt_use_mask: bool = False
     rlt_return_prefix: bool = False
     rlt_loop_prefix_len: int = 64
+    rlt_recon_topk_ratio: float = 1.0
     state_indices: list[int] | None = None
 
 
@@ -622,15 +623,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
         }
         if self.config.rlt_return_prefix:
-            from rlinf.models.embodiment.modules.rlt_mem_write import pool_rlt_prefix
-
-            prefix_embs, prefix_mask = pool_rlt_prefix(
-                rlt_prefix_output,
-                rlt_mask if rlt_mask is not None else rlt_prefix_mask,
-                self.config.rlt_loop_prefix_len,
-            )
-            out["prefix_embs"] = prefix_embs.to(dtype=torch.float16)
-            out["prefix_mask"] = prefix_mask
+            out["prefix_embs"] = rlt_prefix_output.detach().to(dtype=torch.float16)
+            out["prefix_mask"] = (
+                rlt_mask if rlt_mask is not None else rlt_prefix_mask
+            ).detach()
         return out
 
     def prepare_dagger_sft_batch(self, batch):

@@ -24,32 +24,27 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_ac_mlp_mem"
-    logger_backends: ["tensorboard"]
+    experiment_name: "maniskill_rlt_stage2_ac_mlp_ac_mem"
+    logger_backends: ["wandb"]
 
   max_epochs: 5000
   max_steps: -1
   only_eval: False
   weight_sync_interval: 1
-  val_check_interval: 50
-  save_interval: 100
+  val_check_interval: 25
+  save_interval: 50
   resume_dir: null
   ckpt_path: null
 
 algorithm:
-  update_epoch: 1
+  update_epoch: 5
   rlt_schedule:
     enable: True
-    max_updates_per_train_step: 80
-    warmup_min_size: 2000
-    # Eval student gate only. Train collect is VLA until clone_ready; do not
-    # create a 30k-update backlog before the first online cycle.
-    warmup_post_collect_updates: 2000
-    collect_student_when_ready: True
-    student_action_ref_max: 0.03
-    student_clone_ema: 0.9
+    max_updates_per_train_step: 400
+    warmup_min_size: 10000
+    warmup_post_collect_updates: 30000
     train_every_episodes: 0
-    train_every_transitions: 16
+    train_every_transitions: 5
   group_size: 1
 
   adv_type: embodied_sac
@@ -64,15 +59,21 @@ algorithm:
   gamma: 0.99
   tau: 0.005
 
-  # Actor input is ref chunk + z + proprio. z is the stage-1 loop output.
-  # The critic reads z + proprio. Stage 2 does not reconstruct.
+  # Actor/critic memory. Separate from model.use_mem, which loops history into z.
+  ac_memory:
+    lambda_max: 0.5
+    sigma0: 1.0
+
+  # RLT actor objective: -q_weight * Q + bc_weight * BC.
   q_weight: 1.0
   bc_weight: 1.0
-  reference_dropout_prob: 0.0
+  reference_dropout_prob: 0.5
+  # Schedule for the BC/Q weights in the actor objective. Disable it to use
+  # the fixed bc_weight and q_weight above for the entire run.
   actor_weight_schedule:
     enable: True
-    warmup_updates: 4000
-    ramp_updates: 12000
+    warmup_updates: 20000
+    ramp_updates: 50000
     warmup_bc_weight: 7.0
     warmup_q_weight: 0.05
     online_bc_weight: 2.5
@@ -88,16 +89,16 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 4000
-    sample_window_size: 20000
-    max_num_samples: 20000
-    min_buffer_size: 500
+    cache_size: 10000
+    sample_window_size: 50000
+    max_num_samples: 50000
+    min_buffer_size: 1000
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
   train_actor_steps: 1000
-  critic_actor_ratio: 2
+  critic_actor_ratio: 4
   critic_subsample_size: 0
   backup_entropy: False
 
@@ -105,17 +106,13 @@ env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    total_num_envs: 32
+    total_num_envs: 64
     seed: 2026
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: False
     wrap_obs_mode: rlt_openpi_joint
-    reward_mode: success_potential
-    reward_potential:
-      coef: 1.0
-      yz_weight: 1.0
-      gamma: 0.99
+    reward_mode: only_success
     rlt_policy_switch:
       enable: True
       task_mode: full_task
@@ -128,9 +125,11 @@ env:
         near_hole_yz_margin: 1.5
         fallback_hole_radius: 0.03
       expert_takeover:
-        enable: False
-        # Collect already executes VLA until clone_ready. A second OpenPI expert
-        # would double rollout memory without helping mem.
+        enable: True
+        # Simulated real-world takeover: only request expert after the RLT actor
+        # is already in critical phase and has made no measurable insertion
+        # progress for several action chunks. Rollout still masks this during
+        # warmup, and eval disables expert completely.
         trigger_mode: stalled_progress
         gate:
           require_grasp: True
@@ -166,7 +165,7 @@ env:
         height: 384
   eval:
     rollout_epoch: 1
-    total_num_envs: 64
+    total_num_envs: 256
     seed: 2026
     auto_reset: False
     ignore_terminations: False
@@ -245,13 +244,10 @@ rollout:
     add_q_head: ${actor.model.add_q_head}
     q_head_type: ${actor.model.q_head_type}
     fixed_std: ${actor.model.fixed_std}
-    use_mem: ${actor.model.use_mem}
-    mem_ckpt: ${actor.model.mem_ckpt}
-    rlt_input_dim: ${actor.model.rlt_input_dim}
-    rlt_prefix_seq_len: ${actor.model.rlt_prefix_seq_len}
-    rlt_mlp_ratio: ${actor.model.rlt_mlp_ratio}
-    loop_num_layers: ${actor.model.loop_num_layers}
-    loop_num_heads: ${actor.model.loop_num_heads}
+    use_actor_mem: ${actor.model.use_actor_mem}
+    ac_mem_capacity: ${actor.model.ac_mem_capacity}
+    ac_mem_topk: ${actor.model.ac_mem_topk}
+    ac_mem_tau: ${actor.model.ac_mem_tau}
     is_lora: False
     lora_rank: 32
 
@@ -295,12 +291,36 @@ rollout:
       rlt_encoder_type: "append_self_attention"
       rlt_image_only: False
       rlt_use_mask: True
-      # False keeps the original single-frame encode_flat. True returns the
-      # prefix so the loaded stage-1 mem module can write z.
-      rlt_return_prefix: True
 
-  # Do not load a second OpenPI. Train collect is VLA until clone_ready.
-  expert_model: null
+  # Optional ManiSkill expert takeover model. Enable it with
+  # env.train.rlt_policy_switch.expert_takeover.enable=True. This should point
+  # to a stronger openpi_rlinf SFT checkpoint trained with the same task
+  # transforms; it predicts expert actions directly and does not use RLT tokens.
+  expert_model:
+    model_type: "openpi_rlinf"
+    model_path: "/path/to/rlt_maniskill_joint_pi05_sft_more_steps/checkpoints/global_step_<step>/actor"
+    precision: bf16
+    num_action_chunks: 10
+    action_dim: 8
+    num_steps: 5
+    add_value_head: False
+    openpi:
+      task: eval
+      config_name: "pi05_rlt_maniskill_joint"
+      num_images_in_input: 2
+      action_chunk: 10
+      action_horizon: 10
+      action_env_dim: 8
+      num_steps: 5
+      model_action_dim: 32
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 200
+      discrete_state_input: True
+      train_expert_only: False
+      add_value_head: False
+      detach_critic_input: True
+      use_rlt: False
 
   enable_torch_compile: False
   enable_cuda_graph: False
@@ -308,8 +328,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 64
-  global_batch_size: 256
+  micro_batch_size: 128
+  global_batch_size: 512
   seed: 1234
   enable_offload: False
 
@@ -327,14 +347,12 @@ actor:
     add_q_head: True
     q_head_type: "default"
     fixed_std: 0.002
-    # Load the stage-1 mem module and write z at rollout. No reconstruction.
-    use_mem: True
-    mem_ckpt: ${rollout.rlt_feature_model.model_path}
-    rlt_input_dim: ${rollout.rlt_feature_model.openpi.rlt_input_dim}
-    rlt_prefix_seq_len: ${rollout.rlt_feature_model.openpi.rlt_prefix_seq_len}
-    rlt_mlp_ratio: ${rollout.rlt_feature_model.openpi.rlt_mlp_ratio}
-    loop_num_layers: ${rollout.rlt_feature_model.openpi.rlt_num_layers}
-    loop_num_heads: ${rollout.rlt_feature_model.openpi.rlt_num_heads}
+    use_mem: False
+    use_actor_mem: True
+    use_critic_mem: True
+    ac_mem_capacity: 4096
+    ac_mem_topk: 8
+    ac_mem_tau: 0.1
     is_lora: False
     lora_rank: 32
 
