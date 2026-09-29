@@ -275,7 +275,9 @@ class RLTLoopEncoder(nn.Module):
         """Add the token mean once, then run the residual transformer stack."""
         if detach_prev:
             z_prev = z_prev.detach()
-        tokens = prefix_embs.to(dtype=z_prev.dtype)
+        compute = self.out_norm.weight
+        tokens = prefix_embs.to(device=compute.device, dtype=compute.dtype)
+        z_prev = z_prev.to(device=compute.device, dtype=compute.dtype)
         seq_len = tokens.shape[1]
         if seq_len > self.prefix_len:
             raise ValueError(
@@ -307,7 +309,7 @@ class RLTLoopEncoder(nn.Module):
                     z, tokens, mask, self.self_layers[self_index]
                 )
                 self_index += 1
-        z = self.out_norm(z)
+        z = self.out_norm(z.to(dtype=self.out_norm.weight.dtype))
         if empty is not None and empty.any():
             z = torch.where(empty.unsqueeze(-1), z_prev, z)
         return z
@@ -320,6 +322,9 @@ class RLTLoopEncoder(nn.Module):
         layer: nn.Module,
     ) -> torch.Tensor:
         """Self-attend ``[tokens; z]`` and return only the ``z`` position."""
+        weight = layer.self_norm.weight
+        tokens = tokens.to(device=weight.device, dtype=weight.dtype)
+        z = z.to(device=weight.device, dtype=weight.dtype)
         z_tok = z + self.z_pos_enc.to(device=z.device, dtype=z.dtype)
         sequence = torch.cat([tokens, z_tok.unsqueeze(1)], dim=1)
         if token_mask is None:

@@ -117,6 +117,26 @@ def test_scheme2_alternates_cross_and_self_and_returns_z():
     assert not torch.allclose(z, z_other, atol=1e-5)
 
 
+def test_scheme2_write_accepts_bf16_prefix_with_fp32_weights():
+    policy = RLTMLPPolicy(
+        z_dim=32,
+        proprio_dim=4,
+        action_dim=8,
+        num_action_chunks=2,
+        use_mem=True,
+        loop_prefix_len=8,
+        loop_num_heads=4,
+        loop_num_layers=2,
+        mem_scheme=2,
+    ).float()
+    obs = _obs(2)
+    obs["prefix_embs"] = obs["prefix_embs"].to(dtype=torch.bfloat16)
+    obs["z_prev"] = obs["z_prev"].to(dtype=torch.bfloat16)
+    z = policy._write_mem(obs)
+    assert z.shape == (2, 32)
+    assert z.dtype == torch.float32
+
+
 def test_train_loop_samples_suffix_length():
     policy = RLTMLPPolicy(
         z_dim=32,

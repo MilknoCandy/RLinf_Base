@@ -57,6 +57,7 @@ class OpenPiPytorchActionModel(nn.Module):
                 num_layers=self.rlt_cfg.rlt_num_layers,
                 num_heads=self.rlt_cfg.rlt_num_heads,
                 mlp_ratio=self.rlt_cfg.rlt_mlp_ratio,
+                mem_scheme=self.rlt_cfg.rlt_mem_scheme,
             ).to(dtype=next(self.model.parameters()).dtype)
             if int(self.rlt_cfg.rlt_mem_len_max) > 1:
                 self.mem = token_module

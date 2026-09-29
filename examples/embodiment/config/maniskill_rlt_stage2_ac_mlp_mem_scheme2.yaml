@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_ac_mlp_mem"
+    experiment_name: "maniskill_rlt_stage2_ac_mlp_mem_scheme2"
     logger_backends: ["tensorboard"]
 
   max_epochs: 5000
@@ -335,8 +335,8 @@ actor:
     rlt_mlp_ratio: ${rollout.rlt_feature_model.openpi.rlt_mlp_ratio}
     loop_num_layers: ${rollout.rlt_feature_model.openpi.rlt_num_layers}
     loop_num_heads: ${rollout.rlt_feature_model.openpi.rlt_num_heads}
-    # Must match the stage-1 mem checkpoint. 1 is cross-attn, 2 is cross then self.
-    mem_scheme: 1
+    # Must match the stage-1 scheme-2 checkpoint.
+    mem_scheme: 2
     is_lora: False
     lora_rank: 32
 

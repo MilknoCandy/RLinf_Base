@@ -236,3 +236,38 @@ def test_reconstruct_detaches_targets_but_trains_encoder_and_decoder():
     )
     assert encoder_grad_norm > 0
     assert decoder_grad_norm > 0
+
+
+def test_fp32_cross_attention_accepts_bf16_prefix():
+    model = _make_model().float()
+    prefix = torch.randn(2, model.prefix_seq_len, model.input_dim, dtype=torch.bfloat16)
+    z = model.encode(prefix, None)
+    assert z.shape == (2, 1, model.embed_dim)
+    assert z.dtype == torch.float32
+    loss, _ = model.loss(prefix)
+    loss.backward()
+    assert model.encoder.out_norm.weight.grad is not None
+
+
+def test_scheme2_is_cross_then_self_and_accepts_bf16_prefix():
+    model = RLTTokenTransformer(
+        input_dim=8,
+        embed_dim=8,
+        prefix_seq_len=5,
+        num_layers=2,
+        num_heads=2,
+        dropout_rate=0.0,
+        mem_scheme=2,
+    ).float()
+    assert model.encoder.block_kinds == ("cross", "self")
+    assert len(model.encoder.layers) == 1
+    assert len(model.encoder.self_layers) == 1
+    prefix = torch.randn(2, 5, 8, dtype=torch.bfloat16)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    mask[:, -1] = False
+    z = model.encode(prefix, mask)
+    assert z.shape == (2, 1, 8)
+    assert z.dtype == torch.float32
+    loss, _ = model.loss(prefix, mask)
+    loss.backward()
+    assert model.encoder.z_pos_enc.grad is not None

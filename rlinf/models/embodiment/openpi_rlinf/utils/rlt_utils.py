@@ -71,6 +71,7 @@ class OpenPiPytorchRLTConfig:
     rlt_recon_topk_ratio: float = 1.0
     rlt_mem_len_min: int = 1
     rlt_mem_len_max: int = 1
+    rlt_mem_scheme: int = 1
 
 
 def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
@@ -106,6 +107,9 @@ def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
         ),
         rlt_mem_len_max=int(
             OmegaConf.select(model_cfg, "rlt_mem_len_max", default=1)
+        ),
+        rlt_mem_scheme=int(
+            OmegaConf.select(model_cfg, "rlt_mem_scheme", default=1)
         ),
     )
 

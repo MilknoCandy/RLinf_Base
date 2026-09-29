@@ -20,7 +20,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage1_mem_sft_openpi_pi05"
+    experiment_name: "maniskill_rlt_stage1_mem_scheme1_sft_openpi_pi05"
     logger_backends: ["wandb"]
 
   max_epochs: -1
@@ -81,7 +81,7 @@ actor:
       rlt_mem_len_min: 0
       rlt_mem_len_max: 10
       rlt_mem_stride: null
-      # 1: cross-attn stack. 2: cross-attn then self-attn. See the scheme yamls.
+      # Scheme 1: every block is residual cross-attention plus a feed-forward.
       rlt_mem_scheme: 1
 
     openpi_data:

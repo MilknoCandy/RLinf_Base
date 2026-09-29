@@ -144,8 +144,17 @@ class RLTCrossAttentionLayer(nn.Module):
         tokens: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run one Pre-LN cross-attention block. ``query`` is ``[B, D]``."""
-        residual = query.unsqueeze(1)
+        """Run one Pre-LN cross-attention block. ``query`` is ``[B, D]``.
+
+        VLM prefix activations are often bf16 while this block stays fp32.
+        LayerNorm and the following linear / attention kernels require the
+        activation dtype to match the parameter dtype.
+        """
+        weight = self.q_norm.weight
+        residual = query.unsqueeze(1).to(device=weight.device, dtype=weight.dtype)
+        tokens = tokens.to(device=weight.device, dtype=weight.dtype)
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.to(device=residual.device)
         attn_out = self.attn(
             self.q_norm(residual),
             self.kv_norm(tokens),
@@ -268,12 +277,13 @@ class RLTTokenEncoder(nn.Module):
 
 
 class RLTCrossAttentionEncoder(nn.Module):
-    """Compress a token window with a Pre-LN cross-attention transformer.
+    """Compress a token window with a Pre-LN transformer.
 
-    ``z + mean(tokens)`` is the input of the first block only. Every block is
-    the same residual cross-attention plus feed-forward. Later blocks read
-    the residual ``z`` and do not add the mean again. Token positions stay
-    fixed as the attention memory.
+    ``z + mean(tokens)`` is the input of the first block only. Later blocks
+    read the residual ``z`` and do not add the mean again. Scheme 1 repeats
+    residual cross-attention plus a feed-forward. Scheme 2 alternates that
+    cross block with a self-attention block on ``[tokens; z]`` and returns
+    only ``z``. Token positions stay fixed as the attention memory.
     """
 
     def __init__(
@@ -286,16 +296,29 @@ class RLTCrossAttentionEncoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout_rate: float = 0.0,
+        mem_scheme: int = 1,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
         self.prefix_seq_len = int(prefix_seq_len)
+        self.mem_scheme = int(mem_scheme)
         heads = int(num_heads)
+        depth = int(num_layers)
         if self.embed_dim % heads != 0:
             raise ValueError(
                 f"embed_dim {self.embed_dim} must be divisible by num_heads {heads}."
             )
+        if self.mem_scheme not in (1, 2):
+            raise ValueError(f"mem_scheme must be 1 or 2, got {self.mem_scheme}.")
+        if self.mem_scheme == 1:
+            self.block_kinds = tuple("cross" for _ in range(depth))
+        else:
+            self.block_kinds = tuple(
+                "cross" if index % 2 == 0 else "self" for index in range(depth)
+            )
+        n_cross = self.block_kinds.count("cross")
+        n_self = self.block_kinds.count("self")
         self.input_proj = (
             nn.Linear(self.input_dim, self.embed_dim)
             if self.input_dim != self.embed_dim
@@ -305,6 +328,8 @@ class RLTCrossAttentionEncoder(nn.Module):
             sinusoidal_pe_init(self.prefix_seq_len, self.embed_dim)
         )
         self.z_init = nn.Parameter(torch.zeros(self.embed_dim))
+        # Scheme 1 keeps every cross block in ``layers`` so existing mem
+        # checkpoints still match. Scheme 2 stores the self blocks separately.
         self.layers = nn.ModuleList(
             [
                 RLTCrossAttentionLayer(
@@ -313,9 +338,22 @@ class RLTCrossAttentionEncoder(nn.Module):
                     mlp_ratio=mlp_ratio,
                     dropout_rate=dropout_rate,
                 )
-                for _ in range(int(num_layers))
+                for _ in range(n_cross)
             ]
         )
+        self.self_layers = nn.ModuleList(
+            [
+                RLTSelfAttentionLayer(
+                    self.embed_dim,
+                    num_heads=heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout_rate=dropout_rate,
+                )
+                for _ in range(n_self)
+            ]
+        )
+        if n_self:
+            self.z_pos_enc = nn.Parameter(sinusoidal_pe_init(1, self.embed_dim))
         self.out_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -326,6 +364,8 @@ class RLTCrossAttentionEncoder(nn.Module):
         extra_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del extra_tokens
+        compute = self.out_norm.weight
+        prefix_embs = prefix_embs.to(device=compute.device, dtype=compute.dtype)
         tokens = self.input_proj(prefix_embs)
         seq_len = tokens.shape[1]
         if seq_len > self.prefix_seq_len:
@@ -355,9 +395,44 @@ class RLTCrossAttentionEncoder(nn.Module):
             pooled = (tokens * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
             key_padding = ~valid
         z = z + pooled
-        for layer in self.layers:
-            z = layer(z, tokens, key_padding)
-        return self.out_norm(z).unsqueeze(1)
+        cross_index = 0
+        self_index = 0
+        for kind in self.block_kinds:
+            if kind == "cross":
+                z = self.layers[cross_index](z, tokens, key_padding)
+                cross_index += 1
+            else:
+                z = self._self_block(
+                    z, tokens, key_padding, self.self_layers[self_index]
+                )
+                self_index += 1
+        return self.out_norm(z.to(dtype=compute.dtype)).unsqueeze(1)
+
+    def _self_block(
+        self,
+        z: torch.Tensor,
+        tokens: torch.Tensor,
+        key_padding: torch.Tensor | None,
+        layer: RLTSelfAttentionLayer,
+    ) -> torch.Tensor:
+        """Self-attend ``[tokens; z]`` and return only the ``z`` position."""
+        weight = layer.self_norm.weight
+        tokens = tokens.to(device=weight.device, dtype=weight.dtype)
+        z = z.to(device=weight.device, dtype=weight.dtype)
+        z_tok = z + self.z_pos_enc.to(device=z.device, dtype=z.dtype)
+        sequence = torch.cat([tokens, z_tok.unsqueeze(1)], dim=1)
+        if key_padding is None:
+            valid = None
+        else:
+            z_valid = torch.ones(
+                key_padding.shape[0],
+                1,
+                device=key_padding.device,
+                dtype=torch.bool,
+            )
+            valid = torch.cat([~key_padding, z_valid], dim=1)
+        sequence = layer(sequence, mask=valid)
+        return sequence[:, -1]
 
 
 class RLTTokenDecoder(nn.Module):
@@ -413,6 +488,8 @@ class RLTTokenDecoder(nn.Module):
                 f"prefix_seq_len {self.prefix_seq_len}."
             )
 
+        compute = self.layers[0].self_norm.weight
+        rl_tokens = rl_tokens.to(device=compute.device, dtype=compute.dtype)
         frozen_targets = target_embeddings.detach().to(
             device=rl_tokens.device,
             dtype=rl_tokens.dtype,
@@ -470,12 +547,13 @@ class RLTTokenDecoder(nn.Module):
 
 
 class RLTTokenTransformer(nn.Module):
-    """Stage-1 loop: a multi-layer cross-attention stack compresses tokens into ``z``.
+    """Stage-1 loop: a multi-layer compressor writes tokens into ``z``.
 
-    The stack has the same depth and MLP as the RLT encoder. Training carries
-    ``z`` across a same-episode window and reconstructs only the last chunk, so
-    the decoder runs once. Stage 2 reuses this module online and does not
-    reconstruct.
+    ``mem_scheme=1`` repeats residual cross-attention plus a feed-forward.
+    ``mem_scheme=2`` alternates that cross block with a self-attention block.
+    Depth matches the RLT encoder. Training carries ``z`` across a
+    same-episode window and reconstructs only the last chunk, so the decoder
+    runs once. Stage 2 reuses this module online and does not reconstruct.
     """
 
     def __init__(
@@ -488,11 +566,13 @@ class RLTTokenTransformer(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout_rate: float = 0.0,
+        mem_scheme: int = 1,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
         self.prefix_seq_len = int(prefix_seq_len)
+        self.mem_scheme = int(mem_scheme)
 
         self.encoder = RLTCrossAttentionEncoder(
             input_dim=self.input_dim,
@@ -502,6 +582,7 @@ class RLTTokenTransformer(nn.Module):
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             dropout_rate=dropout_rate,
+            mem_scheme=self.mem_scheme,
         )
         self.decoder = RLTTokenDecoder(
             input_dim=self.input_dim,

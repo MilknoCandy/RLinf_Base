@@ -165,6 +165,7 @@ class RLTMLPPolicy(MLPPolicy):
                 num_layers=int(loop_num_layers),
                 num_heads=int(loop_num_heads),
                 mlp_ratio=float(rlt_mlp_ratio),
+                mem_scheme=int(mem_scheme),
             )
             _load_stage1_mem(self.mem, mem_ckpt)
             self.mem.requires_grad_(False)
