@@ -20,7 +20,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage1_sft_openpi_pi05"
+    experiment_name: "maniskill_rlt_stage1_mem_sft_openpi_pi05"
     logger_backends: ["wandb"]
 
   max_epochs: -1
@@ -74,11 +74,17 @@ actor:
       rlt_encoder_type: "append_self_attention"
       rlt_image_only: False
       rlt_use_mask: True
+      # Fraction of image tokens rebuilt. 1.0 keeps every image token.
+      rlt_recon_topk_ratio: 0.5
+      # mem carries z across a random suffix and reconstructs only the last
+      # chunk. Length 0 skips that row. Stride null means one action chunk.
+      rlt_mem_len_min: 0
+      rlt_mem_len_max: 10
+      rlt_mem_stride: null
 
     openpi_data:
       repo_id: "maniskill_peginsertionside_joint"
       default_prompt: "insert the peg in the hole"
-      # Optional: load norm stats from this path. If unset, use the default assets logic.
       norm_stats_path: null
 
   optim:

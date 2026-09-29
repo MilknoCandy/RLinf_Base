@@ -267,15 +267,31 @@ def _torch_loader(openpi_loader: Any) -> Any:
     return inner
 
 
+def _install_dataset(loader: Any, dataset: Any) -> None:
+    """Swap the dataset the loader will iterate.
+
+    PyTorch 2.8+ makes ``DataLoader.dataset`` read-only after ``__init__`` and
+    stores the real object on ``_dataset``. Older loaders keep a public
+    attribute.
+    """
+    if hasattr(loader, "_dataset"):
+        loader._dataset = dataset
+        return
+    loader.dataset = dataset
+
+
 def attach_rlt_chunk_window(
     data_loader: Any, *, mem_len_max: int, stride: int
 ) -> RLTChunkWindowLoader:
-    """Replace the OpenPI dataset so each sample carries a chunk window."""
+    """Wrap the OpenPI dataset so each sample carries a chunk window."""
     torch_loader = _torch_loader(data_loader)
-    torch_loader.dataset = RLTChunkWindowDataset(
-        torch_loader.dataset,
-        mem_len_max=mem_len_max,
-        stride=stride,
+    _install_dataset(
+        torch_loader,
+        RLTChunkWindowDataset(
+            torch_loader.dataset,
+            mem_len_max=mem_len_max,
+            stride=stride,
+        ),
     )
     logger.info(
         "Stage-1 RLT SFT loads %d same-episode chunks at stride %d.",

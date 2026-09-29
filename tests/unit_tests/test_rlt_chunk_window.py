@@ -99,6 +99,38 @@ class _OpenPILoader:
         return {"name": "pi05"}
 
 
+class _LockedTorchLoader:
+    """Matches PyTorch 2.8+, where ``dataset`` cannot be replaced."""
+
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    @property
+    def dataset(self):
+        return self._dataset
+
+    @dataset.setter
+    def dataset(self, _value):
+        raise ValueError(
+            "dataset attribute should not be set after DataLoader is initialized"
+        )
+
+    def __len__(self):
+        return 4
+
+
+def test_attach_replaces_a_read_only_dataset():
+    inner = _LockedTorchLoader(_Wrap(_Frames()))
+    mid = _OpenPITorchLoader.__new__(_OpenPITorchLoader)
+    mid._data_loader = inner
+    loader = _OpenPILoader.__new__(_OpenPILoader)
+    loader._data_loader = mid
+    attached = attach_rlt_chunk_window(loader, mem_len_max=3, stride=10)
+    assert isinstance(inner.dataset, RLTChunkWindowDataset)
+    batch = next(iter(attached))
+    np.testing.assert_array_equal(batch["rlt_hist_valid"], [True, True, True])
+
+
 def test_attach_yields_history_the_model_can_read():
     loader = attach_rlt_chunk_window(
         _OpenPILoader(_Wrap(_Frames())), mem_len_max=3, stride=10
