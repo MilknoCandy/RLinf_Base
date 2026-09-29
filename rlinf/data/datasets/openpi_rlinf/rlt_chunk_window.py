@@ -267,17 +267,28 @@ def _torch_loader(openpi_loader: Any) -> Any:
     return inner
 
 
-def _install_dataset(loader: Any, dataset: Any) -> None:
-    """Swap the dataset the loader will iterate.
-
-    PyTorch 2.8+ makes ``DataLoader.dataset`` read-only after ``__init__`` and
-    stores the real object on ``_dataset``. Older loaders keep a public
-    attribute.
-    """
-    if hasattr(loader, "_dataset"):
-        loader._dataset = dataset
-        return
-    loader.dataset = dataset
+def _clone_dataloader(loader: torch.utils.data.DataLoader, dataset: Any) -> Any:
+    """Build a new loader. ``DataLoader.dataset`` cannot be replaced after init."""
+    kwargs: dict[str, Any] = {
+        "num_workers": loader.num_workers,
+        "collate_fn": loader.collate_fn,
+        "pin_memory": loader.pin_memory,
+        "timeout": loader.timeout,
+        "worker_init_fn": loader.worker_init_fn,
+        "multiprocessing_context": loader.multiprocessing_context,
+        "generator": loader.generator,
+        "persistent_workers": loader.persistent_workers,
+        "pin_memory_device": loader.pin_memory_device,
+    }
+    if loader.num_workers > 0:
+        kwargs["prefetch_factor"] = loader.prefetch_factor
+    if hasattr(loader, "in_order"):
+        kwargs["in_order"] = loader.in_order
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_sampler=loader.batch_sampler,
+        **kwargs,
+    )
 
 
 def attach_rlt_chunk_window(
@@ -285,14 +296,18 @@ def attach_rlt_chunk_window(
 ) -> RLTChunkWindowLoader:
     """Wrap the OpenPI dataset so each sample carries a chunk window."""
     torch_loader = _torch_loader(data_loader)
-    _install_dataset(
-        torch_loader,
-        RLTChunkWindowDataset(
-            torch_loader.dataset,
-            mem_len_max=mem_len_max,
-            stride=stride,
-        ),
+    wrapped = RLTChunkWindowDataset(
+        torch_loader.dataset,
+        mem_len_max=mem_len_max,
+        stride=stride,
     )
+    if isinstance(torch_loader, torch.utils.data.DataLoader):
+        # The guard in DataLoader.__setattr__ rejects assigning ``dataset``.
+        data_loader._data_loader._data_loader = _clone_dataloader(
+            torch_loader, wrapped
+        )
+    else:
+        torch_loader.dataset = wrapped
     logger.info(
         "Stage-1 RLT SFT loads %d same-episode chunks at stride %d.",
         int(mem_len_max),

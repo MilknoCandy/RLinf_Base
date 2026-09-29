@@ -99,36 +99,31 @@ class _OpenPILoader:
         return {"name": "pi05"}
 
 
-class _LockedTorchLoader:
-    """Matches PyTorch 2.8+, where ``dataset`` cannot be replaced."""
+class _YieldingLoader:
+    def __init__(self, loader):
+        self._data_loader = loader
 
-    def __init__(self, dataset):
-        self._dataset = dataset
-
-    @property
-    def dataset(self):
-        return self._dataset
-
-    @dataset.setter
-    def dataset(self, _value):
-        raise ValueError(
-            "dataset attribute should not be set after DataLoader is initialized"
-        )
-
-    def __len__(self):
-        return 4
+    def __iter__(self):
+        yield from self._data_loader
 
 
-def test_attach_replaces_a_read_only_dataset():
-    inner = _LockedTorchLoader(_Wrap(_Frames()))
-    mid = _OpenPITorchLoader.__new__(_OpenPITorchLoader)
-    mid._data_loader = inner
-    loader = _OpenPILoader.__new__(_OpenPILoader)
-    loader._data_loader = mid
-    attached = attach_rlt_chunk_window(loader, mem_len_max=3, stride=10)
-    assert isinstance(inner.dataset, RLTChunkWindowDataset)
+def test_attach_rebuilds_a_real_dataloader():
+    frames = _Wrap(_Frames())
+    inner = torch.utils.data.DataLoader(frames, batch_size=1, shuffle=False)
+    try:
+        inner.dataset = frames
+        raise AssertionError("DataLoader.dataset should be frozen after init")
+    except ValueError as exc:
+        assert "should not be set after" in str(exc)
+    outer = _OpenPILoader.__new__(_OpenPILoader)
+    outer._data_loader = _YieldingLoader(inner)
+    attached = attach_rlt_chunk_window(outer, mem_len_max=3, stride=10)
+    rebuilt = outer._data_loader._data_loader
+    assert rebuilt is not inner
+    assert isinstance(rebuilt.dataset, RLTChunkWindowDataset)
     batch = next(iter(attached))
-    np.testing.assert_array_equal(batch["rlt_hist_valid"], [True, True, True])
+    assert "rlt_hist" in batch
+    assert "rlt_hist" not in batch["observation"]
 
 
 def test_attach_yields_history_the_model_can_read():
