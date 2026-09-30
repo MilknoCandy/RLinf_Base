@@ -35,6 +35,8 @@ class MLPPolicy(nn.Module, BasePolicy):
         q_head_type="default",
         value_granularity="action_level",
         critic_obs_dim=None,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 3,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -47,6 +49,14 @@ class MLPPolicy(nn.Module, BasePolicy):
         self.final_tanh = False
         activation = "tanh"
         action_scale = None
+        hidden_dim = int(hidden_dim)
+        num_hidden_layers = int(num_hidden_layers)
+        if hidden_dim < 1 or num_hidden_layers < 1:
+            raise ValueError(
+                "hidden_dim and num_hidden_layers must be positive, got "
+                f"{hidden_dim} and {num_hidden_layers}."
+            )
+        hidden_dims = [hidden_dim] * num_hidden_layers
 
         self.value_granularity = value_granularity
 
@@ -58,7 +68,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         if add_value_head:
             self.value_head = ValueHead(
                 obs_dim,
-                hidden_sizes=(256, 256, 256),
+                hidden_sizes=tuple(hidden_dims),
                 activation=activation,
                 output_dim=output_dim,
             )
@@ -70,7 +80,7 @@ class MLPPolicy(nn.Module, BasePolicy):
             if q_head_type == "default":
                 self.q_head = MultiQHead(
                     hidden_size=self.critic_obs_dim,
-                    hidden_dims=[256, 256, 256],
+                    hidden_dims=hidden_dims,
                     num_q_heads=2,
                     output_dim=output_dim,
                     action_feature_dim=action_dim * self.num_action_chunks,
@@ -78,7 +88,7 @@ class MLPPolicy(nn.Module, BasePolicy):
             elif q_head_type == "crossq":
                 self.q_head = MultiCrossQHead(
                     hidden_size=self.critic_obs_dim,
-                    hidden_dims=[256, 256, 256],
+                    hidden_dims=hidden_dims,
                     num_q_heads=2,
                     output_dim=output_dim,
                     action_feature_dim=action_dim * self.num_action_chunks,
@@ -88,23 +98,25 @@ class MLPPolicy(nn.Module, BasePolicy):
 
         act = get_act_func(activation)
 
-        self.backbone = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
-            act(),
-            layer_init(nn.Linear(256, 256)),
-            act(),
-            layer_init(nn.Linear(256, 256)),
-            act(),
-        )
+        backbone_layers = []
+        in_dim = obs_dim
+        for _ in range(num_hidden_layers):
+            backbone_layers.append(layer_init(nn.Linear(in_dim, hidden_dim)))
+            backbone_layers.append(act())
+            in_dim = hidden_dim
+        self.backbone = nn.Sequential(*backbone_layers)
         self.actor_mean = layer_init(
-            nn.Linear(256, self.num_action_chunks * action_dim), std=0.01 * np.sqrt(2)
+            nn.Linear(hidden_dim, self.num_action_chunks * action_dim),
+            std=0.01 * np.sqrt(2),
         )
         if self.independent_std:
             self.actor_logstd = nn.Parameter(
                 torch.ones(1, self.num_action_chunks * action_dim) * -0.5
             )
         else:
-            self.actor_logstd = nn.Linear(256, self.num_action_chunks * action_dim)
+            self.actor_logstd = nn.Linear(
+                hidden_dim, self.num_action_chunks * action_dim
+            )
 
         if action_scale is not None:
             l, h = action_scale

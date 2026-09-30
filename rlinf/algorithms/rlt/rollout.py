@@ -18,12 +18,7 @@ import numpy as np
 import torch
 
 from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
-from rlinf.algorithms.rlt.transition import (
-    RLT_MEM_OBS_KEYS,
-    RLT_OBS_KEYS,
-    RLT_PREFIX_OBS_KEYS,
-    RLT_TRANSITION_PREFIX,
-)
+from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
 
 
 def _append_rlt_transition_obs(
@@ -38,16 +33,6 @@ def _append_rlt_transition_obs(
         transition_obs = feature_model.extract_rlt_obs(final_obs)
     for key in RLT_OBS_KEYS:
         result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[key]
-    for key in RLT_PREFIX_OBS_KEYS:
-        if key in transition_obs:
-            result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = transition_obs[
-                key
-            ]
-    for key in RLT_MEM_OBS_KEYS:
-        if key in result["forward_inputs"]:
-            result["forward_inputs"][f"{RLT_TRANSITION_PREFIX}{key}"] = result[
-                "forward_inputs"
-            ][key]
 
 
 def predict_rlt_actions(
@@ -62,12 +47,7 @@ def predict_rlt_actions(
     rlt_switch_flags: torch.Tensor | None = None,
     intervene_requested: torch.Tensor | None = None,
     expert_model: Any | None = None,
-    dones: torch.Tensor | None = None,
-    rewards: torch.Tensor | None = None,
-    success: torch.Tensor | None = None,
-    env_infos: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    del success, env_infos
     with torch.no_grad():
         rlt_obs = feature_model.extract_rlt_obs(env_obs)
         if "ref_chunk" not in rlt_obs or "z_rl" not in rlt_obs:
@@ -79,8 +59,6 @@ def predict_rlt_actions(
             env_obs=rlt_obs,
             mode=mode,
             return_obs=True,
-            dones=dones,
-            rewards=rewards,
         )
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
@@ -89,11 +67,6 @@ def predict_rlt_actions(
             result.get("forward_inputs"), dict
         ):
             result["forward_inputs"]["rlt_switch_flags"] = rlt_switch_flags
-
-        clone_ready = True
-        is_ready = getattr(policy_model, "is_student_clone_ready", None)
-        if callable(is_ready):
-            clone_ready = bool(is_ready())
 
         route_output = rlt_route.route(
             RLTRouteContext(
@@ -106,14 +79,10 @@ def predict_rlt_actions(
                 intervene_requested=intervene_requested,
                 expert_model=expert_model,
                 version=version,
-                clone_ready=clone_ready,
             )
         )
         actions = route_output.actions
         result = route_output.result
-        commit = getattr(policy_model, "commit_rollout_action", None)
-        if callable(commit):
-            commit(actions)
 
         _append_rlt_transition_obs(
             feature_model=feature_model,

@@ -20,30 +20,7 @@ from rlinf.envs import SupportedEnvType
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
-# Current-frame I_t from the frozen VLA. Training also stores a same-episode
-# window so the encoder can be unrolled; rollout still carries z on the policy.
-RLT_PREFIX_OBS_KEYS = ("prefix_embs", "prefix_mask", "recon_mask")
-RLT_MEM_OBS_KEYS = ("z_prev", "prev_action", "prev_reward")
-RLT_HIST_OBS_KEYS = (
-    "hist_prefix_embs",
-    "hist_prefix_mask",
-    "hist_action",
-    "hist_reward",
-    "hist_ref",
-    "hist_valid",
-    "hist_recon_mask",
-)
 RLT_TRANSITION_PREFIX = "rlt_transition_"
-
-
-def _obs_keys_from_forward_inputs(
-    forward_inputs: dict[str, Any], prefix: str
-) -> tuple[str, ...]:
-    keys = list(RLT_OBS_KEYS)
-    for key in (*RLT_PREFIX_OBS_KEYS, *RLT_MEM_OBS_KEYS, *RLT_HIST_OBS_KEYS):
-        if f"{prefix}{key}" in forward_inputs:
-            keys.append(key)
-    return tuple(keys)
 
 
 def use_simulator_transition_replay(cfg: Any) -> bool:
@@ -57,6 +34,7 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
             SupportedEnvType.MANISKILL_RLT,
             SupportedEnvType.ISAACLAB_RLT,
             SupportedEnvType.CALVIN_RLT,
+            SupportedEnvType.LIBERO,
         }
     except ValueError:
         return False
@@ -68,11 +46,8 @@ def extract_rlt_obs_from_forward_inputs(
     transition: bool = False,
 ) -> dict[str, Any]:
     prefix = RLT_TRANSITION_PREFIX if transition else ""
-    obs_keys = _obs_keys_from_forward_inputs(forward_inputs, prefix)
     missing = [
-        f"{prefix}{key}"
-        for key in RLT_OBS_KEYS
-        if f"{prefix}{key}" not in forward_inputs
+        f"{prefix}{key}" for key in RLT_OBS_KEYS if f"{prefix}{key}" not in forward_inputs
     ]
     if missing:
         raise ValueError(
@@ -80,7 +55,7 @@ def extract_rlt_obs_from_forward_inputs(
             "rollout.rlt_feature_model is configured and the rollout worker "
             "populates RLT features."
         )
-    out = {key: forward_inputs[f"{prefix}{key}"] for key in obs_keys}
+    out = {key: forward_inputs[f"{prefix}{key}"] for key in RLT_OBS_KEYS}
     return copy_dict_tensor(out)
 
 

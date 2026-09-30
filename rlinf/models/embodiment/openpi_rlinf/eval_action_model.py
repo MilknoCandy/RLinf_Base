@@ -416,25 +416,10 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             "ref_chunk": ref_chunk.to(
                 device=rlt_prefix_output.device, dtype=torch.float32
             ),
-            "z_rl": (
-                torch.zeros(
-                    rlt_prefix_output.shape[0],
-                    int(self.rlt_cfg.rlt_embed_dim),
-                    device=rlt_prefix_output.device,
-                    dtype=torch.float32,
-                )
-                if self.rlt_cfg.rlt_return_prefix
-                else self._encode_rlt_flat(
-                    rlt_prefix_output, rlt_prefix_mask
-                ).to(dtype=torch.float32)
-            ),
+            "z_rl": self._encode_rlt_flat(
+                rlt_prefix_output, rlt_prefix_mask
+            ).to(dtype=torch.float32),
         }
-        if self.rlt_cfg.rlt_return_prefix:
-            rlt_mask = rlt_prefix_mask if self.rlt_cfg.rlt_use_mask else None
-            out["prefix_embs"] = rlt_prefix_output.detach().to(dtype=torch.float16)
-            out["prefix_mask"] = (
-                rlt_mask if rlt_mask is not None else rlt_prefix_mask
-            ).detach()
         return out
 
     def _sample_actions_from_prefix_cache(

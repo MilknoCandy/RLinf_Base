@@ -20,6 +20,7 @@ import torch
 
 from rlinf.algorithms.rlt.expert import predict_expert_actions
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.envs import SupportedEnvType
 
 
 @dataclass(kw_only=True)
@@ -34,7 +35,6 @@ class RLTRouteContext:
     expert_model: Any | None = None
     version: int = 0
     default_actor_switch: bool = False
-    clone_ready: bool = True
 
 
 @dataclass(kw_only=True)
@@ -153,32 +153,28 @@ class SimulatorRLTRoute(RLTRoute):
         *,
         use_schedule: bool,
         warmup_updates: int,
-        collect_student_when_ready: bool = False,
+        full_task: bool = False,
     ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
-        self.collect_student_when_ready = bool(collect_student_when_ready)
+        # Full-task envs have no precision-phase flag. Missing switch flags
+        # then mean the residual policy owns every chunk.
+        self.full_task = bool(full_task)
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
-
-    def _student_on(self, ctx: RLTRouteContext) -> bool:
-        ready_for_online = self._ready_for_online(ctx.version)
-        if ctx.mode == "train" and self.collect_student_when_ready:
-            return ready_for_online and bool(ctx.clone_ready)
-        return ready_for_online
 
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
         actions = ctx.student_actions
         result = ctx.result
         batch_size, chunk_len, action_dim = actions.shape
-        ready_for_online = self._student_on(ctx)
+        ready_for_online = self._ready_for_online(ctx.version)
 
         critical_phase = _last_info_bool(
             ctx.rlt_switch_flags,
             batch_size=batch_size,
             device=actions.device,
-            default=False,
+            default=self.full_task,
         )
         actor_switch = critical_phase
         if self.use_schedule:
@@ -258,14 +254,22 @@ class SimulatorRLTRoute(RLTRoute):
         return RLTRouteOutput(actions=routed_actions, result=result)
 
 
+def _train_env_type(cfg: Any) -> SupportedEnvType | None:
+    train_env_cfg = cfg.env.get("train", None)
+    if train_env_cfg is None:
+        return None
+    try:
+        return SupportedEnvType(train_env_cfg.get("env_type", ""))
+    except ValueError:
+        return None
+
+
 def build_rlt_route(cfg: Any) -> RLTRoute:
     if use_simulator_transition_replay(cfg):
         schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
-            collect_student_when_ready=bool(
-                schedule_cfg.get("collect_student_when_ready", False)
-            ),
+            full_task=_train_env_type(cfg) == SupportedEnvType.LIBERO,
         )
     return RealworldRLTRoute()

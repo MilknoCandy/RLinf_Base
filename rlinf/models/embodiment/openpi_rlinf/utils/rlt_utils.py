@@ -66,8 +66,6 @@ class OpenPiPytorchRLTConfig:
     rlt_mlp_ratio: float = 4.0
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
-    rlt_return_prefix: bool = False
-    rlt_loop_prefix_len: int = 64
     rlt_recon_topk_ratio: float = 1.0
     rlt_mem_len_min: int = 1
     rlt_mem_len_max: int = 1
@@ -93,12 +91,6 @@ def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
             OmegaConf.select(model_cfg, "rlt_image_only", default=True)
         ),
         rlt_use_mask=bool(OmegaConf.select(model_cfg, "rlt_use_mask", default=False)),
-        rlt_return_prefix=bool(
-            OmegaConf.select(model_cfg, "rlt_return_prefix", default=False)
-        ),
-        rlt_loop_prefix_len=int(
-            OmegaConf.select(model_cfg, "rlt_loop_prefix_len", default=64)
-        ),
         rlt_recon_topk_ratio=float(
             OmegaConf.select(model_cfg, "rlt_recon_topk_ratio", default=1.0)
         ),
