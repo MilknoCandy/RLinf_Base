@@ -171,6 +171,7 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         mlp_num_hidden_layers: int = 2,
         actor_noise_sigma: float = 0.1,
         ref_action_dropout: float = 0.0,
+        frozen_action_dims: list[int] | tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -195,6 +196,14 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
                 "ref_num_action_chunks must be >= num_action_chunks, got "
                 f"{self.ref_chunk_len} < {self.chunk_len}."
             )
+        frozen_dims = tuple(int(dim) for dim in (frozen_action_dims or []))
+        for dim in frozen_dims:
+            if dim < 0 or dim >= self.step_action_dim:
+                raise ValueError(
+                    "frozen_action_dims must index the per-step action, got "
+                    f"{dim} with action_dim={self.step_action_dim}."
+                )
+        self.frozen_action_dims = frozen_dims
 
         self.action_dim = self.step_action_dim
         self.num_action_chunks = self.chunk_len
@@ -297,7 +306,23 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             apply_action_noise=apply_action_noise,
             ref_dropout=reference_dropout_prob,
         )
+        action = self._hold_frozen_action_dims(action, obs)
         return action, torch.zeros_like(action), None
+
+    def _hold_frozen_action_dims(
+        self, actions: torch.Tensor, obs: dict
+    ) -> torch.Tensor:
+        """Keep selected per-step dims on the undropped VLA proposal."""
+        if not self.frozen_action_dims:
+            return actions
+        ref_chunk = self._get_ref_chunk(obs)
+        if ref_chunk.shape != actions.shape:
+            ref_chunk = ref_chunk.reshape_as(actions)
+        held = actions.clone()
+        step = self.step_action_dim
+        for dim in self.frozen_action_dims:
+            held[..., dim::step] = ref_chunk[..., dim::step]
+        return held
 
     def sac_q_forward(
         self,

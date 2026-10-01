@@ -393,6 +393,9 @@ class Trajectory:
     prev_logprobs: torch.Tensor = None
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
+    # Optional n-step critic targets written at RLT transition ingest.
+    n_step_returns: torch.Tensor = None
+    bootstrap_discount: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)

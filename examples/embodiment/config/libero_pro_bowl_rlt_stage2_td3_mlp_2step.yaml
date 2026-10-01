@@ -1,0 +1,11 @@
+defaults:
+  - libero_pro_bowl_rlt_stage2_td3_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "libero_pro_bowl_rlt_stage2_td3_mlp_2step"
+
+algorithm:
+  # Look ahead two action chunks when building the critic TD target.
+  n_step: 2

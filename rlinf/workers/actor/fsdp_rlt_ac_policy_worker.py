@@ -18,6 +18,7 @@ import queue
 import torch
 import torch.nn.functional as F
 
+from rlinf.algorithms.rlt.n_step import compute_n_step_chunk_target
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -267,9 +268,23 @@ class RLTACLossMixin:
                 )
                 q_next = self._min_twin_q(all_qf_next.detach())
 
-            reward_target = self._discounted_chunk_rewards(rewards)
-            reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
-            bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
+            n_step_returns = batch.get("n_step_returns")
+            stored_discount = batch.get("bootstrap_discount")
+            if (
+                isinstance(n_step_returns, torch.Tensor)
+                and isinstance(stored_discount, torch.Tensor)
+                and n_step_returns.numel() > 0
+            ):
+                reward_target = n_step_returns.to(self.torch_dtype).reshape(
+                    n_step_returns.shape[0], -1
+                )[:, :1]
+                bootstrap_discount = stored_discount.to(self.torch_dtype).reshape(
+                    stored_discount.shape[0], -1
+                )[:, :1]
+            else:
+                reward_target = self._discounted_chunk_rewards(rewards)
+                reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
+                bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
 
             if bootstrap_type == "always":
                 target_q_values = reward_target + bootstrap_discount * q_next
@@ -502,8 +517,13 @@ class RLTACReplayMixin:
         bsz = int(trajectory.actions.shape[1])
         num_rows = int(actions.shape[0])
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+        n_step = int(self.cfg.algorithm.get("n_step", 1))
+        if n_step < 1:
+            raise ValueError(f"algorithm.n_step must be >= 1, got {n_step}.")
+        gamma = float(self.cfg.algorithm.gamma)
 
         for env_idx in range(bsz):
+            env_transitions: list[Trajectory] = []
             for t in range(traj_len):
                 idx = t * bsz + env_idx
                 if idx >= num_rows:
@@ -574,13 +594,72 @@ class RLTACReplayMixin:
                     )
                 transition.next_obs = next_obs
 
-                replay_trajectories.append(transition)
+                env_transitions.append(transition)
                 if is_done:
                     completed_episodes += 1
                     if not auto_reset:
                         break
 
+            if n_step > 1:
+                env_transitions = self._apply_n_step_targets(
+                    env_transitions, n_step=n_step, gamma=gamma
+                )
+            replay_trajectories.extend(env_transitions)
+
         return replay_trajectories, completed_episodes
+
+    def _apply_n_step_targets(
+        self,
+        transitions: list[Trajectory],
+        *,
+        n_step: int,
+        gamma: float,
+    ) -> list[Trajectory]:
+        """Rewrite next_obs / done / n-step return for each contiguous episode."""
+        if not transitions:
+            return transitions
+
+        chunk_rewards = []
+        chunk_dones = []
+        for transition in transitions:
+            rewards = transition.rewards
+            if not isinstance(rewards, torch.Tensor):
+                raise ValueError("n-step targets require rewards on every transition.")
+            chunk_rewards.append(rewards)
+            done = (
+                isinstance(transition.dones, torch.Tensor)
+                and transition.dones.reshape(-1).to(torch.bool).any()
+            )
+            chunk_dones.append(bool(done))
+
+        for start in range(len(transitions)):
+            n_step_return, bootstrap_discount, bootstrap_offset, bootstrapped = (
+                compute_n_step_chunk_target(
+                    chunk_rewards[start:],
+                    chunk_dones[start:],
+                    gamma=gamma,
+                    n_step=n_step,
+                )
+            )
+            bootstrap_idx = start + bootstrap_offset
+            bootstrap_transition = transitions[bootstrap_idx]
+            transitions[start].next_obs = {
+                key: value.detach().clone()
+                for key, value in bootstrap_transition.next_obs.items()
+            }
+            window_done = not bootstrapped
+            for done_field in ("dones", "terminations", "truncations"):
+                done_value = getattr(bootstrap_transition, done_field, None)
+                if isinstance(done_value, torch.Tensor):
+                    rewritten = torch.full_like(done_value, fill_value=window_done)
+                    setattr(transitions[start], done_field, rewritten)
+            transitions[start].n_step_returns = torch.tensor(
+                [[[float(n_step_return)]]], dtype=torch.float32
+            )
+            transitions[start].bootstrap_discount = torch.tensor(
+                [[[float(bootstrap_discount)]]], dtype=torch.float32
+            )
+        return transitions
 
     def _transition_replay_metrics(
         self,
