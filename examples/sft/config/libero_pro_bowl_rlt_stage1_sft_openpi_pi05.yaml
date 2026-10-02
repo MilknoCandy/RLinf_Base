@@ -84,9 +84,9 @@ actor:
 
     openpi_data:
       # Must match pi05_libero default and Stage 2 openpi_data.repo_id.
+      # Prompts come from each demo's LeRobot task field (prompt_from_task=True).
       repo_id: "physical-intelligence/libero"
-      # Fallback only. pi05_libero reads the prompt from the dataset task.
-      default_prompt: "pick up the black bowl on the wooden cabinet and place it on the plate"
+      default_prompt: null
       norm_stats_path: null
 
   optim:

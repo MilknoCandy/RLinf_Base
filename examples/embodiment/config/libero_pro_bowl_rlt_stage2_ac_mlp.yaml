@@ -173,8 +173,9 @@ rollout:
     lora_rank: 32
     openpi_data:
       # Norm stats / repo must match Stage 1 and pi05_libero.
+      # Online prompts come from env task_descriptions, not a fixed string.
       repo_id: "physical-intelligence/libero"
-      default_prompt: "pick up the black bowl on the wooden cabinet and place it on the plate"
+      default_prompt: null
     openpi:
       task: eval
       config_name: "pi05_libero"
