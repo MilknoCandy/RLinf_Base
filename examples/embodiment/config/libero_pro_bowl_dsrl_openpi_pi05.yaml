@@ -137,7 +137,7 @@ rollout:
   collect_prev_infos: False
 
   model:
-    model_path: "/path/to/libero_pro_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
+    model_path: "/path/to/libero_spatial_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
     precision: ${actor.model.precision}
 
 actor:
@@ -150,7 +150,7 @@ actor:
 
   model:
     # Same task-specific pi0.5 as RLT stage 1. DSRL does not use the RLT token.
-    model_path: "/path/to/libero_pro_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
+    model_path: "/path/to/libero_spatial_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
     # Appendix E: original DSRL chunk-10. Bowl placing's VLA chunk is already 10.
     num_action_chunks: 10
     action_dim: 7

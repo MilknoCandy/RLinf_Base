@@ -1,0 +1,10 @@
+defaults:
+  - libero_pro_spatial_rlt_stage2_td3_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "libero_pro_spatial_rlt_stage2_td3_mlp_4step"
+
+algorithm:
+  n_step: 4

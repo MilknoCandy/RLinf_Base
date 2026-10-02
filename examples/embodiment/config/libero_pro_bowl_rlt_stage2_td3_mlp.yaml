@@ -98,8 +98,8 @@ algorithm:
 env:
   group_name: "EnvGroup"
   train:
-    # LIBERO-PRO Bowl Placing is libero_spatial task 9.
-    # Launch with LIBERO_TYPE=pro and LIBERO_PRO_PATH set.
+    # Online env is LIBERO-PRO (perturbations). Demos do not come from PRO.
+    # Bowl placing is libero_spatial task 9. Launch with LIBERO_TYPE=pro.
     # One env: one epoch is one episode. Appendix D budget is 45.
     task_id_filter: [9]
     rollout_epoch: 1
@@ -165,7 +165,8 @@ rollout:
 
   rlt_feature_model:
     model_type: "openpi_rlinf"
-    model_path: "/path/to/libero_pro_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
+    # Stage 1 checkpoint trained on standard LIBERO Spatial bowl demos.
+    model_path: "/path/to/libero_spatial_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
     precision: bf16
     num_action_chunks: 10
     action_dim: ${actor.model.action_dim}
@@ -174,7 +175,8 @@ rollout:
     is_lora: False
     lora_rank: 32
     openpi_data:
-      repo_id: "libero_pro_bowl_placing"
+      # Norm stats / repo must match Stage 1 and pi05_libero.
+      repo_id: "physical-intelligence/libero"
       default_prompt: "pick up the black bowl on the wooden cabinet and place it on the plate"
     openpi:
       task: eval

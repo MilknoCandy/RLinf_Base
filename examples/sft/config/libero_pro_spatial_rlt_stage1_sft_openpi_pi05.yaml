@@ -20,20 +20,20 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    # Stage 1 is standard LIBERO Spatial demos, not LIBERO-PRO.
-    # PRO has no demonstration corpus; it is only the Stage 2 / eval env.
-    experiment_name: "libero_spatial_bowl_rlt_stage1_sft_openpi_pi05"
+    # Stage 1 is standard LIBERO Spatial demos. LIBERO-PRO has no demo set.
+    experiment_name: "libero_spatial_rlt_stage1_sft_openpi_pi05"
     logger_backends: ["wandb"]
 
   max_epochs: -1
-  max_steps: 2000
+  # Suite demos are larger than single-task bowl; raise if the dataset is long.
+  max_steps: 10000
   val_check_interval: -1
-  save_interval: 250
+  save_interval: 500
 
 data:
   # Same LeRobot corpus used by pi05_libero / RLinf Pi05 LIBERO SFT.
   # https://huggingface.co/datasets/physical-intelligence/libero
-  # Download locally first, or pass the HF id if your LeRobot cache is set up.
+  # Covers Spatial/Object/Goal/10. Do not point this at LIBERO-PRO assets.
   train_data_paths:
     - dataset_path: "physical-intelligence/libero"
       weight: 1.0
@@ -74,7 +74,7 @@ actor:
       rlt_input_dim: 2048
       rlt_embed_dim: 2048
       rlt_prefix_seq_len: 1024
-      # BEE Appendix C: 4-layer encoder and 4-layer decoder, width 2048, 16 heads.
+      # Match Liber-Pro bowl Stage 1 width so Stage 2 heads stay compatible.
       rlt_num_layers: 4
       rlt_num_heads: 16
       rlt_mlp_ratio: 4.0
@@ -85,8 +85,8 @@ actor:
     openpi_data:
       # Must match pi05_libero default and Stage 2 openpi_data.repo_id.
       repo_id: "physical-intelligence/libero"
-      # Fallback only. pi05_libero reads the prompt from the dataset task.
-      default_prompt: "pick up the black bowl on the wooden cabinet and place it on the plate"
+      # Do not pin one bowl prompt; pi05_libero reads language from each demo.
+      default_prompt: null
       norm_stats_path: null
 
   optim:
@@ -97,8 +97,8 @@ actor:
     adam_eps: 1.0e-08
     weight_decay: 1.0e-10
     clip_grad: 1.0
-    total_training_steps: 10000
-    lr_warmup_steps: 500
+    total_training_steps: 30000
+    lr_warmup_steps: 1000
     lr_scheduler: "cosine"
     num_cycles: 0.5
     min_lr: 2.5e-6
