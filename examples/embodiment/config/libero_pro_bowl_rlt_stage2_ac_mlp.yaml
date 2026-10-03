@@ -55,6 +55,8 @@ algorithm:
   loss_type: rlt_ac
   loss_agg_func: "token-mean"
 
+  # One replay row is one action chunk. n_step=1 is the current RLT TD target.
+  n_step: 1
   agg_q: min
   actor_agg_q: q1
   enable_drq: False
@@ -95,8 +97,8 @@ algorithm:
 env:
   group_name: "EnvGroup"
   train:
-    # LIBERO-PRO Bowl Placing is libero_spatial task 9.
-    # Launch with LIBERO_TYPE=pro and LIBERO_PRO_PATH set.
+    # Online env is LIBERO-PRO (perturbations). Demos do not come from PRO.
+    # Bowl placing is libero_spatial task 9. Launch with LIBERO_TYPE=pro.
     # One env: one epoch is one episode. Appendix D budget is 45.
     task_id_filter: [9]
     rollout_epoch: 1

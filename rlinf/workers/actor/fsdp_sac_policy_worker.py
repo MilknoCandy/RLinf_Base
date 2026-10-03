@@ -798,11 +798,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
         )
 
-        # save replay buffer
-        buffer_save_path = os.path.join(
-            save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.save_checkpoint(buffer_save_path)
+        # # save replay buffer
+        # buffer_save_path = os.path.join(
+        #     save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+        # )
+        # self.replay_buffer.save_checkpoint(buffer_save_path)
+        # save replay buffer （optional: image-heavy buffers can be tens of GB)
+        if self.cfg.algorithm.replay_buffer.get("save_on_checkpoint", True):
+            buffer_save_path = os.path.join(
+                save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+            )
+            self.replay_buffer.save_checkpoint(buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
         # load model

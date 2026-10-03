@@ -305,7 +305,11 @@ class LiberoEnv(gym.Env):
                 )
                 continue
 
-            task = self.task_suite.get_task(self.task_ids[env_id])
+            # task = self.task_suite.get_task(self.task_ids[env_id])    # rlinf ver
+            tid = int(self.task_ids[env_id])
+            if tid < 0:
+                tid = self._fallback_task_id()
+            task = self.task_suite.get_task(tid)
             folder_name = task.problem_folder
             file_name = task.bddl_file
             original_path = os.path.join(bddl_root, folder_name, file_name)
@@ -590,16 +594,38 @@ class LiberoEnv(gym.Env):
         task_ids = []
         trial_ids = []
         # get task id and trial id from reset state ids
+        # Keep length == len(reset_state_ids). Eval pads unused slots with -1;
+        # dropping them shortens task_ids and crashes get_env_fn_params.
         for reset_state_id in reset_state_ids:
+            matched = False
             start_pivot = 0
             for task_id, end_pivot in enumerate(self.cumsum_trial_id_bins):
                 if reset_state_id < end_pivot and reset_state_id >= start_pivot:
                     task_ids.append(task_id)
-                    trial_ids.append(reset_state_id - start_pivot)
+                    # trial_ids.append(reset_state_id - start_pivot)
+                    trial_ids.append(int(reset_state_id - start_pivot))
+                    matched = True
                     break
                 start_pivot = end_pivot
+            if not matched:
+                task_ids.append(-1)
+                trial_ids.append(-1)
 
-        return np.array(task_ids), np.array(trial_ids)
+        # return np.array(task_ids), np.array(trial_ids)    # rlinf ver
+        return np.asarray(task_ids, dtype=np.int64), np.asarray(trial_ids, dtype=np.int64)
+
+    def _fallback_task_id(self):
+        """Pick a real suite task id for constructing idle (-1) eval env slots. """
+        valid = (
+            self.task_ids[self.task_ids >= 0]
+            if getattr(self, "task_ids", None) is not None
+            else np.arange([], dtype=np.int64)
+        )
+        if len(valid) > 0:
+            return int(valid[0])
+        if self.task_id_filter:
+            return int(self.task_id_filter[0])
+        return 0
 
     def _get_reset_states(self, env_idx):
         if env_idx is None:
@@ -619,7 +645,11 @@ class LiberoEnv(gym.Env):
             init_root = l_pro.get_libero_path("init_states")
             init_state = []
             for env_id in env_idx:
-                task = self.task_suite.get_task(self.task_ids[env_id])
+                # task = self.task_suite.get_task(self.task_ids[env_id])    # rlinf ver
+                tid = int(self.task_ids[env_id])
+                if tid < 0:
+                    tid = self._fallback_task_id()
+                task = self.task_suite.get_task(tid)
                 folder = self._pert_init_folders[env_id] or task.problem_folder
                 pert_init_path = os.path.join(init_root, folder, task.init_states_file)
                 states = None
@@ -647,7 +677,8 @@ class LiberoEnv(gym.Env):
                     if self.is_eval:
                         logger.error(msg)
                         raise RuntimeError(msg)
-                    states = self.task_suite.get_task_init_states(self.task_ids[env_id])
+                    # states = self.task_suite.get_task_init_states(self.task_ids[env_id])   # rlinf ver
+                    states = self.task_suite.get_task_init_states(tid)
                     init_path = f"<suite:{task.problem_folder}/{task.init_states_file}>"
                     used_folder = task.problem_folder
                     logger.warning(
@@ -657,6 +688,8 @@ class LiberoEnv(gym.Env):
                         len(states),
                     )
                 trial = int(self.trial_ids[env_id])
+                if trial < 0:
+                    trial = 0
                 if trial >= len(states):
                     trial = trial % len(states)
                 init_state.append(states[trial])
@@ -671,12 +704,24 @@ class LiberoEnv(gym.Env):
                     )
             return init_state
 
-        init_state = [
-            self.task_suite.get_task_init_states(self.task_ids[env_id])[
-                self.trial_ids[env_id]
-            ]
-            for env_id in env_idx
-        ]
+        # init_state = [
+        #     self.task_suite.get_task_init_states(self.task_ids[env_id])[
+        #         self.trial_ids[env_id]
+        #     ]
+        #     for env_id in env_idx
+        # ]
+        init_state = []
+        for env_id in env_idx:
+            tid = int(self.task_ids[env_id])
+            trial = int(self.trial_ids[env_id])
+            if tid < 0:
+                tid = self._fallback_task_id()
+            if trial < 0:
+                trial = 0
+            states = self.task_suite.get_task_init_states(tid)
+            if trial >= len(states):
+                trial = trial % len(states)
+            init_state.append(states[trial])
         return init_state
 
     @property
@@ -792,17 +837,28 @@ class LiberoEnv(gym.Env):
         task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
             reset_state_ids
         )
+        active_env_idx = []
         for j, env_id in enumerate(env_idx):
+            if task_ids[j] < 0:
+                self.task_ids[env_id] = -1
+                self.trial_ids[env_id] = -1
+                continue
             task_changed = self.task_ids[env_id] != task_ids[j]
             self.task_ids[env_id] = task_ids[j]
             self.trial_ids[env_id] = trial_ids[j]
+            active_env_idx.append(env_id)
             if task_changed or not self.is_eval:
                 reconfig_env_idx.append(env_id)
+        if not active_env_idx:
+            return
+        active_env_idx = np.asarray(active_env_idx, dtype=np.int64)
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
             self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
-        self.env.seed(self.seed * len(env_idx))
-        self.env.reset(id=env_idx)
+        # self.env.seed(self.seed * len(env_idx))
+        # self.env.reset(id=env_idx)
+        self.env.seed(self.seed * len(active_env_idx))
+        self.env.reset(id=active_env_idx)
         variant = os.environ.get(
             "LIBERO_TYPE",
             self.cfg.get("libero_variant", "standard")
@@ -810,8 +866,10 @@ class LiberoEnv(gym.Env):
             else "standard",
         )
         if variant != "plus":
-            init_state = self._get_reset_states(env_idx=env_idx)
-            self.env.set_init_state(init_state=init_state, id=env_idx)
+            # init_state = self._get_reset_states(env_idx=env_idx)
+            # self.env.set_init_state(init_state=init_state, id=env_idx)
+            init_state = self._get_reset_states(env_idx=active_env_idx)
+            self.env.set_init_state(init_state=init_state, id=active_env_idx)
 
     def reset(
         self,

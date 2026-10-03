@@ -41,7 +41,9 @@ data:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 8
+  # π0.5 + 4-layer/2048 RLT prefix (1024 tokens) does not fit no_shard + micro=8
+  # on 80G. Keep global 256 via accumulation: 256 / (1 * 8 GPUs) = 32 steps.
+  micro_batch_size: 1
   global_batch_size: 256
   seed: 0
 
@@ -105,8 +107,9 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
+    sharding_strategy: "full_shard"
     use_orig_params: False
+    # openpi sft_forward turns checkpointing off; do not rely on it for memory.
     gradient_checkpointing: False
     mixed_precision:
       param_dtype: bf16
