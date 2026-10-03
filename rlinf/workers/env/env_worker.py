@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.algorithms.qc import is_rlt_stage2_loss
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.schema.embodied_trajectory_builder import (
@@ -78,9 +79,9 @@ class EnvWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
-        self.enable_rlt = OmegaConf.select(
-            self.cfg, "algorithm.loss_type", default=""
-        ) in {"rlt_ac", "rlt_td3"}
+        self.enable_rlt = is_rlt_stage2_loss(
+            OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(

@@ -1,0 +1,16 @@
+defaults:
+  - libero_pro_bowl_rlt_stage2_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "libero_pro_bowl_rlt_stage2_qc"
+
+algorithm:
+  # RLT residual actor / BC / rollout stay unchanged. Only the critic
+  # bootstrap action uses Q-chunking best-of-N.
+  loss_type: rlt_qc
+  n_step: 1
+  qc_num_samples: 8
+  qc_include_ref_chunk: True
+  qc_include_actor_mean: True
