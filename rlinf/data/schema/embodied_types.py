@@ -396,6 +396,14 @@ class Trajectory:
     # Optional n-step critic targets written at RLT transition ingest.
     n_step_returns: torch.Tensor = None
     bootstrap_discount: torch.Tensor = None
+    # Optional T-SAC-style multi-chunk prefixes for Transformer critics.
+    tsac_prefix_actions: torch.Tensor = None
+    tsac_prefix_rewards: torch.Tensor = None
+    tsac_bootstrap_z: torch.Tensor = None
+    tsac_bootstrap_proprio: torch.Tensor = None
+    tsac_bootstrap_ref: torch.Tensor = None
+    tsac_chunk_done: torch.Tensor = None
+    tsac_valid_chunks: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)

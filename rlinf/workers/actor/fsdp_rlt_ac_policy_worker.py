@@ -20,6 +20,12 @@ import torch.nn.functional as F
 
 from rlinf.algorithms.rlt.n_step import compute_n_step_chunk_target
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.tsac_prefix import pack_tsac_prefix_windows
+from rlinf.models.embodiment.modules.tsac_transformer_critic import (
+    discounted_prefix_returns,
+    prefix_horizon_mask,
+    sample_tsac_horizon,
+)
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
@@ -231,8 +237,188 @@ class RLTACLossMixin:
             obs=next_obs,
         )
 
+    def _use_tsac_critic(self) -> bool:
+        return str(self.cfg.algorithm.get("q_head_type", "default")) == "tsac_transformer"
+
+    def _tsac_horizons(self) -> list[int]:
+        chunk_len = int(self.cfg.actor.model.num_action_chunks)
+        raw = self.cfg.algorithm.get("tsac_horizons", None)
+        if raw is None:
+            max_chunks = int(self.cfg.algorithm.get("tsac_max_chunks", 5))
+            return [chunk_len * (k + 1) for k in range(max_chunks)]
+        horizons = sorted(int(h) for h in raw)
+        for horizon in horizons:
+            if horizon % chunk_len != 0:
+                raise ValueError(
+                    "algorithm.tsac_horizons must be multiples of "
+                    f"num_action_chunks={chunk_len}, got {horizons}."
+                )
+        return horizons
+
+    def _forward_tsac_critic(self, batch):
+        """Multi-horizon prefix TD with gradient-level averaging."""
+        bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
+        curr_obs = batch["curr_obs"]
+        prefix_actions = batch.get("tsac_prefix_actions")
+        prefix_rewards = batch.get("tsac_prefix_rewards")
+        bootstrap_z = batch.get("tsac_bootstrap_z")
+        bootstrap_proprio = batch.get("tsac_bootstrap_proprio")
+        bootstrap_ref = batch.get("tsac_bootstrap_ref")
+        chunk_done = batch.get("tsac_chunk_done")
+        valid_chunks = batch.get("tsac_valid_chunks")
+        required = {
+            "tsac_prefix_actions": prefix_actions,
+            "tsac_prefix_rewards": prefix_rewards,
+            "tsac_bootstrap_z": bootstrap_z,
+            "tsac_bootstrap_proprio": bootstrap_proprio,
+            "tsac_bootstrap_ref": bootstrap_ref,
+            "tsac_chunk_done": chunk_done,
+            "tsac_valid_chunks": valid_chunks,
+        }
+        missing = [
+            key
+            for key, value in required.items()
+            if not isinstance(value, torch.Tensor)
+        ]
+        if missing:
+            raise ValueError(
+                "TSAC critic batch is missing prefix fields: "
+                f"{missing}. Ensure pack_tsac_prefix_windows() ran at ingest."
+            )
+
+        chunk_len, _ = self._chunk_shape()
+        horizons = self._tsac_horizons()
+        max_horizon = max(horizons)
+        gamma = float(self.cfg.algorithm.gamma)
+
+        prefix_actions = prefix_actions.to(self.torch_dtype)
+        if prefix_actions.dim() == 4:
+            # [B, 1, T, A] from transition rows -> [B, T, A]
+            prefix_actions = prefix_actions.reshape(
+                prefix_actions.shape[0], prefix_actions.shape[-2], prefix_actions.shape[-1]
+            )
+        prefix_rewards = prefix_rewards.to(dtype=torch.float32)
+        if prefix_rewards.dim() == 3:
+            prefix_rewards = prefix_rewards.reshape(
+                prefix_rewards.shape[0], prefix_rewards.shape[-1]
+            )
+        bootstrap_z = bootstrap_z.to(self.torch_dtype)
+        bootstrap_proprio = bootstrap_proprio.to(self.torch_dtype)
+        bootstrap_ref = bootstrap_ref.to(self.torch_dtype)
+        if bootstrap_z.dim() == 4:
+            bootstrap_z = bootstrap_z.reshape(
+                bootstrap_z.shape[0], bootstrap_z.shape[-2], bootstrap_z.shape[-1]
+            )
+            bootstrap_proprio = bootstrap_proprio.reshape(
+                bootstrap_proprio.shape[0],
+                bootstrap_proprio.shape[-2],
+                bootstrap_proprio.shape[-1],
+            )
+            bootstrap_ref = bootstrap_ref.reshape(
+                bootstrap_ref.shape[0],
+                bootstrap_ref.shape[-2],
+                bootstrap_ref.shape[-1],
+            )
+        chunk_done = chunk_done.to(dtype=torch.bool)
+        if chunk_done.dim() == 3:
+            chunk_done = chunk_done.reshape(chunk_done.shape[0], chunk_done.shape[-1])
+        valid_chunks = valid_chunks.to(dtype=torch.long).reshape(-1)
+        valid_steps = valid_chunks * chunk_len
+        batch_size = int(valid_steps.shape[0])
+
+        sampled_horizons = sample_tsac_horizon(horizons, valid_steps)
+        active_mask = prefix_horizon_mask(sampled_horizons, horizons)
+        reward_targets = discounted_prefix_returns(
+            prefix_rewards[:, :max_horizon], gamma=gamma, horizons=horizons
+        )
+
+        # Online prefix Q for the longest needed window in this batch.
+        forward_len = int(sampled_horizons.max().item())
+        all_q_seq = self.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=curr_obs,
+            actions=prefix_actions[:, :forward_len],
+            detach_encoder=False,
+            return_sequence=True,
+        )
+
+        # Targets [B, H, 1] and online Q [B, H, num_q] on the chunk lattice.
+        num_horizons = len(horizons)
+        targets = torch.zeros(
+            batch_size, num_horizons, 1, dtype=self.torch_dtype, device=all_q_seq.device
+        )
+        q_at_horizons = torch.zeros(
+            batch_size,
+            num_horizons,
+            all_q_seq.shape[-1],
+            dtype=all_q_seq.dtype,
+            device=all_q_seq.device,
+        )
+        horizon_metrics = {}
+        with torch.no_grad():
+            for h_idx, horizon in enumerate(horizons):
+                active = active_mask[:, h_idx]
+                if not bool(active.any()):
+                    continue
+                chunk_idx = horizon // chunk_len - 1
+                boundary_obs = {
+                    "z_rl": bootstrap_z[:, chunk_idx],
+                    "proprio": bootstrap_proprio[:, chunk_idx],
+                    "ref_chunk": bootstrap_ref[:, chunk_idx],
+                }
+                next_actions, _, _ = self._next_actions_for_critic_target(boundary_obs)
+                q_next_all = self.target_model(
+                    forward_type=ForwardType.SAC_Q,
+                    obs=boundary_obs,
+                    actions=next_actions,
+                )
+                q_next = self._min_twin_q(q_next_all)
+                done_at_boundary = chunk_done[:, chunk_idx].reshape(-1, 1)
+                if bootstrap_type == "always":
+                    bootstrap = q_next
+                elif bootstrap_type == "standard":
+                    bootstrap = (~done_at_boundary) * q_next
+                else:
+                    raise NotImplementedError(f"{bootstrap_type=} is not supported!")
+                discount = gamma**horizon
+                targets[:, h_idx, :] = (
+                    reward_targets[:, h_idx : h_idx + 1].to(self.torch_dtype)
+                    + discount * bootstrap
+                )
+                horizon_metrics[f"tsac_active_h{horizon}"] = float(
+                    active.float().mean().item()
+                )
+
+        for h_idx, horizon in enumerate(horizons):
+            q_at_horizons[:, h_idx, :] = all_q_seq[:, horizon - 1, :]
+
+        if not bool(active_mask.any()):
+            raise RuntimeError(
+                "TSAC critic produced no active horizons. Check tsac_valid_chunks "
+                f"and tsac_horizons={horizons}."
+            )
+
+        # Per-sample gradient averaging over that sample's active horizons.
+        sq_err = (q_at_horizons - targets.expand_as(q_at_horizons)).pow(2)
+        # Mean over twin Q heads, then over active horizons for each sample.
+        sq_err = sq_err.mean(dim=-1)
+        mask = active_mask.to(dtype=sq_err.dtype)
+        per_sample = (sq_err * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
+        critic_loss = per_sample.mean()
+        critic_metrics = {
+            "q_data": float(all_q_seq[:, chunk_len - 1, :].mean().item()),
+            "tsac_sampled_horizon_mean": float(sampled_horizons.float().mean().item()),
+            "tsac_active_horizon_frac": float(mask.mean().item()),
+            "tsac_batch_size": float(batch_size),
+            **horizon_metrics,
+        }
+        return critic_loss, critic_metrics
+
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
+        if self._use_tsac_critic():
+            return self._forward_tsac_critic(batch)
+
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
 
@@ -321,6 +507,8 @@ class RLTACLossMixin:
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
+        if self._use_tsac_critic() and use_crossq:
+            raise ValueError("TSAC critic cannot be combined with crossq.")
 
         curr_obs = batch["curr_obs"]
         reference_dropout_prob = float(
@@ -600,13 +788,36 @@ class RLTACReplayMixin:
                     if not auto_reset:
                         break
 
-            if n_step > 1:
+            if self._use_tsac_critic():
+                env_transitions = self._apply_tsac_prefix_windows(env_transitions)
+            elif n_step > 1:
                 env_transitions = self._apply_n_step_targets(
                     env_transitions, n_step=n_step, gamma=gamma
                 )
             replay_trajectories.extend(env_transitions)
 
         return replay_trajectories, completed_episodes
+
+    def _apply_tsac_prefix_windows(
+        self,
+        transitions: list[Trajectory],
+    ) -> list[Trajectory]:
+        """Attach multi-chunk prefixes for the T-SAC Transformer critic."""
+        chunk_len, action_dim = self._chunk_shape()
+        horizons = self._tsac_horizons()
+        max_chunks = max(h // chunk_len for h in horizons)
+        z_dim = int(self.cfg.actor.model.z_dim)
+        proprio_dim = int(self.cfg.actor.model.proprio_dim)
+        ref_dim = chunk_len * action_dim
+        return pack_tsac_prefix_windows(
+            transitions,
+            chunk_len=chunk_len,
+            action_dim=action_dim,
+            max_chunks=max_chunks,
+            z_dim=z_dim,
+            proprio_dim=proprio_dim,
+            ref_dim=ref_dim,
+        )
 
     def _apply_n_step_targets(
         self,

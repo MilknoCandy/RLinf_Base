@@ -1,0 +1,34 @@
+defaults:
+  - libero_pro_bowl_rlt_stage2_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "libero_pro_bowl_rlt_stage2_ac_tsac"
+
+algorithm:
+  # Keep n_step=1; multi-chunk credit assignment is handled by TSAC prefixes.
+  n_step: 1
+  q_head_type: tsac_transformer
+  # Control-step horizons sampled uniformly each update (chunk lattice of C=5).
+  # Drawing n=20 supervises prefixes {5,10,15,20} with gradient averaging.
+  tsac_horizons: [5, 10, 15, 20, 25]
+  tsac_max_chunks: 5
+
+rollout:
+  model:
+    q_head_type: tsac_transformer
+    tsac_d_model: ${actor.model.tsac_d_model}
+    tsac_num_layers: ${actor.model.tsac_num_layers}
+    tsac_num_heads: ${actor.model.tsac_num_heads}
+    tsac_max_action_len: ${actor.model.tsac_max_action_len}
+
+actor:
+  model:
+    q_head_type: tsac_transformer
+    # Match the existing Stage-2 MLP width so z_rl is not compressed.
+    tsac_d_model: 512
+    tsac_num_layers: 2
+    tsac_num_heads: 8
+    # max(tsac_horizons)
+    tsac_max_action_len: 25

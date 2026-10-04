@@ -38,6 +38,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             mlp_hidden_dim=cfg.get("mlp_hidden_dim", 256),
             mlp_num_hidden_layers=cfg.get("mlp_num_hidden_layers", 3),
             frozen_action_dims=cfg.get("frozen_action_dims", None),
+            tsac_d_model=cfg.get("tsac_d_model", 512),
+            tsac_num_layers=cfg.get("tsac_num_layers", 2),
+            tsac_num_heads=cfg.get("tsac_num_heads", 8),
+            tsac_max_action_len=cfg.get("tsac_max_action_len", 25),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

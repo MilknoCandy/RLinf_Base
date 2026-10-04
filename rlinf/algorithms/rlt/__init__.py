@@ -22,6 +22,7 @@ from rlinf.algorithms.rlt.route import (
     build_rlt_route,
 )
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.tsac_prefix import pack_tsac_prefix_windows
 
 __all__ = [
     "RLTRoute",
@@ -30,6 +31,7 @@ __all__ = [
     "SimulatorRLTRoute",
     "build_expert_model_config",
     "build_rlt_route",
+    "pack_tsac_prefix_windows",
     "predict_rlt_actions",
     "use_simulator_transition_replay",
 ]

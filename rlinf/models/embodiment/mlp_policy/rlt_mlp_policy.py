@@ -17,14 +17,18 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+from rlinf.models.embodiment.modules.tsac_transformer_critic import (
+    MultiTSACTransformerQHead,
+)
 
 
 class RLTMLPPolicy(MLPPolicy):
     """MLP actor-critic policy for RLT Stage 2 heads.
 
     Actor input follows RLT: reference action chunk, RL token feature, and
-    proprioceptive state. Critic input follows RLT: action chunk, RL token
-    feature, and proprioceptive state.
+    proprioceptive state. Critic input is either the default MLP over
+    ``(z_rl, proprio, action_chunk)`` or a T-SAC-style Transformer over
+    ``(z_rl, per-step actions)``.
     """
 
     def __init__(
@@ -40,6 +44,10 @@ class RLTMLPPolicy(MLPPolicy):
         mlp_hidden_dim: int = 256,
         mlp_num_hidden_layers: int = 3,
         frozen_action_dims: list[int] | tuple[int, ...] | None = None,
+        tsac_d_model: int = 512,
+        tsac_num_layers: int = 2,
+        tsac_num_heads: int = 8,
+        tsac_max_action_len: int = 25,
     ):
         if not add_q_head:
             raise ValueError(
@@ -58,21 +66,38 @@ class RLTMLPPolicy(MLPPolicy):
                 f"{ref_chunk_len} < {chunk_len}."
             )
         flat_action_dim = chunk_len * step_action_dim
+        self.q_head_type = str(q_head_type)
+        self.use_tsac_critic = self.q_head_type == "tsac_transformer"
 
         actor_obs_dim = z_dim + proprio_dim + flat_action_dim
-        critic_obs_dim = z_dim + proprio_dim
+        critic_obs_dim = z_dim if self.use_tsac_critic else z_dim + proprio_dim
 
+        parent_q_head_type = (
+            "default" if self.use_tsac_critic else self.q_head_type
+        )
         super().__init__(
             obs_dim=actor_obs_dim,
             action_dim=flat_action_dim,
             num_action_chunks=1,
             add_value_head=False,
-            add_q_head=add_q_head,
-            q_head_type=q_head_type,
+            add_q_head=True,
+            q_head_type=parent_q_head_type,
             critic_obs_dim=critic_obs_dim,
             hidden_dim=int(mlp_hidden_dim),
             num_hidden_layers=int(mlp_num_hidden_layers),
         )
+        if self.use_tsac_critic:
+            # Replace the temporary MLP twin-Q with the T-SAC Transformer.
+            self.q_head = MultiTSACTransformerQHead(
+                state_dim=z_dim,
+                action_dim=step_action_dim,
+                d_model=int(tsac_d_model),
+                num_layers=int(tsac_num_layers),
+                num_heads=int(tsac_num_heads),
+                max_action_len=int(tsac_max_action_len),
+                num_q_heads=2,
+            )
+
         frozen_dims = tuple(int(dim) for dim in (frozen_action_dims or []))
         for dim in frozen_dims:
             if dim < 0 or dim >= step_action_dim:
@@ -143,6 +168,8 @@ class RLTMLPPolicy(MLPPolicy):
         return torch.cat([ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1)
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
+        if self.use_tsac_critic:
+            return self._get_z(obs)
         return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
 
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
@@ -162,6 +189,18 @@ class RLTMLPPolicy(MLPPolicy):
         for dim in self.frozen_action_dims:
             held[..., dim::step] = ref_chunk[..., dim::step]
         return held
+
+    def _reshape_actions_for_tsac(self, actions: torch.Tensor) -> torch.Tensor:
+        if actions.dim() == 3:
+            return actions
+        flat = self._flatten_batch(actions)
+        if flat.shape[-1] % self.step_action_dim != 0:
+            raise ValueError(
+                "TSAC actions trailing dim must be divisible by action_dim, got "
+                f"{flat.shape[-1]} and action_dim={self.step_action_dim}."
+            )
+        seq_len = flat.shape[-1] // self.step_action_dim
+        return flat.reshape(flat.shape[0], seq_len, self.step_action_dim)
 
     def sac_forward(
         self,
@@ -186,12 +225,27 @@ class RLTMLPPolicy(MLPPolicy):
         action = self._hold_frozen_action_dims(action, obs)
         return action, chunk_logprobs, None
 
-    def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
+    def sac_q_forward(
+        self,
+        obs,
+        actions,
+        shared_feature=None,
+        detach_encoder=False,
+        return_sequence: bool = False,
+    ):
         del shared_feature
         critic_state = self._critic_state(obs)
         if detach_encoder:
             critic_state = critic_state.detach()
-        return self.q_head(critic_state, self._flatten_batch(actions))
+        if not self.use_tsac_critic:
+            return self.q_head(critic_state, self._flatten_batch(actions))
+
+        action_seq = self._reshape_actions_for_tsac(actions)
+        q_seq = self.q_head(critic_state, action_seq)
+        if return_sequence:
+            return q_seq
+        # Actor / single-chunk bootstrap uses the final prefix position.
+        return q_seq[:, -1, :]
 
     def crossq_q_forward(
         self,
@@ -202,6 +256,10 @@ class RLTMLPPolicy(MLPPolicy):
         shared_feature=None,
         detach_encoder=False,
     ):
+        if self.use_tsac_critic:
+            raise NotImplementedError(
+                "TSAC Transformer critic does not support crossq_q_forward."
+            )
         del shared_feature
         critic_state = self._critic_state(obs)
         next_critic_state = (
