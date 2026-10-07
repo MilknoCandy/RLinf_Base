@@ -17,9 +17,11 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
+from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.models.embodiment.modules.tsac_transformer_critic import (
     MultiTSACTransformerQHead,
 )
+from rlinf.models.embodiment.modules.value_head import ValueHead
 
 
 class RLTMLPPolicy(MLPPolicy):
@@ -48,6 +50,14 @@ class RLTMLPPolicy(MLPPolicy):
         tsac_num_layers: int = 2,
         tsac_num_heads: int = 8,
         tsac_max_action_len: int = 25,
+        action_extract: str = "sample",
+        qc_num_samples: int = 8,
+        qc_include_ref_chunk: bool = True,
+        qc_include_actor_mean: bool = True,
+        chunk_critic_steps: int | None = None,
+        scale_critic_steps: list[int] | tuple[int, ...] | None = None,
+        add_scale_value_heads: bool = False,
+        aqc_gamma: float = 0.99,
     ):
         if not add_q_head:
             raise ValueError(
@@ -115,6 +125,87 @@ class RLTMLPPolicy(MLPPolicy):
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+
+        extract = str(action_extract).lower()
+        if extract not in {"sample", "best_of_n", "adaptive"}:
+            raise ValueError(
+                "action_extract must be sample, best_of_n, or adaptive, "
+                f"got {action_extract!r}."
+            )
+        self.action_extract = extract
+        self.qc_num_samples = int(qc_num_samples)
+        self.qc_include_ref_chunk = bool(qc_include_ref_chunk)
+        self.qc_include_actor_mean = bool(qc_include_actor_mean)
+        self.aqc_gamma = float(aqc_gamma)
+        hidden_dims = [int(mlp_hidden_dim)] * int(mlp_num_hidden_layers)
+
+        self.chunk_critic_steps = (
+            None if chunk_critic_steps is None else int(chunk_critic_steps)
+        )
+        if self.chunk_critic_steps is not None:
+            if self.chunk_critic_steps < chunk_len:
+                raise ValueError(
+                    "chunk_critic_steps must be >= num_action_chunks, got "
+                    f"{self.chunk_critic_steps} < {chunk_len}."
+                )
+            self.chunk_q_head = MultiQHead(
+                hidden_size=critic_obs_dim,
+                hidden_dims=hidden_dims,
+                num_q_heads=2,
+                output_dim=1,
+                action_feature_dim=self.chunk_critic_steps * step_action_dim,
+            )
+            self.q_head_v = ValueHead(
+                critic_obs_dim,
+                hidden_sizes=tuple(hidden_dims),
+                activation="tanh",
+                output_dim=1,
+            )
+
+        raw_scales = [] if scale_critic_steps is None else list(scale_critic_steps)
+        scales = sorted({int(step) for step in raw_scales})
+        for step in scales:
+            if step < 1 or step > chunk_len:
+                raise ValueError(
+                    "scale_critic_steps must be in [1, num_action_chunks], "
+                    f"got {scales} with chunk_len={chunk_len}."
+                )
+        if chunk_len not in scales:
+            scales.append(chunk_len)
+            scales = sorted(set(scales))
+        self.scale_critic_steps = tuple(scales)
+        self.add_scale_value_heads = bool(add_scale_value_heads) or extract == "adaptive"
+        if self.add_scale_value_heads or len(self.scale_critic_steps) > 1:
+            self.scale_q_heads = torch.nn.ModuleDict()
+            self.q_head_v_scale = torch.nn.ModuleDict()
+            for step in self.scale_critic_steps:
+                key = str(step)
+                if step == chunk_len:
+                    continue
+                self.scale_q_heads[key] = MultiQHead(
+                    hidden_size=critic_obs_dim,
+                    hidden_dims=hidden_dims,
+                    num_q_heads=2,
+                    output_dim=1,
+                    action_feature_dim=step * step_action_dim,
+                )
+                if self.add_scale_value_heads:
+                    self.q_head_v_scale[key] = ValueHead(
+                        critic_obs_dim,
+                        hidden_sizes=tuple(hidden_dims),
+                        activation="tanh",
+                        output_dim=1,
+                    )
+            if self.add_scale_value_heads:
+                self.q_head_v_scale[str(chunk_len)] = ValueHead(
+                    critic_obs_dim,
+                    hidden_sizes=tuple(hidden_dims),
+                    activation="tanh",
+                    output_dim=1,
+                )
+        else:
+            self.scale_q_heads = torch.nn.ModuleDict()
+            self.q_head_v_scale = torch.nn.ModuleDict()
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -225,6 +316,173 @@ class RLTMLPPolicy(MLPPolicy):
         action = self._hold_frozen_action_dims(action, obs)
         return action, chunk_logprobs, None
 
+    def _min_twin_q(self, all_q_values: torch.Tensor) -> torch.Tensor:
+        return torch.minimum(all_q_values[..., 0:1], all_q_values[..., 1:2])
+
+    def chunk_q_forward(self, obs, actions, detach_encoder: bool = False):
+        if not hasattr(self, "chunk_q_head"):
+            raise RuntimeError("chunk_q_head is not configured on this policy.")
+        critic_state = self._critic_state(obs)
+        if detach_encoder:
+            critic_state = critic_state.detach()
+        flat = self._flatten_batch(actions)
+        expected = int(self.chunk_critic_steps) * self.step_action_dim
+        if flat.shape[-1] != expected:
+            raise ValueError(
+                "chunk critic action dim mismatch: expected "
+                f"{expected}, got {tuple(flat.shape)}."
+            )
+        return self.chunk_q_head(critic_state, flat)
+
+    def scale_q_forward(self, obs, actions, horizon: int, detach_encoder: bool = False):
+        critic_state = self._critic_state(obs)
+        if detach_encoder:
+            critic_state = critic_state.detach()
+        prefix = self._flatten_batch(actions)
+        expected = int(horizon) * self.step_action_dim
+        if prefix.shape[-1] < expected:
+            raise ValueError(
+                f"scale critic {horizon} needs {expected} action dims, "
+                f"got {tuple(prefix.shape)}."
+            )
+        prefix = prefix[..., :expected]
+        if int(horizon) == self.chunk_len:
+            return self.q_head(critic_state, prefix)
+        key = str(int(horizon))
+        if key not in self.scale_q_heads:
+            raise KeyError(f"No scale Q head for horizon={horizon}.")
+        return self.scale_q_heads[key](critic_state, prefix)
+
+    def scale_v_forward(self, obs, horizon: int, detach_encoder: bool = False):
+        critic_state = self._critic_state(obs)
+        if detach_encoder:
+            critic_state = critic_state.detach()
+        key = str(int(horizon))
+        if key in self.q_head_v_scale:
+            return self.q_head_v_scale[key](critic_state)
+        if hasattr(self, "q_head_v"):
+            return self.q_head_v(critic_state)
+        raise KeyError(f"No value head for horizon={horizon}.")
+
+    def _gather_extract_candidates(self, obs, *, num_samples: int) -> torch.Tensor:
+        from rlinf.algorithms.qc.best_of_n import (
+            flatten_chunk_actions,
+            stack_action_candidates,
+        )
+
+        parts: list[torch.Tensor] = []
+        if self.qc_include_ref_chunk:
+            parts.append(
+                flatten_chunk_actions(
+                    self._get_ref_chunk(obs),
+                    chunk_len=self.chunk_len,
+                    action_dim=self.step_action_dim,
+                )
+            )
+        mean_actions, _, _ = self.sac_forward(obs, deterministic=True)
+        if self.qc_include_actor_mean:
+            parts.append(
+                flatten_chunk_actions(
+                    mean_actions,
+                    chunk_len=self.chunk_len,
+                    action_dim=self.step_action_dim,
+                )
+            )
+        if num_samples > 0:
+            from rlinf.algorithms.qc.best_of_n import repeat_obs
+
+            batch = int(mean_actions.shape[0])
+            expanded = repeat_obs(obs, num_samples)
+            sampled, _, _ = self.sac_forward(expanded, deterministic=False)
+            flat = flatten_chunk_actions(
+                sampled,
+                chunk_len=self.chunk_len,
+                action_dim=self.step_action_dim,
+            )
+            parts.append(flat.reshape(batch, num_samples, -1))
+        if not parts:
+            raise ValueError("Best-of-N extraction needs at least one candidate.")
+        return stack_action_candidates(parts)
+
+    def _best_of_n_actions(self, obs) -> tuple[torch.Tensor, dict[str, float]]:
+        from rlinf.algorithms.qc.best_of_n import select_best_of_n_actions
+
+        candidates = self._gather_extract_candidates(
+            obs, num_samples=self.qc_num_samples
+        )
+        batch, num_candidates, _ = candidates.shape
+        expanded = {}
+        for key, value in obs.items():
+            if not torch.is_tensor(value):
+                expanded[key] = value
+                continue
+            expanded[key] = (
+                value.unsqueeze(1)
+                .expand(value.shape[0], num_candidates, *value.shape[1:])
+                .reshape(batch * num_candidates, *value.shape[1:])
+            )
+        all_q = self.sac_q_forward(
+            expanded, candidates.reshape(batch * num_candidates, -1)
+        )
+        q_values = self._min_twin_q(all_q).reshape(batch, num_candidates)
+        best, indices = select_best_of_n_actions(q_values, candidates)
+        metrics = {
+            "qc/num_candidates": float(num_candidates),
+            "qc/q_best_mean": q_values.max(dim=-1).values.mean().item(),
+        }
+        return best, metrics
+
+    def _adaptive_actions(self, obs) -> tuple[torch.Tensor, dict[str, float]]:
+        from rlinf.algorithms.qc.adaptive import (
+            discount_normalized_advantage,
+            select_adaptive_chunk,
+            zscore,
+        )
+
+        candidates = self._gather_extract_candidates(
+            obs, num_samples=self.qc_num_samples
+        )
+        batch, num_candidates, _ = candidates.shape
+        horizons = self.scale_critic_steps
+        scores = []
+        with torch.no_grad():
+            for horizon in horizons:
+                prefix = candidates[..., : horizon * self.step_action_dim]
+                expanded = {}
+                for key, value in obs.items():
+                    if not torch.is_tensor(value):
+                        expanded[key] = value
+                        continue
+                    expanded[key] = (
+                        value.unsqueeze(1)
+                        .expand(value.shape[0], num_candidates, *value.shape[1:])
+                        .reshape(batch * num_candidates, *value.shape[1:])
+                    )
+                q_all = self.scale_q_forward(
+                    expanded, prefix.reshape(batch * num_candidates, -1), horizon
+                )
+                q = self._min_twin_q(q_all).reshape(batch, num_candidates)
+                v = self.scale_v_forward(obs, horizon).reshape(batch, 1)
+                adv = discount_normalized_advantage(
+                    q, v, gamma=self.aqc_gamma, horizon=horizon
+                )
+                scores.append(zscore(adv, dim=-1))
+        score_stack = torch.stack(scores, dim=-1)
+        sample_idx, horizon_idx = select_adaptive_chunk(score_stack)
+        rows = torch.arange(batch, device=candidates.device)
+        best = candidates[rows, sample_idx]
+        chosen_h = torch.as_tensor(
+            horizons, device=candidates.device, dtype=torch.long
+        )[horizon_idx]
+        metrics = {
+            "aqc/num_candidates": float(num_candidates),
+            "aqc/chosen_horizon_mean": chosen_h.float().mean().item(),
+            "aqc/chosen_full_chunk_rate": (
+                (chosen_h == self.chunk_len).float().mean().item()
+            ),
+        }
+        return best, metrics
+
     def sac_q_forward(
         self,
         obs,
@@ -302,9 +560,21 @@ class RLTMLPPolicy(MLPPolicy):
     ):
         del calculate_logprobs, calculate_values, kwargs
         obs = self.preprocess_env_obs(env_obs=env_obs)
-        action, chunk_logprobs, _ = self.sac_forward(
-            obs, deterministic=(mode == "eval")
-        )
+        extract_metrics: dict[str, float] = {}
+        if self.action_extract == "best_of_n":
+            action, extract_metrics = self._best_of_n_actions(obs)
+            _, chunk_logprobs, _ = self.sac_forward(
+                obs, deterministic=(mode == "eval")
+            )
+        elif self.action_extract == "adaptive":
+            action, extract_metrics = self._adaptive_actions(obs)
+            _, chunk_logprobs, _ = self.sac_forward(
+                obs, deterministic=(mode == "eval")
+            )
+        else:
+            action, chunk_logprobs, _ = self.sac_forward(
+                obs, deterministic=(mode == "eval")
+            )
         chunk_actions = self._format_chunk_actions(action)
 
         forward_inputs = {"action": action, "model_action": action}
@@ -316,4 +586,6 @@ class RLTMLPPolicy(MLPPolicy):
             "prev_values": torch.zeros_like(chunk_logprobs[..., :1]),
             "forward_inputs": forward_inputs,
         }
+        if extract_metrics:
+            result["qc_extract_metrics"] = extract_metrics
         return chunk_actions, result

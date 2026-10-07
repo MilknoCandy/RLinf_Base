@@ -82,6 +82,8 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         # openpi.transforms pipeline state (installed by :meth:`setup_wrappers`).
         self._input_transform_fn = None
         self._output_transform_fn = None
+        self._phase_yes_ids: torch.Tensor | None = None
+        self._phase_no_ids: torch.Tensor | None = None
 
     # -------------------------------------------------------- transforms glue
 
@@ -421,6 +423,84 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             ).to(dtype=torch.float32),
         }
         return out
+
+    def _task_prompt_list(self, env_obs: dict[str, Any]) -> list[str]:
+        tasks = env_obs["task_descriptions"]
+        if isinstance(tasks, np.ndarray):
+            tasks = tasks.tolist()
+        return [str(task) for task in tasks]
+
+    def _replace_task_descriptions(
+        self, env_obs: dict[str, Any], prompts: list[str]
+    ) -> dict[str, Any]:
+        replaced = dict(env_obs)
+        replaced["task_descriptions"] = prompts
+        return replaced
+
+    def _word_token_ids(self, env_obs: dict[str, Any], word: str) -> torch.Tensor:
+        prompts = self._task_prompt_list(env_obs)
+        word_obs = self._replace_task_descriptions(env_obs, [word] * len(prompts))
+        processed = self.input_transform(
+            self._repack_env_obs(word_obs), transpose=False
+        )
+        ids = processed["tokenized_prompt"][0]
+        mask = processed["tokenized_prompt_mask"][0].to(dtype=torch.bool)
+        valid = ids[mask]
+        if valid.numel() < 1:
+            raise RuntimeError(f"PaliGemma tokenizer produced no ids for {word!r}.")
+        return valid[-1:].to(dtype=torch.long)
+
+    def _collect_word_token_ids(
+        self, env_obs: dict[str, Any], words: Sequence[str]
+    ) -> torch.Tensor:
+        pieces = [self._word_token_ids(env_obs, word) for word in words]
+        return torch.unique(torch.cat(pieces).to(dtype=torch.long))
+
+    def _yes_no_token_ids(
+        self, env_obs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._phase_yes_ids is None or self._phase_no_ids is None:
+            self._phase_yes_ids = self._collect_word_token_ids(
+                env_obs, ("yes", "Yes")
+            )
+            self._phase_no_ids = self._collect_word_token_ids(env_obs, ("no", "No"))
+        return self._phase_yes_ids, self._phase_no_ids
+
+    def _last_prefix_logits(
+        self, prefix_out: torch.Tensor, prefix_mask: torch.Tensor
+    ) -> torch.Tensor:
+        last_idx = prefix_mask.to(dtype=torch.long).sum(dim=1).clamp_min(1) - 1
+        batch_idx = torch.arange(prefix_out.shape[0], device=prefix_out.device)
+        hidden = prefix_out[batch_idx, last_idx]
+        return self.model.llm.embedder.decode(hidden.float())
+
+    @torch.no_grad()
+    def score_rlt_phase_yes(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        question: str,
+    ) -> torch.Tensor:
+        """Ask the frozen VLM whether this observation is the precision phase.
+
+        Returns ``P(yes) / (P(yes)+P(no))`` at the last language token.
+        """
+        tasks = self._task_prompt_list(env_obs)
+        questions = [question.format(task=task) for task in tasks]
+        judge_obs = self._replace_task_descriptions(env_obs, questions)
+        processed = self.input_transform(
+            self._repack_env_obs(judge_obs), transpose=False
+        )
+        observation = self._observation_dict_to_device(processed)
+        prepared = pi0_model_module.preprocess_observation(observation, train=False)
+        prefix_out, prefix_mask, _ = self.model.build_prefix_cache(prepared)
+        logits = self._last_prefix_logits(prefix_out, prefix_mask)
+        yes_ids, no_ids = self._yes_no_token_ids(env_obs)
+        yes_ids = yes_ids.to(device=logits.device)
+        no_ids = no_ids.to(device=logits.device)
+        logit_yes = torch.logsumexp(logits.index_select(-1, yes_ids), dim=-1)
+        logit_no = torch.logsumexp(logits.index_select(-1, no_ids), dim=-1)
+        return torch.softmax(torch.stack([logit_yes, logit_no], dim=-1), dim=-1)[:, 0]
 
     def _sample_actions_from_prefix_cache(
         self,

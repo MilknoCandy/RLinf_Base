@@ -558,6 +558,7 @@ class MultiStepRolloutWorker(Worker):
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
         stage_id: int | None = None,
+        dones: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
@@ -571,6 +572,8 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
+                dones=dones,
+                stage_id=0 if stage_id is None else int(stage_id),
             )
         return self.predict(env_obs, mode=mode)
 
@@ -611,6 +614,9 @@ class MultiStepRolloutWorker(Worker):
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
         if final_obs is None:
+            return None
+        # RLT Stage 2 has no value head; also avoid mutating the VLM phase gate.
+        if self.rlt_feature_model is not None:
             return None
         if not (
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
@@ -693,6 +699,7 @@ class MultiStepRolloutWorker(Worker):
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
                     stage_id=stage_id,
+                    dones=env_output.get("dones", None),
                 )
 
                 policy_output = self._build_policy_output(
@@ -727,6 +734,7 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                 intervene_requested=env_output.get("intervene_flags", None),
                 stage_id=stage_id,
+                dones=env_output.get("dones", None),
             )
 
             if self.enable_opd:
@@ -806,6 +814,7 @@ class MultiStepRolloutWorker(Worker):
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
                     stage_id=0,
+                    dones=env_output.get("dones", None),
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
@@ -841,6 +850,7 @@ class MultiStepRolloutWorker(Worker):
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
                             stage_id=stage_id,
+                            dones=env_output.get("dones", None),
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()

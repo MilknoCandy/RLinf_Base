@@ -788,15 +788,28 @@ class RLTACReplayMixin:
                     if not auto_reset:
                         break
 
-            if self._use_tsac_critic():
-                env_transitions = self._apply_tsac_prefix_windows(env_transitions)
-            elif n_step > 1:
-                env_transitions = self._apply_n_step_targets(
-                    env_transitions, n_step=n_step, gamma=gamma
-                )
+            env_transitions = self._postprocess_env_transitions(
+                env_transitions, n_step=n_step, gamma=gamma
+            )
             replay_trajectories.extend(env_transitions)
 
         return replay_trajectories, completed_episodes
+
+    def _postprocess_env_transitions(
+        self,
+        env_transitions: list,
+        *,
+        n_step: int,
+        gamma: float,
+    ) -> list:
+        """Attach critic-specific fields after splitting a trajectory into rows."""
+        if self._use_tsac_critic():
+            return self._apply_tsac_prefix_windows(env_transitions)
+        if n_step > 1:
+            return self._apply_n_step_targets(
+                env_transitions, n_step=n_step, gamma=gamma
+            )
+        return env_transitions
 
     def _apply_tsac_prefix_windows(
         self,

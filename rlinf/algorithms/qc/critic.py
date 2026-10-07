@@ -12,19 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Q-chunking critic constraints for RLT Stage 2.
+"""Chunked-critic loss names for RLT Stage 2 comparison methods.
 
-The unbiased Q-chunking backup matches one action chunk: discounted rewards
-inside the chunk plus ``gamma ** chunk_len * Q(next, a_next)``. Looking ahead
-more chunks while the critic still consumes one chunk is the biased n-step
-ablation from the paper, not Q-chunking.
+These are online-only adaptations of Q-chunking (QC), Decoupled Q-Chunking
+(DQC), and Adaptive Q-Chunking (AQC). The frozen Stage-1 VLA is the behavior
+prior; there is no separate offline critic pretrain.
 """
 
 from __future__ import annotations
 
 QC_LOSS_TYPE = "rlt_qc"
+DQC_LOSS_TYPE = "rlt_dqc"
+AQC_LOSS_TYPE = "rlt_aqc"
+ZAP_LOSS_TYPE = "rlt_zap"
 QC_REQUIRED_N_STEP = 1
-RLT_STAGE2_LOSS_TYPES = frozenset({"rlt_ac", "rlt_td3", QC_LOSS_TYPE})
+RLT_STAGE2_LOSS_TYPES = frozenset(
+    {
+        "rlt_ac",
+        "rlt_td3",
+        QC_LOSS_TYPE,
+        DQC_LOSS_TYPE,
+        AQC_LOSS_TYPE,
+        ZAP_LOSS_TYPE,
+    }
+)
 
 
 def validate_qc_n_step(n_step: int) -> None:

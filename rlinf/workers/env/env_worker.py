@@ -962,6 +962,7 @@ class EnvWorker(Worker):
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
+            data["dones"] = env_batch.get("dones", None)
         return data
 
     def _send_train_bootstrap(

@@ -1,0 +1,28 @@
+defaults:
+  - metaworld_50_rlt_stage2_qc
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "metaworld_50_rlt_stage2_aqc"
+
+algorithm:
+  # Adaptive Q-chunking: per-scale critics + advantage selector.
+  loss_type: rlt_aqc
+  n_step: 1
+  aqc_horizons: [1, 2, 5]
+  aqc_kappa_v: 0.9
+
+actor:
+  model:
+    action_extract: adaptive
+    scale_critic_steps: [1, 2, 5]
+    add_scale_value_heads: True
+    aqc_gamma: 0.99
+
+rollout:
+  model:
+    action_extract: adaptive
+    scale_critic_steps: [1, 2, 5]
+    add_scale_value_heads: True
+    aqc_gamma: 0.99

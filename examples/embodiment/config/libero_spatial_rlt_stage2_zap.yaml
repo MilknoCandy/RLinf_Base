@@ -1,0 +1,44 @@
+defaults:
+  - libero_pro_bowl_rlt_stage2_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "libero_spatial_rlt_stage2_zap"
+  max_epochs: 200
+  val_check_interval: 25
+  save_interval: 50
+
+algorithm:
+  # ZAP: (Z, A) Path metric-gated n-step. Q still takes a single atom.
+  loss_type: rlt_zap
+  n_step: 1
+  za_tau_z: 0.1
+  za_tau_a: 0.05
+  za_truncate_eps: 0.01
+  za_max_horizon: 32
+  za_neighbor_k: 32
+  za_uniform_entropy_ratio: 0.95
+  za_enable_neighbors: True
+  # Spatial suite is long; only train residual in the precision phase.
+  # For short single-task bowl runs, set mode: none (full-episode training).
+  rlt_phase_gate:
+    mode: vlm
+    yes_threshold: 0.55
+    min_chunks_before_enter: 1
+    latch_until_done: True
+    force_enter_after_chunks: 0
+
+env:
+  train:
+    # Standard LIBERO Spatial (all tasks). Do not set LIBERO_TYPE=pro.
+    task_id_filter: null
+    total_num_envs: 8
+  eval:
+    task_id_filter: null
+    total_num_envs: 16
+
+rollout:
+  rlt_feature_model:
+    # Stage 1 checkpoint trained on standard LIBERO Spatial demos.
+    model_path: "/path/to/libero_spatial_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"

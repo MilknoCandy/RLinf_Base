@@ -1,0 +1,25 @@
+defaults:
+  - metaworld_50_rlt_stage2_qc
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "metaworld_50_rlt_stage2_dqc"
+
+algorithm:
+  # Decoupled Q-chunking: critic horizon 15 env steps, policy chunk 5.
+  loss_type: rlt_dqc
+  n_step: 1
+  dqc_backup_horizon: 15
+  dqc_kappa_d: 0.9
+  dqc_kappa_b: 0.9
+
+actor:
+  model:
+    action_extract: best_of_n
+    chunk_critic_steps: 15
+
+rollout:
+  model:
+    action_extract: best_of_n
+    chunk_critic_steps: 15

@@ -65,6 +65,24 @@ def main(cfg) -> None:
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncQCFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_dqc":
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.fsdp_dqc_policy_worker import AsyncDQCFSDPPolicy
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncDQCFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_aqc":
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.fsdp_aqc_policy_worker import AsyncAQCFSDPPolicy
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncAQCFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_zap":
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.fsdp_zap_policy_worker import AsyncZAPFSDPPolicy
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncZAPFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (

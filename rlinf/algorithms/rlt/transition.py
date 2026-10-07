@@ -35,6 +35,7 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
             SupportedEnvType.ISAACLAB_RLT,
             SupportedEnvType.CALVIN_RLT,
             SupportedEnvType.LIBERO,
+            SupportedEnvType.METAWORLD,
         }
     except ValueError:
         return False

@@ -23,12 +23,14 @@ from rlinf.algorithms.rlt.route import (
 )
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.algorithms.rlt.tsac_prefix import pack_tsac_prefix_windows
+from rlinf.algorithms.rlt.vlm_phase import VLMPhaseGate
 
 __all__ = [
     "RLTRoute",
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
+    "VLMPhaseGate",
     "build_expert_model_config",
     "build_rlt_route",
     "pack_tsac_prefix_windows",

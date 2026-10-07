@@ -20,6 +20,7 @@ import torch
 
 from rlinf.algorithms.rlt.expert import predict_expert_actions
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.vlm_phase import VLMPhaseGate
 from rlinf.envs import SupportedEnvType
 
 
@@ -35,6 +36,9 @@ class RLTRouteContext:
     expert_model: Any | None = None
     version: int = 0
     default_actor_switch: bool = False
+    dones: torch.Tensor | None = None
+    stage_id: int = 0
+    vlm_p_yes: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True)
@@ -154,12 +158,16 @@ class SimulatorRLTRoute(RLTRoute):
         use_schedule: bool,
         warmup_updates: int,
         full_task: bool = False,
+        phase_gate: VLMPhaseGate | None = None,
     ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
-        # Full-task envs have no precision-phase flag. Missing switch flags
-        # then mean the residual policy owns every chunk.
+        # Full-task mode (e.g. short bowl): missing switch flags mean the
+        # residual policy owns every chunk. A phase_gate overrides that.
         self.full_task = bool(full_task)
+        self.phase_gate = phase_gate
+        # Alias used by predict_rlt_actions when scoring the VLM gate.
+        self.z_phase = phase_gate
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
@@ -170,12 +178,34 @@ class SimulatorRLTRoute(RLTRoute):
         batch_size, chunk_len, action_dim = actions.shape
         ready_for_online = self._ready_for_online(ctx.version)
 
-        critical_phase = _last_info_bool(
-            ctx.rlt_switch_flags,
-            batch_size=batch_size,
-            device=actions.device,
-            default=self.full_task,
-        )
+        if ctx.rlt_switch_flags is not None:
+            critical_phase = _last_info_bool(
+                ctx.rlt_switch_flags,
+                batch_size=batch_size,
+                device=actions.device,
+                default=self.full_task,
+            )
+        elif self.phase_gate is not None:
+            if ctx.vlm_p_yes is None:
+                raise RuntimeError(
+                    "VLM phase gate requires vlm_p_yes from the frozen VLM. "
+                    "Set algorithm.rlt_phase_gate.mode=none for full-task "
+                    "training without the gate."
+                )
+            critical_phase, metrics = self.phase_gate.update(
+                ctx.vlm_p_yes,
+                dones=ctx.dones,
+                stage_id=ctx.stage_id,
+            )
+            critical_phase = critical_phase.to(device=actions.device)
+            result["rlt_phase_metrics"] = metrics
+        else:
+            critical_phase = _last_info_bool(
+                None,
+                batch_size=batch_size,
+                device=actions.device,
+                default=self.full_task,
+            )
         actor_switch = critical_phase
         if self.use_schedule:
             actor_switch = actor_switch & torch.full(
@@ -250,6 +280,8 @@ class SimulatorRLTRoute(RLTRoute):
         forward_inputs["record_transition"] = critical_phase[:, None]
         forward_inputs["actor_switch"] = (actor_switch & ~expert_takeover)[:, None]
         forward_inputs["intervention_requested"] = requested_expert_takeover[:, None]
+        if ctx.rlt_switch_flags is None:
+            forward_inputs["rlt_switch_flags"] = critical_phase[:, None]
         result["intervene_flags"] = intervene_flags
         return RLTRouteOutput(actions=routed_actions, result=result)
 
@@ -264,12 +296,49 @@ def _train_env_type(cfg: Any) -> SupportedEnvType | None:
         return None
 
 
+# Envs without geometric switch flags: mode=none trains the residual all episode.
+_FULL_TASK_DEFAULT_ENVS = frozenset(
+    {
+        SupportedEnvType.LIBERO,
+        SupportedEnvType.METAWORLD,
+    }
+)
+
+
+def _default_full_task(cfg: Any) -> bool:
+    return _train_env_type(cfg) in _FULL_TASK_DEFAULT_ENVS
+
+
+def _resolve_phase_gate(cfg: Any) -> tuple[bool, VLMPhaseGate | None]:
+    """Return ``(full_task, phase_gate)`` from ``algorithm.rlt_phase_gate``.
+
+    Modes:
+      - ``none``: no VLM gate. On LIBERO / MetaWorld the residual owns the
+        whole episode (short single-task runs such as bowl).
+      - ``vlm``: frozen VLM yes/no decides the precision phase (Spatial / MT50).
+    """
+    gate_cfg = cfg.algorithm.get("rlt_phase_gate", {}) or {}
+    mode = str(gate_cfg.get("mode", "none")).lower()
+    default_full_task = _default_full_task(cfg)
+    if mode in {"none", "off", "full", ""}:
+        return default_full_task or bool(gate_cfg.get("full_task", False)), None
+    if mode == "vlm":
+        if not bool(gate_cfg.get("enable", True)):
+            return default_full_task or bool(gate_cfg.get("full_task", False)), None
+        return False, VLMPhaseGate.from_cfg(gate_cfg)
+    raise ValueError(
+        f"Unknown algorithm.rlt_phase_gate.mode={mode!r}. Use 'none' or 'vlm'."
+    )
+
+
 def build_rlt_route(cfg: Any) -> RLTRoute:
     if use_simulator_transition_replay(cfg):
         schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
+        full_task, phase_gate = _resolve_phase_gate(cfg)
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
-            full_task=_train_env_type(cfg) == SupportedEnvType.LIBERO,
+            full_task=full_task,
+            phase_gate=phase_gate,
         )
     return RealworldRLTRoute()

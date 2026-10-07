@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Best-of-N helpers for Q-chunking critic targets.
+"""Best-of-N helpers for Q-chunking.
 
-Official QC (``agents/acfql.py``) selects the next chunk by scoring N samples
-with the online critic, then bootstraps the target critic on the winner. These
-helpers only implement that selection step. They do not change the residual
-actor used at rollout time.
+Official QC (``agents/acfql.py``) uses Best-of-N both to interact with the
+environment and to choose ``a_next`` in the chunk TD backup. Samples come from
+the behavior policy (here: residual actor + frozen VLA ``ref_chunk``).
 """
 
 from __future__ import annotations

@@ -1,18 +1,20 @@
 defaults:
-  - libero_pro_bowl_rlt_stage2_ac_mlp
+  - metaworld_50_rlt_stage2_zap
   - _self_
 
 runner:
   logger:
-    experiment_name: "libero_pro_bowl_rlt_stage2_qc"
+    experiment_name: "metaworld_50_rlt_stage2_qc"
 
 algorithm:
-  # Online Q-chunking on RLT Stage 2: chunk critic + Best-of-N extraction.
+  # Online Q-chunking on RLT Stage 2 (no offline critic pretrain).
   loss_type: rlt_qc
   n_step: 1
   qc_num_samples: 8
   qc_include_ref_chunk: True
   qc_include_actor_mean: True
+  rlt_phase_gate:
+    mode: vlm
 
 actor:
   model:

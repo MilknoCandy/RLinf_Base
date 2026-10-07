@@ -42,6 +42,14 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             tsac_num_layers=cfg.get("tsac_num_layers", 2),
             tsac_num_heads=cfg.get("tsac_num_heads", 8),
             tsac_max_action_len=cfg.get("tsac_max_action_len", 25),
+            action_extract=cfg.get("action_extract", "sample"),
+            qc_num_samples=cfg.get("qc_num_samples", 8),
+            qc_include_ref_chunk=cfg.get("qc_include_ref_chunk", True),
+            qc_include_actor_mean=cfg.get("qc_include_actor_mean", True),
+            chunk_critic_steps=cfg.get("chunk_critic_steps", None),
+            scale_critic_steps=cfg.get("scale_critic_steps", None),
+            add_scale_value_heads=cfg.get("add_scale_value_heads", False),
+            aqc_gamma=cfg.get("aqc_gamma", 0.99),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

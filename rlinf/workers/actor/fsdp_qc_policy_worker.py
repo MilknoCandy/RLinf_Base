@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RLT Stage 2 worker with a Q-chunking critic target.
+"""RLT Stage 2 worker with online Q-chunking.
 
-Rollout still uses the residual RLT actor. Only the critic bootstrap action is
-replaced by best-of-N over the VLA reference chunk and residual samples.
+Official QC (Li et al., NeurIPS 2025) trains a chunked critic and extracts
+actions by Best-of-N from a behavior policy. Here the frozen Stage-1 VLA plus
+the residual actor are that behavior prior: Best-of-N is used both for the TD
+bootstrap and (via ``action_extract: best_of_n``) for environment interaction.
+There is no offline critic pretrain.
 """
 
 from __future__ import annotations

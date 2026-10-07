@@ -80,6 +80,30 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_qc_policy_worker import QCFSDPPolicy
 
         actor_worker_cls = QCFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_dqc":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for rlt_dqc."
+            )
+        from rlinf.workers.actor.fsdp_dqc_policy_worker import DQCFSDPPolicy
+
+        actor_worker_cls = DQCFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_aqc":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for rlt_aqc."
+            )
+        from rlinf.workers.actor.fsdp_aqc_policy_worker import AQCFSDPPolicy
+
+        actor_worker_cls = AQCFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_zap":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for rlt_zap."
+            )
+        from rlinf.workers.actor.fsdp_zap_policy_worker import ZAPFSDPPolicy
+
+        actor_worker_cls = ZAPFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         if use_training_pipeline:
             raise ValueError(

@@ -16,6 +16,8 @@ import pytest
 import torch
 
 from rlinf.algorithms.qc import (
+    AQC_LOSS_TYPE,
+    DQC_LOSS_TYPE,
     QC_LOSS_TYPE,
     build_qc_critic_candidates,
     flatten_chunk_actions,
@@ -82,7 +84,11 @@ def test_validate_qc_n_step_rejects_biased_multi_chunk_backup():
 
 def test_rlt_qc_is_treated_as_stage2_loss():
     assert QC_LOSS_TYPE == "rlt_qc"
+    assert DQC_LOSS_TYPE == "rlt_dqc"
+    assert AQC_LOSS_TYPE == "rlt_aqc"
     assert is_rlt_stage2_loss("rlt_qc")
+    assert is_rlt_stage2_loss("rlt_dqc")
+    assert is_rlt_stage2_loss("rlt_aqc")
     assert is_rlt_stage2_loss("rlt_ac")
     assert not is_rlt_stage2_loss("embodied_sac")
 

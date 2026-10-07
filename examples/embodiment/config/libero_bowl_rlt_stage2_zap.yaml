@@ -1,0 +1,25 @@
+defaults:
+  - libero_spatial_rlt_stage2_zap
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "libero_bowl_rlt_stage2_zap"
+
+algorithm:
+  # Short single-task bowl: no VLM precision gate; train on the full episode.
+  rlt_phase_gate:
+    mode: none
+
+env:
+  train:
+    task_id_filter: [9]
+    total_num_envs: 1
+  eval:
+    task_id_filter: [9]
+    total_num_envs: 16
+
+rollout:
+  rlt_feature_model:
+    # Stage 1 checkpoint trained on standard LIBERO Spatial bowl demos.
+    model_path: "/path/to/libero_spatial_bowl_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor"
