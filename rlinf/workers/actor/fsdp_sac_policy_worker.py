@@ -32,6 +32,7 @@ from rlinf.data.storage.replay import (
 )
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
+from rlinf.models.embodiment.modules.erlt import is_erlt_routing_update
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
@@ -110,15 +111,28 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model_initialized = True
 
         self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+        self.use_erlt = self.cfg.actor.model.get("openpi", {}).get("use_erlt", False)
         use_dsrl = self.use_dsrl
-        if use_dsrl:
+        if self.use_erlt:
+            # Router is a third Adam group so ordinary critic steps do not move it.
+            param_filters = {
+                "critic": ["erlt_q"],
+                "router": ["erlt_router"],
+            }
+            router_optim = self.cfg.actor.get("router_optim", self.cfg.actor.critic_optim)
+            filtered_optim_config = {
+                "critic": self.cfg.actor.critic_optim,
+                "router": router_optim,
+            }
+        elif use_dsrl:
             # DSRL: separate actor/critic encoders into different optimizer groups
             param_filters = {
                 "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
             }
+            filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
         else:
             param_filters = {"critic": ["encoders", "encoder", "q_head", "state_proj"]}
-        filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
+            filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
         optimizers = self.build_optimizers(
             model=self.model,
             main_optim_config=self.cfg.actor.optim,
@@ -127,6 +141,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.optimizer = optimizers[0]
         self.qf_optimizer = optimizers[1]
+        self.router_optimizer = optimizers[2] if self.use_erlt else None
 
         # SAC alpha
         # Initialize temperature parameter for automatic entropy tuning
@@ -163,6 +178,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.qf_lr_scheduler = self.build_lr_scheduler(
             self.qf_optimizer, self.cfg.actor.critic_optim
         )
+        if self.router_optimizer is not None:
+            router_optim = self.cfg.actor.get(
+                "router_optim", self.cfg.actor.critic_optim
+            )
+            self.router_lr_scheduler = self.build_lr_scheduler(
+                self.router_optimizer, router_optim
+            )
         if self.alpha_optimizer is not None:
             self.alpha_lr_scheduler = self.build_lr_scheduler(
                 self.alpha_optimizer, self.cfg.algorithm.entropy_tuning.optim
@@ -349,7 +371,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         agg_q = self.cfg.algorithm.get("agg_q", "min")
         use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
-        if use_dsrl:
+        use_erlt = self.cfg.actor.model.get("openpi", {}).get("use_erlt", False)
+        if use_dsrl or use_erlt:
             num_action_chunks = self.cfg.actor.model.get("num_action_chunks", 1)
             discount = self.cfg.algorithm.gamma**num_action_chunks
             rewards_for_bootstrap = batch["rewards"][:, 0:1].to(self.torch_dtype)
@@ -360,8 +383,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
         terminations = batch["terminations"].to(self.torch_dtype)
 
-        curr_obs = batch["curr_obs"]
-        next_obs = batch["next_obs"]
+        curr_obs = self._erlt_obs(batch["curr_obs"], batch)
+        next_obs = self._erlt_obs(batch["next_obs"], batch, next_obs=True)
         actions = batch["actions"]
 
         with torch.no_grad():
@@ -480,7 +503,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         else:
             agg_q = self.cfg.algorithm.get("agg_q", "min")
 
-        curr_obs = batch["curr_obs"]
+        curr_obs = self._erlt_obs(batch["curr_obs"], batch)
         kwargs = {}
         if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
             kwargs["temperature"] = self.cfg.rollout.sampling_params.temperature_train
@@ -527,8 +550,39 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         return actor_loss, entropy, metrics
 
     @Worker.timer("forward_alpha")
+    def _erlt_obs(self, obs, batch, next_obs: bool = False):
+        """Attach the VLM prefix so eRLT can recompute the current or next token.
+
+        The instruction does not change inside a LIBERO episode, so the next
+        state's images are paired with this transition's tokenized prompt.
+        """
+        if not getattr(self, "use_erlt", False):
+            return obs
+        forward_inputs = batch.get("forward_inputs") or {}
+        if next_obs:
+            merged = {
+                "observation/image": obs["main_images"],
+                "observation/state": obs["states"],
+                "tokenized_prompt": forward_inputs["tokenized_prompt"],
+                "tokenized_prompt_mask": forward_inputs["tokenized_prompt_mask"],
+            }
+            if "wrist_images" in obs:
+                merged["observation/wrist_image"] = obs["wrist_images"]
+            return merged
+        merged = dict(obs)
+        for key, value in forward_inputs.items():
+            if key in ("action", "model_action", "chains", "denoise_inds"):
+                continue
+            merged[key] = value
+        return merged
+
+    def _set_erlt_router_grad(self, enabled: bool) -> None:
+        for candidate in (self.model, getattr(self.model, "module", None)):
+            if candidate is not None and hasattr(candidate, "erlt_router_grad_enabled"):
+                candidate.erlt_router_grad_enabled = enabled
+
     def forward_alpha(self, batch):
-        curr_obs = batch["curr_obs"]
+        curr_obs = self._erlt_obs(batch["curr_obs"], batch)
         with torch.no_grad():
             kwargs = {}
             if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:
@@ -557,9 +611,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         with self.worker_timer("sample"):
             global_batch = next(self.buffer_dataloader_iter)
 
+        micro_batch_size = getattr(
+            self, "_active_micro_batch_size", self.cfg.actor.micro_batch_size
+        )
         train_micro_batch_list = split_dict_to_chunk(
             global_batch,
-            global_batch_size_per_rank // self.cfg.actor.micro_batch_size,
+            global_batch_size_per_rank // micro_batch_size,
         )
 
         # move train_micro_batch_list to device and apply DRQ for critic/actor/alpha passes
@@ -571,6 +628,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             train_micro_batch_list[i] = batch
 
         self.qf_optimizer.zero_grad()
+        if self.router_optimizer is not None:
+            self.router_optimizer.zero_grad()
         gbs_critic_loss = []
         all_critic_metrics = {}
         for batch in train_micro_batch_list:
@@ -582,6 +641,32 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         all_critic_metrics = {
             f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
         }
+        if (
+            self.router_optimizer is not None
+            and getattr(self, "_erlt_routing_update", False)
+        ):
+            router_clip = self.cfg.actor.get(
+                "router_optim", self.cfg.actor.critic_optim
+            ).get("clip_grad", self.cfg.actor.critic_optim.clip_grad)
+            router_params = [
+                param
+                for param in self.router_optimizer.param_groups[0]["params"]
+                if param.grad is not None
+            ]
+            router_grad_norm = (
+                torch.nn.utils.clip_grad_norm_(router_params, router_clip)
+                if router_params
+                else torch.zeros((), device=self.device)
+            )
+            self.router_optimizer.step()
+            self.router_lr_scheduler.step()
+            self.router_optimizer.zero_grad()
+            metrics_data_router = {
+                "router/grad_norm": float(router_grad_norm),
+                "router/lr": self.router_optimizer.param_groups[0]["lr"],
+            }
+        else:
+            metrics_data_router = {}
         qf_grad_norm = self.model.clip_grad_norm_(
             max_norm=self.cfg.actor.critic_optim.clip_grad
         )
@@ -594,6 +679,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
             **all_critic_metrics,
+            **metrics_data_router,
         }
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
@@ -734,10 +820,29 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         metrics = {}
 
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        routing_interval = int(self.cfg.algorithm.get("erlt_update_interval", 200))
+        base_micro = int(self.cfg.actor.micro_batch_size)
+        base_accumulation = self.gradient_accumulation
         for _ in range(update_epoch):
+            routing_update = self.use_erlt and is_erlt_routing_update(
+                self.update_step, routing_interval
+            )
+            self._erlt_routing_update = routing_update
+            self._set_erlt_router_grad(routing_update)
+            if routing_update:
+                # Appendix B.3: the routing step uses micro-batches of one.
+                self._active_micro_batch_size = 1
+                self.gradient_accumulation = (
+                    self.cfg.actor.global_batch_size // self._world_size
+                )
+            else:
+                self._active_micro_batch_size = base_micro
+                self.gradient_accumulation = base_accumulation
             metrics_data = self.update_one_epoch(train_actor=train_actor)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
+        self._set_erlt_router_grad(False)
+        self._erlt_routing_update = False
 
         mean_metric_dict = self.process_train_metrics(metrics)
 

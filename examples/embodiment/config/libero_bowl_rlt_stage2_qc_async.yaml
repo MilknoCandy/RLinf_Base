@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_bowl_rlt_stage2_qc"
+    experiment_name: "libero_bowl_rlt_stage2_qc_async"
     logger_backends: ["wandb"]
 
   # Table II lists 25 online episodes after ~20 seed corrections.
@@ -33,6 +33,7 @@ runner:
   max_steps: -1
   only_eval: False
   weight_sync_interval: 1
+  use_training_pipeline: False
   val_check_interval: 15
   save_interval: 15
   resume_dir: null
@@ -226,6 +227,7 @@ actor:
   global_batch_size: 256
   seed: 1234
   enable_offload: False
+  sync_weight_no_wait: True
 
   model:
     model_type: "rlt_mlp_policy"

@@ -67,6 +67,71 @@ def rbf_kernel_a(
     return torch.exp(-sq / float(temperature))
 
 
+def cosine_kernel_query_keys(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    """Batched $$k_z$$.
+
+    ``query`` is ``[B, D]``. ``keys`` is ``[B, K, D]`` or ``[K, D]``. Returns
+    ``[B, K]``.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}.")
+    query = F.normalize(_flatten_rows(query, "query").float(), dim=-1, eps=1e-6)
+    if keys.dim() == 2:
+        keys = F.normalize(_flatten_rows(keys, "keys").float(), dim=-1, eps=1e-6)
+        cos = query.matmul(keys.transpose(0, 1)).clamp(-1.0, 1.0)
+        return torch.exp((cos - 1.0) / float(temperature))
+    if keys.dim() != 3:
+        raise ValueError(f"keys must be 2D or 3D, got {tuple(keys.shape)}.")
+    batch, num_keys, dim = keys.shape
+    if query.shape[0] != batch or query.shape[1] != dim:
+        raise ValueError(
+            f"query/keys last dim must match, got {tuple(query.shape)} vs "
+            f"{tuple(keys.shape)}."
+        )
+    keys = F.normalize(keys.reshape(batch * num_keys, dim).float(), dim=-1, eps=1e-6)
+    keys = keys.reshape(batch, num_keys, dim)
+    cos = (query.unsqueeze(1) * keys).sum(dim=-1).clamp(-1.0, 1.0)
+    return torch.exp((cos - 1.0) / float(temperature))
+
+
+def rbf_kernel_query_keys(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    """Batched $$k_a$$.
+
+    ``query`` is ``[B, D]``. ``keys`` is ``[B, K, D]`` or ``[K, D]``. Returns
+    ``[B, K]``.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}.")
+    query = _flatten_rows(query, "query").float()
+    if keys.dim() == 2:
+        keys = _flatten_rows(keys, "keys").float()
+        q_sq = (query**2).sum(dim=-1, keepdim=True)
+        k_sq = (keys**2).sum(dim=-1).unsqueeze(0)
+        sq = (q_sq + k_sq - 2.0 * query.matmul(keys.transpose(0, 1))).clamp_min(0.0)
+        return torch.exp(-sq / float(temperature))
+    if keys.dim() != 3:
+        raise ValueError(f"keys must be 2D or 3D, got {tuple(keys.shape)}.")
+    batch, num_keys, dim = keys.shape
+    if query.shape[0] != batch or query.shape[1] != dim:
+        raise ValueError(
+            f"query/keys last dim must match, got {tuple(query.shape)} vs "
+            f"{tuple(keys.shape)}."
+        )
+    keys = keys.reshape(batch, num_keys, dim).float()
+    sq = ((query.unsqueeze(1) - keys) ** 2).sum(dim=-1)
+    return torch.exp(-sq / float(temperature))
+
+
 def continuation_factor(
     z_anchor: torch.Tensor,
     z_step: torch.Tensor,

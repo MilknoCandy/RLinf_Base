@@ -34,6 +34,7 @@ RLT_STAGE2_LOSS_TYPES = frozenset(
         DQC_LOSS_TYPE,
         AQC_LOSS_TYPE,
         ZAP_LOSS_TYPE,
+        "bee",
     }
 )
 

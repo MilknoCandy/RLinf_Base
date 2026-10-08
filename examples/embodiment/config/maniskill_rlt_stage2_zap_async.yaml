@@ -24,13 +24,14 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_rlt_stage2_aqc"
+    experiment_name: "maniskill_rlt_stage2_zap_async"
     logger_backends: ["wandb"]
 
   max_epochs: 5000
   max_steps: -1
   only_eval: False
   weight_sync_interval: 1
+  use_training_pipeline: False
   val_check_interval: 25
   save_interval: 50
   resume_dir: null
@@ -48,10 +49,15 @@ algorithm:
   group_size: 1
 
   adv_type: embodied_sac
-  loss_type: rlt_aqc
+  loss_type: rlt_zap
   n_step: 1
-  aqc_horizons: [1, 5, 10]
-  aqc_kappa_v: 0.9
+  za_tau_z: 0.1
+  za_tau_a: 0.05
+  za_truncate_eps: 0.01
+  za_max_horizon: 32
+  za_neighbor_k: 32
+  za_uniform_entropy_ratio: 0.95
+  za_enable_neighbors: True
   loss_agg_func: "token-mean"
 
   agg_q: min
@@ -244,10 +250,6 @@ rollout:
     proprio_dim: ${actor.model.proprio_dim}
     add_q_head: ${actor.model.add_q_head}
     q_head_type: ${actor.model.q_head_type}
-    action_extract: adaptive
-    scale_critic_steps: [1, 5, 10]
-    add_scale_value_heads: True
-    aqc_gamma: 0.99
     fixed_std: ${actor.model.fixed_std}
     is_lora: False
     lora_rank: 32
@@ -333,6 +335,7 @@ actor:
   global_batch_size: 512
   seed: 1234
   enable_offload: False
+  sync_weight_no_wait: True
 
   model:
     model_type: "rlt_mlp_policy"
@@ -347,10 +350,6 @@ actor:
     add_value_head: False
     add_q_head: True
     q_head_type: "default"
-    action_extract: adaptive
-    scale_critic_steps: [1, 5, 10]
-    add_scale_value_heads: True
-    aqc_gamma: 0.99
     fixed_std: 0.002
     is_lora: False
     lora_rank: 32

@@ -24,12 +24,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.zap import (
+from rlinf.algorithms.zap.backup import (
     attach_episode_zap_paths,
-    compute_zap_path_target,
-    stack_path_metrics,
+    compute_zap_path_targets_batch,
+    reduce_zap_metrics,
+    select_zap_include_batch,
 )
-from rlinf.algorithms.zap.backup import select_zap_include
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
 from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
@@ -108,24 +108,9 @@ class ZAPCriticMixin:
         z: torch.Tensor,
         template_obs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Run the actor on a batch of path $$z$$ rows using a template obs."""
+        """Run the actor on a batch of $$z$$ rows using aligned template obs."""
         batch = int(z.shape[0])
-        obs: dict[str, torch.Tensor] = {}
-        for key, value in template_obs.items():
-            if not torch.is_tensor(value):
-                continue
-            row = value
-            while row.dim() > 1 and row.shape[0] == 1:
-                row = row[0]
-            if key == "z_rl":
-                obs[key] = z.to(device=value.device, dtype=value.dtype)
-                continue
-            obs[key] = (
-                row.unsqueeze(0)
-                .expand(batch, *row.shape)
-                .reshape(batch, *row.shape)
-                .contiguous()
-            )
+        obs = self._obs_with_z(template_obs, z, batch)
         actions, _, _ = self.model(
             forward_type=ForwardType.SAC,
             obs=obs,
@@ -133,33 +118,72 @@ class ZAPCriticMixin:
         )
         return actions.reshape(batch, -1).detach()
 
-    def _local_bootstrap_q(
+    def _obs_with_z(
         self,
-        z: torch.Tensor,
-        a_pi: torch.Tensor,
         template_obs: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+        z: torch.Tensor,
+        batch: int,
+    ) -> dict[str, torch.Tensor]:
         obs: dict[str, torch.Tensor] = {}
-        device = None
-        dtype = None
+        z_flat = z.reshape(batch, -1)
         for key, value in template_obs.items():
             if not torch.is_tensor(value):
                 continue
-            row = value
-            while row.dim() > 1 and row.shape[0] == 1:
-                row = row[0]
-            device = value.device
-            dtype = value.dtype
             if key == "z_rl":
-                obs[key] = z.reshape(1, -1).to(device=device, dtype=dtype)
+                obs[key] = z_flat.to(device=value.device, dtype=value.dtype)
                 continue
-            obs[key] = row.reshape(1, *row.shape).to(device=device, dtype=dtype)
+            if value.shape[0] == batch:
+                obs[key] = value
+                continue
+            row = value[0] if value.dim() >= 1 and value.shape[0] == 1 else value
+            obs[key] = row.unsqueeze(0).expand(batch, *row.shape).contiguous()
+        return obs
+
+    def _policy_actions_for_paths(
+        self,
+        path_z: torch.Tensor,
+        obs_flat: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """One actor forward over every path atom in the batch."""
+        batch, length = int(path_z.shape[0]), int(path_z.shape[1])
+        z_flat = path_z.reshape(batch * length, -1)
+        obs: dict[str, torch.Tensor] = {}
+        for key, value in obs_flat.items():
+            if not torch.is_tensor(value):
+                continue
+            if key == "z_rl":
+                obs[key] = z_flat.to(device=value.device, dtype=value.dtype)
+                continue
+            extra = value.shape[1:]
+            obs[key] = (
+                value.unsqueeze(1)
+                .expand(batch, length, *extra)
+                .reshape(batch * length, *extra)
+                .contiguous()
+            )
+        actions, _, _ = self.model(
+            forward_type=ForwardType.SAC,
+            obs=obs,
+            deterministic=True,
+        )
+        return actions.reshape(batch, length, -1).detach()
+
+    def _q_values_for_z(
+        self,
+        z: torch.Tensor,
+        actions: torch.Tensor,
+        template_obs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        batch = int(z.shape[0])
+        obs = self._obs_with_z(template_obs, z, batch)
         all_q = self.target_model(
             forward_type=ForwardType.SAC_Q,
             obs=obs,
-            actions=a_pi.reshape(1, -1).to(device=device, dtype=dtype),
+            actions=actions.reshape(batch, -1).to(
+                device=obs["z_rl"].device, dtype=obs["z_rl"].dtype
+            ),
         )
-        return self._min_twin_q(all_q).reshape(()).detach().float()
+        return self._min_twin_q(all_q).reshape(batch).detach().float()
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
@@ -188,90 +212,101 @@ class ZAPCriticMixin:
                 "attach_episode_zap_paths ran at transition ingest."
             )
 
-        def _rows(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.reshape(-1, *tensor.shape[2:])
+        def _path_rows(tensor: torch.Tensor, *, feature: bool) -> torch.Tensor:
+            if tensor.dim() >= 4:
+                return tensor.reshape(-1, *tensor.shape[2:])
+            if tensor.dim() == 3 and (not feature) and tensor.shape[1] == 1:
+                return tensor.squeeze(1)
+            return tensor
 
-        path_z = _rows(path_z)
-        path_a = _rows(path_a)
-        path_r = _rows(path_r)
-        path_done = _rows(path_done)
-        path_len = _rows(path_len).reshape(-1)
-        path_h = _rows(path_h) if isinstance(path_h, torch.Tensor) else torch.ones_like(path_r)
+        path_z = _path_rows(path_z, feature=True)
+        path_a = _path_rows(path_a, feature=True)
+        path_r = _path_rows(path_r, feature=False)
+        path_done = _path_rows(path_done, feature=False)
+        path_len = _path_rows(path_len, feature=False).reshape(-1)
+        path_h = (
+            _path_rows(path_h, feature=False)
+            if isinstance(path_h, torch.Tensor)
+            else torch.ones_like(path_r)
+        )
 
         batch_size = int(path_z.shape[0])
         gamma = float(self.cfg.algorithm.gamma)
         obs_flat = _flatten_batch_obs(curr_obs, batch_size)
+        device = obs_flat["z_rl"].device
+        path_z = path_z.to(device)
+        path_a = path_a.to(device)
+        path_r = path_r.to(device)
+        path_done = path_done.to(device)
+        path_len = path_len.to(device).clamp(min=1)
+        path_h = path_h.to(device)
+        used_len = int(path_len.max().item())
+        path_z = path_z[:, :used_len]
+        path_a = path_a[:, :used_len]
+        path_r = path_r[:, :used_len]
+        path_done = path_done[:, :used_len]
+        path_h = path_h[:, :used_len]
 
-        neighbor_z = neighbor_a = neighbor_q = None
-        if self._zap_enable_neighbors() and batch_size > 1:
-            flat_z = obs_flat["z_rl"].reshape(batch_size, -1)
-            a_pi_batch = self._policy_actions_for_z(flat_z, obs_flat)
-            neighbor_z = flat_z.detach().float()
-            neighbor_a = actions.reshape(batch_size, -1).detach().float()
-            with torch.no_grad():
-                all_q = self.target_model(
-                    forward_type=ForwardType.SAC_Q,
-                    obs=obs_flat,
-                    actions=a_pi_batch.to(
-                        device=flat_z.device, dtype=obs_flat["z_rl"].dtype
-                    ),
-                )
-                neighbor_q = (
-                    self._min_twin_q(all_q).reshape(batch_size).detach().float()
-                )
-
-        targets = []
-        metric_list = []
-        for i in range(batch_size):
-            length = max(int(path_len[i].item()), 1)
-            z_i = path_z[i, :length]
-            a_buf_i = path_a[i, :length]
-            r_i = path_r[i, :length]
-            d_i = path_done[i, :length]
-            h_i = path_h[i, :length]
-            template = {key: value[i : i + 1] for key, value in obs_flat.items()}
-            a_pi_i = self._policy_actions_for_z(z_i, template)
-            include, _ = select_zap_include(
-                path_z=z_i,
-                path_a_buf=a_buf_i,
-                path_a_pi=a_pi_i,
-                path_dones=d_i,
+        with torch.no_grad():
+            a_pi = self._policy_actions_for_paths(path_z, obs_flat)
+            include, _ = select_zap_include_batch(
+                path_z=path_z,
+                path_a_buf=path_a,
+                path_a_pi=a_pi,
+                path_dones=path_done,
+                path_len=path_len,
                 tau_z=self._zap_tau_z(),
                 tau_a=self._zap_tau_a(),
                 truncate_eps=self._zap_truncate_eps(),
             )
-            boot_idx = include if include < length else include - 1
-            local_q = self._local_bootstrap_q(
-                z_i[boot_idx], a_pi_i[boot_idx], template
-            )
-            if neighbor_z is not None:
-                mask = torch.ones(batch_size, dtype=torch.bool, device=neighbor_z.device)
-                mask[i] = False
-                n_z, n_a, n_q = neighbor_z[mask], neighbor_a[mask], neighbor_q[mask]
-            else:
-                n_z = n_a = n_q = None
-            y_i, metrics = compute_zap_path_target(
-                path_z=z_i,
-                path_a_buf=a_buf_i,
-                path_a_pi=a_pi_i,
-                path_rewards=r_i,
-                path_dones=d_i,
-                path_horizons=h_i,
+            length = int(path_z.shape[1])
+            use_next = include < path_len
+            trunc_idx = torch.where(
+                use_next, include, (include - 1).clamp(min=0)
+            ).clamp(max=max(length - 1, 0))
+            z_dim = path_z.shape[-1]
+            a_dim = a_pi.shape[-1]
+            trunc_z = path_z.gather(
+                1, trunc_idx.view(batch_size, 1, 1).expand(batch_size, 1, z_dim)
+            ).reshape(batch_size, -1)
+            trunc_a = a_pi.gather(
+                1, trunc_idx.view(batch_size, 1, 1).expand(batch_size, 1, a_dim)
+            ).reshape(batch_size, -1)
+            local_q = self._q_values_for_z(trunc_z, trunc_a, obs_flat)
+
+            neighbor_z = neighbor_a = neighbor_q = exclude_mask = None
+            if self._zap_enable_neighbors() and batch_size > 1:
+                neighbor_z = obs_flat["z_rl"].reshape(batch_size, -1).detach().float()
+                neighbor_a = actions.reshape(batch_size, -1).detach().float()
+                neighbor_q = self._q_values_for_z(
+                    neighbor_z, a_pi[:, 0], obs_flat
+                )
+                exclude_mask = torch.eye(
+                    batch_size, dtype=torch.bool, device=device
+                )
+
+            targets, zap_metrics = compute_zap_path_targets_batch(
+                path_z=path_z,
+                path_a_buf=path_a,
+                path_a_pi=a_pi,
+                path_rewards=path_r,
+                path_dones=path_done,
+                path_horizons=path_h,
+                path_len=path_len,
                 gamma=gamma,
                 tau_z=self._zap_tau_z(),
                 tau_a=self._zap_tau_a(),
                 truncate_eps=self._zap_truncate_eps(),
-                neighbor_z=n_z,
-                neighbor_a=n_a,
-                neighbor_q=n_q,
                 local_bootstrap_q=local_q,
+                neighbor_z=neighbor_z,
+                neighbor_a=neighbor_a,
+                neighbor_q=neighbor_q,
+                exclude_mask=exclude_mask,
                 neighbor_top_k=self._zap_neighbor_k(),
                 uniform_entropy_ratio=self._zap_uniform_entropy_ratio(),
             )
-            targets.append(y_i)
-            metric_list.append(metrics)
 
-        target_q_values = torch.stack(targets, dim=0).to(self.torch_dtype)
+        target_q_values = targets.to(self.torch_dtype)
         if actions.dim() >= 2:
             target_q_values = target_q_values.reshape(*actions.shape[:2], 1)
         else:
@@ -288,7 +323,7 @@ class ZAPCriticMixin:
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
         critic_metrics = {"q_data": float(all_data_q_values.mean().item())}
-        critic_metrics.update(stack_path_metrics(metric_list))
+        critic_metrics.update(reduce_zap_metrics(zap_metrics))
         self._last_zap_metrics = critic_metrics
         return critic_loss, critic_metrics
 

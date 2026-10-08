@@ -159,6 +159,8 @@ class SimulatorRLTRoute(RLTRoute):
         warmup_updates: int,
         full_task: bool = False,
         phase_gate: VLMPhaseGate | None = None,
+        preserve_vla_proposal_on_intervene: bool = False,
+        simulate_intervention_prob: float = 0.0,
     ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
@@ -168,6 +170,12 @@ class SimulatorRLTRoute(RLTRoute):
         self.phase_gate = phase_gate
         # Alias used by predict_rlt_actions when scoring the VLM gate.
         self.z_phase = phase_gate
+        # Bee keeps ã on intervention samples; RLT overwrites with a^H.
+        self.preserve_vla_proposal_on_intervene = bool(
+            preserve_vla_proposal_on_intervene
+        )
+        # Headless LIBERO-PRO stand-in for SpaceMouse: Bernoulli expert takeover.
+        self.simulate_intervention_prob = float(simulate_intervention_prob)
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
@@ -221,6 +229,17 @@ class SimulatorRLTRoute(RLTRoute):
             device=actions.device,
             default=False,
         )
+        if (
+            self.simulate_intervention_prob > 0.0
+            and ctx.mode == "train"
+            and ctx.expert_model is not None
+            and ready_for_online
+        ):
+            simulated = (
+                torch.rand((batch_size,), device=actions.device)
+                < self.simulate_intervention_prob
+            )
+            requested_expert_takeover = requested_expert_takeover | simulated
         expert_takeover = (
             requested_expert_takeover
             & ready_for_online
@@ -267,14 +286,15 @@ class SimulatorRLTRoute(RLTRoute):
                 routed_actions,
             ).contiguous()
             intervene_flags[expert_takeover] = True
-            ref_chunk = forward_inputs["ref_chunk"]
-            ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
-            ref_actions[:, :chunk_len] = torch.where(
-                expert_takeover[:, None, None],
-                expert_actions,
-                ref_actions[:, :chunk_len],
-            )
-            forward_inputs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)
+            if not self.preserve_vla_proposal_on_intervene:
+                ref_chunk = forward_inputs["ref_chunk"]
+                ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
+                ref_actions[:, :chunk_len] = torch.where(
+                    expert_takeover[:, None, None],
+                    expert_actions,
+                    ref_actions[:, :chunk_len],
+                )
+                forward_inputs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)
 
         forward_inputs["action"] = _flatten_action_chunk(routed_actions).detach()
         forward_inputs["record_transition"] = critical_phase[:, None]
@@ -334,11 +354,18 @@ def _resolve_phase_gate(cfg: Any) -> tuple[bool, VLMPhaseGate | None]:
 def build_rlt_route(cfg: Any) -> RLTRoute:
     if use_simulator_transition_replay(cfg):
         schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
+        bee_cfg = cfg.algorithm.get("bee", {}) or {}
         full_task, phase_gate = _resolve_phase_gate(cfg)
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
             full_task=full_task,
             phase_gate=phase_gate,
+            preserve_vla_proposal_on_intervene=bool(
+                bee_cfg.get("preserve_vla_proposal_on_intervene", False)
+            ),
+            simulate_intervention_prob=float(
+                bee_cfg.get("simulate_intervention_prob", 0.0)
+            ),
         )
     return RealworldRLTRoute()

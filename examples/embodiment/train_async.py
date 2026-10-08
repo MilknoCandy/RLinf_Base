@@ -83,6 +83,12 @@ def main(cfg) -> None:
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncZAPFSDPPolicy
+    elif cfg.algorithm.loss_type == "bee":
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.fsdp_bee_policy_worker import AsyncBeeFSDPPolicy
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncBeeFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (

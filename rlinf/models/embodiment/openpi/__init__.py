@@ -87,6 +87,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             all_state_dict.update(state_dict)
         model.load_state_dict(all_state_dict, strict=False)
 
+    router_path = getattr(actor_model_config, "erlt_router_path", None)
+    if router_path:
+        router_state = torch.load(router_path, map_location="cpu")
+        model.erlt_router.load_state_dict(router_state)
+
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()

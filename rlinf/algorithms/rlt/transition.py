@@ -69,9 +69,17 @@ def update_rlt_transitions(
     cache_current: bool,
     intervene_actions: torch.Tensor | None = None,
     intervene_flags: torch.Tensor | None = None,
+    replace_ref_on_intervene: bool = True,
 ) -> None:
     if pending_obs[stage_id] is not None:
-        if intervene_actions is not None and intervene_flags is not None:
+        # RLT replaces the stored proposal with the human action on intervention
+        # samples. Bee keeps the VLA proposal so the Correction Model can learn
+        # residuals Δ^H = a^H - ã (arXiv 2609.27450 §IV-B).
+        if (
+            replace_ref_on_intervene
+            and intervene_actions is not None
+            and intervene_flags is not None
+        ):
             current_obs = pending_obs[stage_id]
             ref_chunk = current_obs["ref_chunk"]
             batch_size = ref_chunk.shape[0]

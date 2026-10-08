@@ -50,6 +50,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             scale_critic_steps=cfg.get("scale_critic_steps", None),
             add_scale_value_heads=cfg.get("add_scale_value_heads", False),
             aqc_gamma=cfg.get("aqc_gamma", 0.99),
+            residual_actor=cfg.get("residual_actor", False),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

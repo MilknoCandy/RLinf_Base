@@ -58,6 +58,7 @@ class RLTMLPPolicy(MLPPolicy):
         scale_critic_steps: list[int] | tuple[int, ...] | None = None,
         add_scale_value_heads: bool = False,
         aqc_gamma: float = 0.99,
+        residual_actor: bool = False,
     ):
         if not add_q_head:
             raise ValueError(
@@ -137,6 +138,8 @@ class RLTMLPPolicy(MLPPolicy):
         self.qc_include_ref_chunk = bool(qc_include_ref_chunk)
         self.qc_include_actor_mean = bool(qc_include_actor_mean)
         self.aqc_gamma = float(aqc_gamma)
+        # Bee: a_θ = ã + Δ_θ(s, ã). Exploration noise stays fixed_std at sample.
+        self.residual_actor = bool(residual_actor)
         hidden_dims = [int(mlp_hidden_dim)] * int(mlp_num_hidden_layers)
 
         self.chunk_critic_steps = (
@@ -310,10 +313,16 @@ class RLTMLPPolicy(MLPPolicy):
         action_mean = self.actor_mean(feat)
         action_std = torch.full_like(action_mean, self.fixed_std)
         probs = Normal(action_mean, action_std)
-        action = action_mean if deterministic else probs.rsample()
-        chunk_logprobs = probs.log_prob(action)
-        action = torch.tanh(action)
-        action = self._hold_frozen_action_dims(action, obs)
+        raw = action_mean if deterministic else probs.rsample()
+        chunk_logprobs = probs.log_prob(raw)
+        if self.residual_actor:
+            # Deterministic residual around the VLA proposal; TD3-style noise
+            # is the fixed_std sample above. Gripper dims stay on the proposal.
+            action = self._get_ref_chunk(obs) + raw
+            action = self._hold_frozen_action_dims(action, obs)
+        else:
+            action = torch.tanh(raw)
+            action = self._hold_frozen_action_dims(action, obs)
         return action, chunk_logprobs, None
 
     def _min_twin_q(self, all_q_values: torch.Tensor) -> torch.Tensor:

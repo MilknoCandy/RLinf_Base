@@ -1,0 +1,100 @@
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    # Demos are standard LIBERO. LIBERO-PRO has no demonstration set; it is
+    # the stage-2 environment.
+    experiment_name: "libero_pro_bowl_erlt_stage1_openpi_pi05"
+    logger_backends: ["tensorboard"]
+
+  # Appendix C.2: 5000 AdamW steps, validation every 250 steps.
+  max_epochs: -1
+  max_steps: 5000
+  val_check_interval: 250
+  save_interval: 250
+  # 332 validation frames / batch 2. This is the paper's validation size.
+  # The loader is the LIBERO SFT corpus, not the paper's seeded 5% frame holdout.
+  erlt_val_batches: 166
+
+data:
+  train_data_paths: "physical-intelligence/libero"
+  val_data_paths: "physical-intelligence/libero"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 2
+  global_batch_size: 2
+  seed: 123
+
+  model:
+    precision: null
+    model_path: "/path/to/pi05_libero"
+    model_type: "openpi"
+    num_action_chunks: 10
+    action_dim: 7
+    num_steps: 3
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      num_images_in_input: 2
+      train_expert_only: True
+      action_chunk: 10
+      action_env_dim: 7
+      num_steps: 3
+      use_erlt: True
+      erlt_use_probe: True
+      erlt_num_tokens: 1
+      erlt_hidden_dim: 2048
+      erlt_layer_indices: [0, 3, 6, 9, 12, 15, 18]
+      erlt_logit_slots: 64
+      erlt_temperature: 1.0
+      erlt_probe_hidden_dim: 256
+
+    openpi_data:
+      repo_id: "physical-intelligence/libero"
+      default_prompt: null
+      norm_stats_path: null
+
+  optim:
+    lr: 1.0e-3
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-4
+    clip_grad: 1.0
+    lr_scheduler: "torch_constant"
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: True
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      buffer_dtype: bf16
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

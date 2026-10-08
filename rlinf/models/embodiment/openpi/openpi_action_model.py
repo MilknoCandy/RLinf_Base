@@ -96,6 +96,18 @@ class OpenPi0Config(Pi0Config):
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
 
+    # ===== eRLT: action-relevant token routing on the frozen VLM =====
+    use_erlt: bool = False
+    erlt_use_probe: bool = False
+    erlt_num_tokens: int = 1
+    erlt_hidden_dim: int = 2048
+    erlt_layer_indices: tuple = (0, 3, 6, 9, 12, 15, 18)
+    erlt_logit_slots: int = 64
+    erlt_temperature: float = 1.0
+    erlt_actor_hidden_dims: tuple = (1024, 512, 256)
+    erlt_probe_hidden_dim: int = 256
+    erlt_router_path: str | None = None
+
     # ===== NFT-specific parameters =====
     is_nft: bool = False
 
@@ -225,7 +237,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             ).to(dtype=torch.bfloat16)
 
         # ===== DSRL components initialization =====
-        if self.config.use_dsrl:
+        # eRLT replaces the DSRL image/state encoders with a VLM routing token.
+        if self.config.use_dsrl and not self.config.use_erlt:
             from rlinf.models.embodiment.modules.compact_encoders import (
                 CompactMultiQHead,
                 CompactStateEncoder,
@@ -281,6 +294,50 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 num_q_heads=self.config.dsrl_num_q_heads,
                 output_dim=1,
             ).to(dtype=_dsrl_dtype)
+
+        if self.config.use_erlt:
+            from rlinf.models.embodiment.modules.erlt import (
+                ERLTActionProbe,
+                ERLTLatentActor,
+                ERLTMultiQ,
+                ERLTRouter,
+            )
+
+            _erlt_dtype = torch.bfloat16
+            layer_indices = tuple(self.config.erlt_layer_indices)
+            hidden_dims = tuple(self.config.erlt_actor_hidden_dims)
+            self.erlt_router_grad_enabled = False
+            self.erlt_router = ERLTRouter(
+                hidden_dim=self.config.erlt_hidden_dim,
+                num_tokens=self.config.erlt_num_tokens,
+                layer_indices=layer_indices,
+                logit_slots=self.config.erlt_logit_slots,
+                temperature=self.config.erlt_temperature,
+            ).to(dtype=_erlt_dtype)
+            action_horizon = int(
+                getattr(self.config, "action_horizon", self.config.action_chunk)
+            )
+            self.erlt_actor = ERLTLatentActor(
+                input_dim=self.config.erlt_hidden_dim,
+                output_dim=self.config.dsrl_action_noise_dim,
+                hidden_dims=hidden_dims,
+                action_horizon=action_horizon,
+            ).to(dtype=_erlt_dtype)
+            self.erlt_q = ERLTMultiQ(
+                token_dim=self.config.erlt_hidden_dim,
+                action_dim=self.config.dsrl_action_noise_dim,
+                hidden_dims=hidden_dims,
+                num_q_heads=self.config.dsrl_num_q_heads,
+            ).to(dtype=_erlt_dtype)
+            if self.config.erlt_use_probe:
+                probe_out = int(self.config.action_chunk) * int(
+                    self.config.action_env_dim
+                )
+                self.erlt_probe = ERLTActionProbe(
+                    self.config.erlt_hidden_dim,
+                    probe_out,
+                    hidden_dim=self.config.erlt_probe_hidden_dim,
+                ).to(dtype=_erlt_dtype)
 
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
@@ -376,6 +433,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
+        if self.config.use_erlt and self.config.erlt_use_probe:
+            return self._erlt_stage1_forward(data)
         if hasattr(self, "gradient_checkpointing_disable"):
             self.gradient_checkpointing_disable()
 
@@ -858,16 +917,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )  # obs precision processor
         observation = _model.Observation.from_dict(processed_obs)
 
-        is_dsrl_active = self.config.use_dsrl
+        is_dsrl_active = self.config.use_dsrl or self.config.use_erlt
         if is_dsrl_active:
-            # DSRL mode (both train and eval)
-
-            # Step 1: SAC agent outputs noise
-            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
-
-            noise_actions, noise_logprob, _ = self.sac_forward(
-                dsrl_obs, train=False, mode=mode
-            )
+            # DSRL / eRLT: the lightweight actor outputs flow noise. eRLT reads
+            # that noise's conditioning from the routing token, not an image CNN.
+            if self.config.use_erlt:
+                with torch.no_grad():
+                    rl_token = self._erlt_token(observation)
+                noise_actions, noise_logprob = self.erlt_actor.sample(
+                    rl_token, deterministic=(mode == "eval")
+                )
+            else:
+                dsrl_obs = {
+                    "images": [env_obs["main_images"]],
+                    "states": env_obs["states"],
+                }
+                noise_actions, noise_logprob, _ = self.sac_forward(
+                    dsrl_obs, train=False, mode=mode
+                )
 
             # Step 2: Use noise to sample actual actions from diffusion model
             outputs = self.sample_actions(
@@ -1467,6 +1534,132 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         f"  Froze {noise_net_params:,} parameters in reinflow_explore_noise_net"
                     )
 
+        if self.config.use_erlt:
+            # Stage 1 trains the router and the probe. Online training trains
+            # the router, the latent actor, and the Q ensemble. The VLA does not.
+            train_probe = bool(self.config.erlt_use_probe)
+            for name, param in self.named_parameters():
+                if name.startswith("erlt_router"):
+                    param.requires_grad = True
+                elif name.startswith("erlt_probe"):
+                    param.requires_grad = train_probe
+                elif name.startswith("erlt_actor") or name.startswith("erlt_q"):
+                    param.requires_grad = not train_probe
+                else:
+                    param.requires_grad = False
+            self.paligemma_with_expert.eval()
+
+    def _erlt_stage1_forward(self, data):
+        """Train the router and the temporary action probe. The VLA stays frozen."""
+        from rlinf.models.embodiment.modules.erlt import expert_action_target
+
+        if isinstance(data, tuple):
+            observation, actions = data
+        else:
+            observation = data["observation"]
+            actions = data["actions"]
+        device = next(self.parameters()).device
+        register_pytree_dataclasses(observation)
+        observation = tree_map(
+            lambda x: (
+                torch.as_tensor(x, device=device).contiguous().clone()
+                if x is not None
+                else x
+            ),
+            observation,
+        )
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=device)
+        actions = actions.to(device=device)
+        self.paligemma_with_expert.eval()
+        rl_token = self._erlt_token(observation)
+        prediction = self.erlt_probe(rl_token)
+        target = expert_action_target(
+            actions,
+            action_chunk=int(self.config.action_chunk),
+            action_dim=int(self.config.action_env_dim),
+        ).to(dtype=prediction.dtype)
+        loss = F.mse_loss(prediction.float(), target.float())
+        return {"loss": loss, "action_mse": loss.detach()}
+
+    def _observation_from_erlt_obs(self, obs: dict):
+        """Rebuild a model observation from a replay row that stores the prefix."""
+        if "tokenized_prompt" not in obs or "observation/image" not in obs:
+            raise ValueError(
+                "eRLT replay rows need tokenized_prompt and observation/image "
+                "from forward_inputs. Got keys: "
+                + ", ".join(sorted(obs.keys()))
+            )
+        processed = self.input_transform(obs, transpose=False)
+        processed = self.precision_processor(processed)
+        return _model.Observation.from_dict(processed)
+
+    def _erlt_token(self, observation) -> torch.Tensor:
+        """Separate VLM pass: routing tokens read selected layers, then mix them.
+
+        Prefix tokens cannot attend to the appended routing tokens, so this
+        pass does not change the frozen VLA's action proposal.
+        """
+        self.paligemma_with_expert.eval()
+        images, img_masks, lang_tokens, lang_masks, _state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        router = self.erlt_router
+        tokens = router.routing_tokens.to(
+            device=prefix_embs.device, dtype=prefix_embs.dtype
+        )
+        batch = prefix_embs.shape[0]
+        num_route = tokens.shape[0]
+        route = tokens.unsqueeze(0).expand(batch, num_route, -1)
+        embeddings = torch.cat([prefix_embs, route], dim=1)
+        route_pad = torch.ones(
+            batch, num_route, dtype=torch.bool, device=embeddings.device
+        )
+        pad_masks = torch.cat([prefix_pad_masks, route_pad], dim=1)
+        route_att = torch.zeros(
+            batch, num_route, dtype=prefix_att_masks.dtype, device=embeddings.device
+        )
+        route_att[:, 0] = True
+        att_masks = torch.cat([prefix_att_masks, route_att], dim=1)
+        att_2d = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks.to(torch.int64), dim=1) - 1
+        attention_mask = self._prepare_attention_masks_4d(att_2d)
+        language_model = self.paligemma_with_expert.paligemma.language_model
+        outputs = language_model(
+            inputs_embeds=embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden_states = outputs.hidden_states
+        if hidden_states is None:
+            raise RuntimeError(
+                "eRLT requires the VLM to return hidden states at the selected layers."
+            )
+        summaries = []
+        for index in router.layer_indices:
+            if index >= len(hidden_states):
+                raise IndexError(
+                    f"layer index {index} is outside the VLM hidden states "
+                    f"(got {len(hidden_states)} tensors)."
+                )
+            layer_hidden = hidden_states[index]
+            summaries.append(layer_hidden[:, -num_route:, :].mean(dim=1))
+        stacked = torch.stack(summaries, dim=1)
+        return router.combine(stacked)
+
+    def _erlt_rl_token_from_batch(self, obs: dict, *, enable_grad: bool) -> torch.Tensor:
+        observation = self._observation_from_erlt_obs(obs)
+        if enable_grad:
+            return self._erlt_token(observation)
+        with torch.no_grad():
+            return self._erlt_token(observation)
+
     # ===== DSRL-specific methods =====
 
     def sac_forward(
@@ -1488,6 +1681,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             logprobs: [B] - log probabilities
             dist_params: (mean, std) or None - distribution parameters for logging
         """
+        if self.config.use_erlt:
+            if obs is None:
+                obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+            mode = kwargs.get("mode", "train")
+            rl_token = self._erlt_rl_token_from_batch(obs, enable_grad=False)
+            action_noise, logprobs = self.erlt_actor.sample(
+                rl_token, deterministic=(mode == "eval")
+            )
+            return action_noise, logprobs, None
+
         if not self.config.use_dsrl:
             raise ValueError("sac_forward called but use_dsrl=False")
 
@@ -1562,6 +1765,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         Returns:
             q_values: [B, num_q_heads] - Q-values from all Q-networks.
         """
+        if self.config.use_erlt:
+            if obs is None:
+                obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+            if actions is None:
+                actions = kwargs.get("actions")
+            enable_grad = bool(self.erlt_router_grad_enabled) and not detach_encoder
+            rl_token = self._erlt_rl_token_from_batch(obs, enable_grad=enable_grad)
+            return self.erlt_q(rl_token, actions)
+
         if not self.config.use_dsrl:
             raise ValueError("sac_q_forward called but use_dsrl=False")
 

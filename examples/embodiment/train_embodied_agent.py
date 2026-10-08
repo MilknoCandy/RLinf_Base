@@ -104,6 +104,14 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_zap_policy_worker import ZAPFSDPPolicy
 
         actor_worker_cls = ZAPFSDPPolicy
+    elif cfg.algorithm.loss_type == "bee":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for bee."
+            )
+        from rlinf.workers.actor.fsdp_bee_policy_worker import BeeFSDPPolicy
+
+        actor_worker_cls = BeeFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_dagger":
         if use_training_pipeline:
             raise ValueError(

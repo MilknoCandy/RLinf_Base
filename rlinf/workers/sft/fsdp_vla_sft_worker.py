@@ -20,6 +20,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
@@ -81,6 +82,49 @@ class FSDPVlaSftWorker(FSDPSftWorker):
     def get_eval_model_output(self, batch: dict[str, Any]):
         # now the eval is not supported for embodied sft
         raise NotImplementedError("eval is not supported for embodied sft right now.")
+
+    def run_eval(self):
+        """Stage-1 eRLT eval reports action-chunk MSE and keeps the best router."""
+        use_erlt = bool(
+            self.cfg.actor.model.get("openpi", {}).get("use_erlt", False)
+        ) and bool(self.cfg.actor.model.get("openpi", {}).get("erlt_use_probe", False))
+        if not use_erlt:
+            return super().run_eval()
+        if self.eval_data_loader is None:
+            return {"eval/action_mse": float("nan")}
+
+        max_batches = int(self.cfg.runner.get("erlt_val_batches", 166))
+        losses = []
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for batch_index, batch in enumerate(self.eval_data_loader):
+                if batch_index >= max_batches:
+                    break
+                output = self.model(
+                    forward_type=ForwardType.SFT,
+                    data=batch,
+                )
+                loss = output["loss"] if isinstance(output, dict) else output
+                losses.append(float(loss.detach().item()))
+        if was_training:
+            self.model.train()
+        mse = float(sum(losses) / max(len(losses), 1))
+        metrics = {"action_mse": mse}
+        metrics = all_reduce_dict(metrics, op=torch.distributed.ReduceOp.AVG)
+        best = getattr(self, "_erlt_best_action_mse", None)
+        if best is None or metrics["action_mse"] < best:
+            self._erlt_best_action_mse = metrics["action_mse"]
+            if self._rank == 0:
+                owner = self.model
+                if not hasattr(owner, "erlt_router") and hasattr(owner, "module"):
+                    owner = owner.module
+                path = os.path.join(
+                    self.cfg.runner.logger.log_path, "erlt_router_best.pt"
+                )
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                torch.save(owner.erlt_router.state_dict(), path)
+        return metrics
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         with self.amp_context:

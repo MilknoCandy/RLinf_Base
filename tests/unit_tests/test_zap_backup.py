@@ -17,10 +17,14 @@ import torch
 from rlinf.algorithms.qc.critic import ZAP_LOSS_TYPE, is_rlt_stage2_loss
 from rlinf.algorithms.zap.backup import (
     accumulate_product_and_truncate,
+    attach_episode_zap_paths,
     compute_zap_path_target,
+    compute_zap_path_targets_batch,
     neighbor_weights,
+    neighbor_weights_batch,
     path_nstep_return,
     select_zap_include,
+    select_zap_include_batch,
 )
 from rlinf.algorithms.zap.kernels import continuation_factor, cosine_kernel_z, rbf_kernel_a
 
@@ -134,6 +138,51 @@ def test_neighbor_weights_fallback_when_z_uniform():
     assert float(weights.sum()) == 0.0
 
 
+def test_batch_neighbor_weights_match_scalar():
+    z = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.95, 0.05],
+            [0.0, 1.0],
+            [0.2, 0.8],
+        ]
+    )
+    a = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.01, 0.0],
+            [1.0, 1.0],
+            [0.8, 0.9],
+        ]
+    )
+    exclude = torch.eye(4, dtype=torch.bool)
+    w_batch, _ = neighbor_weights_batch(
+        z,
+        a,
+        z,
+        a,
+        tau_z=0.1,
+        tau_a=0.05,
+        top_k=3,
+        uniform_entropy_ratio=0.95,
+        exclude_mask=exclude,
+    )
+    for i in range(4):
+        mask = torch.ones(4, dtype=torch.bool)
+        mask[i] = False
+        w_i, _ = neighbor_weights(
+            z[i],
+            a[i],
+            z[mask],
+            a[mask],
+            tau_z=0.1,
+            tau_a=0.05,
+            top_k=3,
+        )
+        assert torch.allclose(w_batch[i][mask], w_i, atol=1e-5)
+        assert float(w_batch[i][i]) == 0.0 or float(w_batch[i].sum()) == 0.0
+
+
 def test_zap_target_uses_local_bootstrap_without_neighbors():
     z = torch.ones(3, 2)
     a = torch.zeros(3, 2)
@@ -158,3 +207,98 @@ def test_zap_target_uses_local_bootstrap_without_neighbors():
     assert metrics["zap/bootstrap"] == 1.0
     # 1 + 0 + 0 + (0.9**3) * 2
     assert abs(float(y) - (1.0 + (0.9**3) * 2.0)) < 1e-5
+
+
+def test_batch_include_matches_scalar():
+    z = torch.ones(2, 4, 3)
+    z[1] = torch.tensor([1.0, 0.0, 0.0])
+    z[1, 2:] = torch.tensor([0.0, 1.0, 0.0])
+    a_buf = torch.zeros(2, 4, 2)
+    a_pi = torch.zeros(2, 4, 2)
+    dones = torch.zeros(2, 4, dtype=torch.bool)
+    path_len = torch.tensor([4, 4])
+    include, mean_c = select_zap_include_batch(
+        path_z=z,
+        path_a_buf=a_buf,
+        path_a_pi=a_pi,
+        path_dones=dones,
+        path_len=path_len,
+        tau_z=0.1,
+        tau_a=0.05,
+        truncate_eps=0.01,
+    )
+    for i in range(2):
+        inc_i, mean_i = select_zap_include(
+            path_z=z[i],
+            path_a_buf=a_buf[i],
+            path_a_pi=a_pi[i],
+            path_dones=dones[i],
+            tau_z=0.1,
+            tau_a=0.05,
+            truncate_eps=0.01,
+        )
+        assert int(include[i]) == inc_i
+        assert abs(float(mean_c[i]) - mean_i) < 1e-5
+
+
+def test_batch_targets_match_scalar_without_neighbors():
+    z = torch.ones(2, 3, 2)
+    a = torch.zeros(2, 3, 2)
+    rewards = torch.tensor([[1.0, 0.0, 0.0], [0.5, 0.5, 0.0]])
+    dones = torch.zeros(2, 3, dtype=torch.bool)
+    horizons = torch.ones(2, 3)
+    local_q = torch.tensor([2.0, 1.0])
+    y_batch, _ = compute_zap_path_targets_batch(
+        path_z=z,
+        path_a_buf=a,
+        path_a_pi=a,
+        path_rewards=rewards,
+        path_dones=dones,
+        path_horizons=horizons,
+        path_len=torch.tensor([3, 3]),
+        gamma=0.9,
+        tau_z=0.1,
+        tau_a=0.05,
+        truncate_eps=0.01,
+        local_bootstrap_q=local_q,
+        neighbor_z=None,
+    )
+    for i in range(2):
+        y_i, _ = compute_zap_path_target(
+            path_z=z[i],
+            path_a_buf=a[i],
+            path_a_pi=a[i],
+            path_rewards=rewards[i],
+            path_dones=dones[i],
+            path_horizons=horizons[i],
+            gamma=0.9,
+            tau_z=0.1,
+            tau_a=0.05,
+            truncate_eps=0.01,
+            local_bootstrap_q=local_q[i],
+            neighbor_z=None,
+        )
+        assert abs(float(y_batch[i]) - float(y_i)) < 1e-5
+
+
+def test_attach_episode_windows_are_causal():
+    class _Tr:
+        def __init__(self, z, a, r, done):
+            self.curr_obs = {"z_rl": z}
+            self.actions = a
+            self.rewards = r
+            self.dones = done
+
+    transitions = [
+        _Tr(torch.tensor([float(i), 0.0]), torch.zeros(2), torch.ones(3), torch.tensor(False))
+        for i in range(5)
+    ]
+    transitions[-1].dones = torch.tensor(True)
+    attach_episode_zap_paths(transitions, max_atoms=4, gamma=0.99)
+    assert int(transitions[0].zap_path_len) == 4
+    assert int(transitions[3].zap_path_len) == 2
+    assert torch.allclose(
+        transitions[0].zap_path_z[0, 0, :3, 0], torch.tensor([0.0, 1.0, 2.0])
+    )
+    assert bool(transitions[0].zap_path_done[0, 0, 3]) is False
+    assert bool(transitions[4].zap_path_done[0, 0, 0]) is True

@@ -82,6 +82,11 @@ class EnvWorker(Worker):
         self.enable_rlt = is_rlt_stage2_loss(
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
         )
+        bee_cfg = OmegaConf.select(self.cfg, "algorithm.bee", default={}) or {}
+        # Bee retains the VLA proposal on intervention samples (Eq. 5).
+        self.replace_ref_on_intervene = not bool(
+            bee_cfg.get("preserve_vla_proposal_on_intervene", False)
+        )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -1181,6 +1186,7 @@ class EnvWorker(Worker):
                             cache_current=True,
                             intervene_actions=env_output.intervene_actions,
                             intervene_flags=env_output.intervene_flags,
+                            replace_ref_on_intervene=self.replace_ref_on_intervene,
                         )
 
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
@@ -1323,6 +1329,7 @@ class EnvWorker(Worker):
                         cache_current=False,
                         intervene_actions=env_output.intervene_actions,
                         intervene_flags=env_output.intervene_flags,
+                        replace_ref_on_intervene=self.replace_ref_on_intervene,
                     )
 
             if self.use_training_pipeline and actor_channel is not None:
