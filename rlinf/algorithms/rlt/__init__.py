@@ -13,6 +13,11 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
+from rlinf.algorithms.rlt.expert import (
+    ResidualExpertPolicy,
+    build_residual_expert,
+    is_residual_expert_config,
+)
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
@@ -20,6 +25,7 @@ from rlinf.algorithms.rlt.route import (
     RLTRouteContext,
     SimulatorRLTRoute,
     build_rlt_route,
+    expert_disagreement_mask,
 )
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.algorithms.rlt.tsac_prefix import pack_tsac_prefix_windows
@@ -30,9 +36,13 @@ __all__ = [
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
+    "ResidualExpertPolicy",
     "VLMPhaseGate",
     "build_expert_model_config",
+    "build_residual_expert",
     "build_rlt_route",
+    "expert_disagreement_mask",
+    "is_residual_expert_config",
     "pack_tsac_prefix_windows",
     "predict_rlt_actions",
     "use_simulator_transition_replay",
