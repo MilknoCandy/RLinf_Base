@@ -96,8 +96,6 @@ algorithm:
   critic_subsample_size: 0
   backup_entropy: False
 
-  rlt_phase_gate:
-    mode: none
 
 env:
   group_name: "EnvGroup"

@@ -399,6 +399,8 @@ class Trajectory:
     # Optional ZAP forward paths written at RLT transition ingest.
     zap_path_z: torch.Tensor = None
     zap_path_a: torch.Tensor = None
+    zap_path_proprio: torch.Tensor = None
+    zap_path_ref: torch.Tensor = None
     zap_path_r: torch.Tensor = None
     zap_path_horizon: torch.Tensor = None
     zap_path_done: torch.Tensor = None

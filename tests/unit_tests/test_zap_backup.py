@@ -20,6 +20,10 @@ from rlinf.algorithms.zap.backup import (
     attach_episode_zap_paths,
     compute_zap_path_target,
     compute_zap_path_targets_batch,
+    flatten_path_actor_obs,
+    gather_path_atom,
+    gather_path_history,
+    zap_bootstrap_index,
     neighbor_weights,
     neighbor_weights_batch,
     path_nstep_return,
@@ -183,6 +187,83 @@ def test_batch_neighbor_weights_match_scalar():
         assert float(w_batch[i][i]) == 0.0 or float(w_batch[i].sum()) == 0.0
 
 
+def test_sharper_neighbor_tau_concentrates_weights():
+    z_q = torch.tensor([[1.0, 0.0]])
+    a_q = torch.zeros(1, 2)
+    neighbor_z = torch.tensor(
+        [
+            [0.98, 0.02],
+            [0.0, 1.0],
+            [0.0, -1.0],
+            [-1.0, 0.0],
+            [0.2, 0.98],
+            [-0.2, 0.98],
+        ]
+    )
+    neighbor_a = torch.zeros(6, 2)
+    _, wide = neighbor_weights_batch(
+        z_q,
+        a_q,
+        neighbor_z,
+        neighbor_a,
+        tau_z=0.1,
+        tau_a=0.05,
+        top_k=4,
+        uniform_entropy_ratio=0.95,
+    )
+    weights_sharp, sharp = neighbor_weights_batch(
+        z_q,
+        a_q,
+        neighbor_z,
+        neighbor_a,
+        tau_z=0.02,
+        tau_a=0.05,
+        top_k=4,
+        uniform_entropy_ratio=0.95,
+    )
+    assert float(sharp["zap/z_weight_entropy"]) < float(wide["zap/z_weight_entropy"])
+    assert float(sharp["zap/neighbor_fallback"]) == 0.0
+    assert float(weights_sharp[0, 0]) > 0.5
+
+
+def test_neighbor_tau_does_not_change_path_include():
+    z = torch.ones(2, 4, 2)
+    z[1, 2:] = torch.tensor([0.0, 1.0])
+    a = torch.zeros(2, 4, 2)
+    rewards = torch.ones(2, 4)
+    dones = torch.zeros(2, 4, dtype=torch.bool)
+    horizons = torch.ones(2, 4)
+    neighbor_z = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    neighbor_a = torch.zeros(2, 2)
+    neighbor_q = torch.tensor([1.0, 2.0])
+    kwargs = dict(
+        path_z=z,
+        path_a_buf=a,
+        path_a_pi=a,
+        path_rewards=rewards,
+        path_dones=dones,
+        path_horizons=horizons,
+        path_len=torch.tensor([4, 4]),
+        gamma=0.99,
+        tau_z=0.1,
+        tau_a=0.05,
+        truncate_eps=0.01,
+        local_bootstrap_q=torch.ones(2),
+        neighbor_z=neighbor_z,
+        neighbor_a=neighbor_a,
+        neighbor_q=neighbor_q,
+        neighbor_top_k=2,
+        uniform_entropy_ratio=0.95,
+    )
+    _, path_tau = compute_zap_path_targets_batch(**kwargs)
+    _, sharp = compute_zap_path_targets_batch(**kwargs, neighbor_tau_z=0.02)
+    assert torch.equal(path_tau["zap/tau"], sharp["zap/tau"])
+    assert torch.allclose(path_tau["zap/mean_c"], sharp["zap/mean_c"])
+    assert float(sharp["zap/z_weight_entropy"].mean()) < float(
+        path_tau["zap/z_weight_entropy"].mean()
+    )
+
+
 def test_zap_target_uses_local_bootstrap_without_neighbors():
     z = torch.ones(3, 2)
     a = torch.zeros(3, 2)
@@ -283,22 +364,163 @@ def test_batch_targets_match_scalar_without_neighbors():
 
 def test_attach_episode_windows_are_causal():
     class _Tr:
-        def __init__(self, z, a, r, done):
-            self.curr_obs = {"z_rl": z}
+        def __init__(self, z, a, r, done, proprio, ref_chunk):
+            self.curr_obs = {
+                "z_rl": z,
+                "proprio": proprio,
+                "ref_chunk": ref_chunk,
+            }
             self.actions = a
             self.rewards = r
             self.dones = done
 
     transitions = [
-        _Tr(torch.tensor([float(i), 0.0]), torch.zeros(2), torch.ones(3), torch.tensor(False))
+        _Tr(
+            torch.tensor([float(i), 0.0]),
+            torch.zeros(2),
+            torch.ones(3),
+            torch.tensor(False),
+            torch.tensor([float(i), 10.0]),
+            torch.tensor([float(i), 20.0, 30.0]),
+        )
         for i in range(5)
     ]
+    for i, tr in enumerate(transitions):
+        if i + 1 < len(transitions):
+            tr.next_obs = transitions[i + 1].curr_obs
+        else:
+            tr.next_obs = {
+                "z_rl": torch.tensor([5.0, 0.0]),
+                "proprio": torch.tensor([5.0, 10.0]),
+                "ref_chunk": torch.tensor([5.0, 20.0, 30.0]),
+            }
     transitions[-1].dones = torch.tensor(True)
     attach_episode_zap_paths(transitions, max_atoms=4, gamma=0.99)
     assert int(transitions[0].zap_path_len) == 4
     assert int(transitions[3].zap_path_len) == 2
+    assert transitions[0].zap_path_z.shape[-2] == 5
     assert torch.allclose(
         transitions[0].zap_path_z[0, 0, :3, 0], torch.tensor([0.0, 1.0, 2.0])
     )
+    assert abs(float(transitions[0].zap_path_z[0, 0, 4, 0]) - 4.0) < 1e-5
+    assert torch.allclose(
+        transitions[0].zap_path_proprio[0, 0, :3, 0], torch.tensor([0.0, 1.0, 2.0])
+    )
+    assert torch.allclose(
+        transitions[0].zap_path_ref[0, 0, :3, 0], torch.tensor([0.0, 1.0, 2.0])
+    )
     assert bool(transitions[0].zap_path_done[0, 0, 3]) is False
     assert bool(transitions[4].zap_path_done[0, 0, 0]) is True
+    include_full = torch.tensor([4])
+    boot = zap_bootstrap_index(include_full, z_len=5)
+    assert int(boot) == 4
+
+
+def test_zap_bootstrap_index_uses_state_after_rewards():
+    # include=n with an extra packed state must not clamp back to n-1.
+    assert int(zap_bootstrap_index(torch.tensor([3]), z_len=4)) == 3
+    assert int(zap_bootstrap_index(torch.tensor([3]), z_len=3)) == 2
+
+
+def test_gather_path_history_left_pads_and_records_delta():
+    path_z = torch.ones(1, 3, 2)
+    path_p = torch.tensor([[[0.0], [1.0], [3.0]]])
+    hist = gather_path_history(path_z, path_p, torch.tensor([2]), hist_len=4)
+    # 4 steps × (z=2 + proprio=1 + delta=1)
+    assert tuple(hist.shape) == (1, 16)
+    hist_short = gather_path_history(
+        path_z, path_p, torch.tensor([2]), hist_len=2
+    )
+    hist_from_mid = gather_path_history(
+        path_z, path_p, torch.tensor([1]), hist_len=2
+    )
+    assert not torch.allclose(hist_short, hist_from_mid)
+
+
+def test_history_kernel_separates_same_z_different_proprio():
+    path_z = torch.ones(2, 4, 2)
+    path_p = torch.tensor(
+        [
+            [[0.0], [1.0], [2.0], [3.0]],
+            [[0.0], [-1.0], [-2.0], [-3.0]],
+        ]
+    )
+    idx = torch.tensor([3, 3])
+    hist = gather_path_history(path_z, path_p, idx, hist_len=4)
+    cos_diff = torch.nn.functional.normalize(hist[:1], dim=-1) @ (
+        torch.nn.functional.normalize(hist[1:], dim=-1).transpose(0, 1)
+    )
+    hist_same = gather_path_history(
+        path_z, path_p[:1].repeat(2, 1, 1), idx, hist_len=4
+    )
+    cos_same = torch.nn.functional.normalize(hist_same[:1], dim=-1) @ (
+        torch.nn.functional.normalize(hist_same[1:], dim=-1).transpose(0, 1)
+    )
+    assert float(cos_same) > float(cos_diff) + 0.2
+
+
+def test_neighbor_query_uses_history_not_trunc_z():
+    path_z = torch.ones(2, 4, 2)
+    path_z[1] = torch.tensor([0.0, 1.0]).expand(4, 2).clone()
+    path_p = torch.tensor(
+        [
+            [[0.0], [1.0], [2.0], [3.0]],
+            [[0.0], [1.0], [2.0], [3.0]],
+        ]
+    )
+    a = torch.zeros(2, 4, 2)
+    hist = gather_path_history(
+        path_z, path_p, torch.tensor([3, 3]), hist_len=4
+    )
+    y, metrics = compute_zap_path_targets_batch(
+        path_z=path_z,
+        path_a_buf=a,
+        path_a_pi=a,
+        path_rewards=torch.ones(2, 4),
+        path_dones=torch.zeros(2, 4, dtype=torch.bool),
+        path_horizons=torch.ones(2, 4),
+        path_len=torch.tensor([4, 4]),
+        gamma=0.99,
+        tau_z=0.1,
+        tau_a=0.05,
+        truncate_eps=0.01,
+        local_bootstrap_q=torch.tensor([1.0, 5.0]),
+        neighbor_z=hist,
+        neighbor_a=a[:, -1],
+        neighbor_q=torch.tensor([1.0, 5.0]),
+        neighbor_query=hist,
+        neighbor_top_k=2,
+        uniform_entropy_ratio=0.95,
+        exclude_mask=torch.eye(2, dtype=torch.bool),
+    )
+    y_local, _ = compute_zap_path_targets_batch(
+        path_z=path_z[:1],
+        path_a_buf=a[:1],
+        path_a_pi=a[:1],
+        path_rewards=torch.ones(1, 4),
+        path_dones=torch.zeros(1, 4, dtype=torch.bool),
+        path_horizons=torch.ones(1, 4),
+        path_len=torch.tensor([4]),
+        gamma=0.99,
+        tau_z=0.1,
+        tau_a=0.05,
+        truncate_eps=0.01,
+        local_bootstrap_q=torch.tensor([1.0]),
+        neighbor_z=None,
+    )
+    assert float(metrics["zap/neighbor_fallback"].mean()) == 0.0
+    assert float(metrics["zap/neighbor_mix"][0]) == 1.0
+    # Same proprio history despite different trunc z: row 0 borrows Q=5.
+    assert float(y[0]) > float(y_local[0]) + 0.5
+
+
+def test_flatten_path_actor_obs_keeps_per_atom_state():
+    path_z = torch.tensor([[[0.0, 1.0], [2.0, 3.0]]])
+    path_proprio = torch.tensor([[[10.0], [20.0]]])
+    path_ref = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    obs = flatten_path_actor_obs(path_z, path_proprio, path_ref)
+    assert tuple(obs["z_rl"].shape) == (2, 2)
+    assert torch.allclose(obs["proprio"].reshape(-1), torch.tensor([10.0, 20.0]))
+    assert torch.allclose(obs["ref_chunk"][1], torch.tensor([0.0, 1.0]))
+    gathered = gather_path_atom(path_proprio, torch.tensor([1]))
+    assert torch.allclose(gathered, torch.tensor([[20.0]]))

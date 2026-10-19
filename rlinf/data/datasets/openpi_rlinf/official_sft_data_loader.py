@@ -17,12 +17,97 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
+import re
+from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from rlinf.config import SupportedModel
-from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
+from rlinf.data.storage.lerobot import (
+    fix_lerobot_episode_data_index,
+    resolve_lerobot_dataset_root,
+    resolve_lerobot_repo_id,
+)
+
+_LOG = logging.getLogger(__name__)
+_TASK_WS_RE = re.compile(r"\s+")
+
+
+def normalize_sft_task_name(text: str) -> str:
+    """Normalize a LIBERO / LeRobot task string for equality checks.
+
+    Spatial suite names use underscores (``pick_up_the_black_bowl_...``);
+    ``physical-intelligence/libero`` stores the same prompt with spaces.
+    """
+    return _TASK_WS_RE.sub(" ", str(text).replace("_", " ").strip().lower())
+
+
+def collect_sft_task_filter(cfg: Any, data_paths: Any = None) -> list[str] | None:
+    """Return ``data.task_filter`` or a per-path override, if any."""
+    path_filter = _task_filter_from_data_paths(data_paths)
+    if path_filter is not None:
+        return path_filter
+    return _as_str_list(OmegaConf.select(cfg, "data.task_filter", default=None))
+
+
+def resolve_lerobot_task_filter_episodes(
+    dataset_root: str | Path,
+    task_filter: Sequence[str],
+) -> list[int]:
+    """Episode indices whose LeRobot task prompt matches ``task_filter``.
+
+    Args:
+        dataset_root: On-disk LeRobot dataset (must have ``meta/episodes.jsonl``).
+        task_filter: Language prompts to keep. Underscores and spaces are
+            equivalent. Matching is case-insensitive.
+
+    Returns:
+        Sorted unique episode indices.
+
+    Raises:
+        FileNotFoundError: If episode metadata is missing.
+        ValueError: If ``task_filter`` is empty or matches no episode.
+    """
+    wanted = {
+        normalize_sft_task_name(name) for name in task_filter if str(name).strip()
+    }
+    if not wanted:
+        raise ValueError("data.task_filter must contain at least one non-empty prompt.")
+
+    root = Path(dataset_root)
+    episodes_path = root / "meta" / "episodes.jsonl"
+    if not episodes_path.is_file():
+        raise FileNotFoundError(
+            "OpenPI SFT task_filter needs meta/episodes.jsonl under "
+            f"{root}. Point data.train_data_paths at a local LeRobot copy "
+            "(e.g. libero_data), not a Hub id that has not been downloaded."
+        )
+
+    matched: list[int] = []
+    available: set[str] = set()
+    with episodes_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            tasks = _episode_task_strings(record)
+            available.update(tasks)
+            if any(normalize_sft_task_name(task) in wanted for task in tasks):
+                matched.append(int(record["episode_index"]))
+
+    if not matched:
+        preview = ", ".join(sorted(available)[:8])
+        raise ValueError(
+            "data.task_filter matched 0 episodes in "
+            f"{episodes_path}. filter={sorted(wanted)}; "
+            f"example tasks in the dataset: {preview}."
+        )
+    return sorted(set(matched))
 
 
 def build_official_openpi_sft_dataloader(
@@ -68,11 +153,111 @@ def build_official_openpi_sft_dataloader(
         )
         _validate_openpi_rlinf_model_shape(model_cfg, config)
 
-    data_loader = openpi_data_loader.create_data_loader(
-        config, framework="pytorch", shuffle=not eval_dataset
-    )
+    task_filter = collect_sft_task_filter(cfg, data_paths)
+    restore_create = None
+    if task_filter:
+        dataset_root = resolve_lerobot_dataset_root(repo_id)
+        episodes = resolve_lerobot_task_filter_episodes(dataset_root, task_filter)
+        _LOG.info(
+            "OpenPI SFT task_filter kept %d episodes from %s (%s).",
+            len(episodes),
+            dataset_root,
+            task_filter,
+        )
+        restore_create = openpi_data_loader.create_torch_dataset
+
+        def _create_filtered_torch_dataset(
+            data_config: Any,
+            action_horizon: int,
+            model_config: Any,
+        ) -> Any:
+            return _create_torch_dataset_for_episodes(
+                data_config,
+                action_horizon,
+                model_config,
+                episodes=episodes,
+                dataset_root=dataset_root,
+            )
+
+        openpi_data_loader.create_torch_dataset = _create_filtered_torch_dataset
+    try:
+        data_loader = openpi_data_loader.create_data_loader(
+            config, framework="pytorch", shuffle=not eval_dataset
+        )
+    finally:
+        if restore_create is not None:
+            openpi_data_loader.create_torch_dataset = restore_create
     data_loader = _maybe_attach_rlt_chunk_window(cfg, data_loader)
     return data_loader, data_loader.data_config()
+
+
+def _as_str_list(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, ListConfig)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _task_filter_from_data_paths(data_paths: Any) -> list[str] | None:
+    if data_paths is None:
+        return None
+    if isinstance(data_paths, (dict, DictConfig)):
+        return _as_str_list(data_paths.get("task_filter"))
+    if isinstance(data_paths, (list, tuple, ListConfig)) and data_paths:
+        return _task_filter_from_data_paths(data_paths[0])
+    return None
+
+
+def _episode_task_strings(record: dict[str, Any]) -> list[str]:
+    tasks = record.get("tasks")
+    if isinstance(tasks, str):
+        return [tasks]
+    if isinstance(tasks, Iterable) and not isinstance(tasks, (bytes, bytearray)):
+        return [str(task) for task in tasks]
+    task = record.get("task")
+    if task is None:
+        return []
+    return [str(task)]
+
+
+def _create_torch_dataset_for_episodes(
+    data_config: Any,
+    action_horizon: int,
+    model_config: Any,
+    *,
+    episodes: Sequence[int],
+    dataset_root: Path,
+) -> Any:
+    """OpenPI ``create_torch_dataset`` with a LeRobot ``episodes=`` subset."""
+    import openpi.training.data_loader as openpi_data_loader
+    import openpi.transforms as openpi_transforms
+
+    del model_config
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create dataset.")
+    lerobot_dataset = openpi_data_loader._import_lerobot_dataset()
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=dataset_root)
+    episode_ids = list(episodes)
+    dataset = lerobot_dataset.LeRobotDataset(
+        repo_id,
+        root=dataset_root,
+        episodes=episode_ids,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        },
+    )
+    fix_lerobot_episode_data_index(dataset, episode_ids)
+    if data_config.prompt_from_task:
+        dataset = openpi_data_loader.TransformedDataset(
+            dataset,
+            [openpi_transforms.PromptFromLeRobotTask(dataset_meta.tasks)],
+        )
+    return dataset
 
 
 def _maybe_attach_rlt_chunk_window(cfg: Any, data_loader: Any) -> Any:
@@ -104,9 +289,7 @@ def _maybe_attach_rlt_chunk_window(cfg: Any, data_loader: Any) -> Any:
         attach_rlt_chunk_window,
     )
 
-    return attach_rlt_chunk_window(
-        data_loader, mem_len_max=mem_len_max, stride=stride
-    )
+    return attach_rlt_chunk_window(data_loader, mem_len_max=mem_len_max, stride=stride)
 
 
 def get_official_openpi_sft_num_batches(data_loader: Any) -> int:

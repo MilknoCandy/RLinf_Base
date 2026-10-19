@@ -96,7 +96,10 @@ class ReplayBufferDataset(IterableDataset):
                 is_ready = False
 
             if is_ready:
-                if self.demo_buffer is not None:
+                if (
+                    self.demo_buffer is not None
+                    and self.demo_buffer.total_samples > 0
+                ):
                     replay_batch = self.replay_buffer.sample(self.batch_size // 2)
                     demo_batch = self.demo_buffer.sample(self.batch_size // 2)
                     batch = concat_batch(replay_batch, demo_batch)
@@ -195,7 +198,10 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                 is_ready = False
 
             if is_ready:
-                if self.demo_buffer is not None:
+                if (
+                    self.demo_buffer is not None
+                    and self.demo_buffer.total_samples > 0
+                ):
                     replay_batch = self.replay_buffer.sample(self.batch_size // 2)
                     demo_batch = self.demo_buffer.sample(self.batch_size // 2)
                     batch = concat_batch(replay_batch, demo_batch)

@@ -15,6 +15,7 @@
 import torch
 
 from rlinf.models.embodiment.modules.rlt_token_transformer import (
+    RLTTokenEncoder,
     RLTTokenTransformer,
 )
 
@@ -247,6 +248,28 @@ def test_fp32_cross_attention_accepts_bf16_prefix():
     loss, _ = model.loss(prefix)
     loss.backward()
     assert model.encoder.out_norm.weight.grad is not None
+
+
+def test_scheme0_uses_original_token_encoder():
+    model = RLTTokenTransformer(
+        input_dim=8,
+        embed_dim=8,
+        prefix_seq_len=5,
+        num_layers=2,
+        num_heads=2,
+        dropout_rate=0.0,
+        mem_scheme=0,
+    )
+    assert isinstance(model.encoder, RLTTokenEncoder)
+    assert hasattr(model.encoder, "rl_token_embed")
+    assert not hasattr(model.encoder, "z_init")
+    prefix = torch.randn(2, 5, 8)
+    z = model.encode(prefix)
+    assert z.shape == (2, 1, 8)
+    assert model.encode_flat(prefix).shape == (2, 8)
+    state_keys = model.state_dict()
+    assert any(key.endswith("encoder.rl_token_embed") for key in state_keys)
+    assert not any(key.endswith("encoder.z_init") for key in state_keys)
 
 
 def test_scheme2_is_cross_then_self_and_accepts_bf16_prefix():

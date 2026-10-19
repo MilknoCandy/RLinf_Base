@@ -97,12 +97,6 @@ algorithm:
   critic_subsample_size: 0
   backup_entropy: False
 
-  rlt_phase_gate:
-    mode: vlm
-    yes_threshold: 0.55
-    min_chunks_before_enter: 1
-    latch_until_done: True
-    force_enter_after_chunks: 0
 
 env:
   group_name: "EnvGroup"

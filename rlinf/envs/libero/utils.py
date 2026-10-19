@@ -16,7 +16,7 @@
 
 import math
 import os
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -215,6 +215,220 @@ def distribute_reset_state_ids_round_robin(
     return distributed
 
 
+_LIBERO_PRO_PERTS = ("lan", "object", "swap", "task")
+
+
+def perturbation_label_from_folder(folder: Optional[str]) -> str:
+    """Map a LIBERO-Pro BDDL folder name to a short perturbation label."""
+    if not folder:
+        return "orig"
+    name = os.path.basename(str(folder).rstrip("/"))
+    for pert in _LIBERO_PRO_PERTS:
+        if name.endswith(f"_{pert}"):
+            return pert
+    return "orig"
+
+
+def load_nonempty_pruned_init(path: str):
+    """Load a ``.pruned_init`` file, or return None if missing or empty."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        loaded = torch.load(path, weights_only=False)
+    except TypeError:
+        loaded = torch.load(path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if loaded is None:
+        return None
+    if hasattr(loaded, "__len__") and len(loaded) == 0:
+        return None
+    return loaded
+
+
+def resolve_libero_pro_init_states(
+    *,
+    init_root: str,
+    pert_folder: str,
+    suite_folder: str,
+    init_states_file: str,
+):
+    """Load LIBERO-Pro init states, falling back to the original suite file.
+
+    Official ``*_task`` assets leave some ``.pruned_init`` files empty. The
+    corresponding original-suite file uses the same scene, so it is a valid
+    last resort for eval instead of aborting the whole perturbation.
+    """
+    candidates: list[tuple[str, str]] = []
+    pert_folder = str(pert_folder or "").strip()
+    suite_folder = str(suite_folder or "").strip()
+    if pert_folder:
+        candidates.append(
+            (pert_folder, os.path.join(init_root, pert_folder, init_states_file))
+        )
+    if suite_folder and suite_folder != pert_folder:
+        candidates.append(
+            (suite_folder, os.path.join(init_root, suite_folder, init_states_file))
+        )
+    for folder, path in candidates:
+        states = load_nonempty_pruned_init(path)
+        if states is not None:
+            return states, path, folder
+    tried = ", ".join(path for _, path in candidates) or "<none>"
+    raise FileNotFoundError(
+        "No non-empty LIBERO-Pro pruned_init found for "
+        f"{init_states_file!r} (tried {tried})."
+    )
+
+
+def seed_intervene_flags(num_envs: int, seed_active: bool) -> np.ndarray:
+    """All-or-nothing expert flag for Appendix D seed-correction episodes."""
+    return np.full((int(num_envs), 1), bool(seed_active), dtype=bool)
+
+
+def merge_expert_intervene_flags(
+    num_envs: int,
+    *,
+    seed_active: bool,
+    progress_flags: np.ndarray | None = None,
+    always: bool = False,
+) -> np.ndarray:
+    """OR seed / progress / always-on expert takeover (train collect only)."""
+    flags = seed_intervene_flags(num_envs, seed_active)[:, 0]
+    if progress_flags is not None:
+        flags = flags | np.asarray(progress_flags, dtype=bool).reshape(-1)
+    if always:
+        flags = np.ones(int(num_envs), dtype=bool)
+    return flags
+
+
+def count_new_episode_dones(prev_dones: np.ndarray, dones: np.ndarray) -> tuple[np.ndarray, int]:
+    """Count episode ends once. Sticky done=True after success must not re-count."""
+    prev = np.asarray(prev_dones, dtype=bool).reshape(-1)
+    cur = np.asarray(dones, dtype=bool).reshape(-1)
+    if prev.shape != cur.shape:
+        prev = np.zeros_like(cur)
+    return cur.copy(), int((cur & ~prev).sum())
+
+
+_BOWL_NEEDLES = ("bowl", "mug", "cup", "pot", "pan", "basket")
+_PLATE_NEEDLES = ("plate", "platter", "dish", "saucer", "tray")
+
+
+def _named_pos(obs: dict, needles: tuple[str, ...]) -> np.ndarray | None:
+    for key, value in obs.items():
+        name = str(key).lower()
+        if not name.endswith("_pos"):
+            continue
+        if name.startswith("robot0_"):
+            continue
+        if not any(needle in name for needle in needles):
+            continue
+        pos = np.asarray(value, dtype=np.float64).reshape(-1)
+        if pos.size >= 3:
+            return pos[:3]
+    return None
+
+
+def bowl_place_progress_from_obs(
+    obs: dict,
+    *,
+    grasp_dist: float = 0.07,
+    gripper_closed: float = 0.045,
+) -> tuple[float, bool]:
+    """Scalar bowl-place progress from a LIBERO raw observation.
+
+    Approach is ``-||ee - bowl||``. A grasp jumps the score by ``+1`` and
+    then tracks ``-||bowl - plate||``. Returns ``(progress, valid)``; ``valid``
+    is false when the bowl or plate pose is missing. LIBERO-PRO object
+    perturbations often rename the bowl; callers must still stall on
+    ``valid=False`` so the expert can return.
+    """
+    try:
+        ee = np.asarray(obs["robot0_eef_pos"], dtype=np.float64).reshape(-1)[:3]
+    except (KeyError, TypeError, ValueError):
+        return 0.0, False
+    bowl = _named_pos(obs, _BOWL_NEEDLES)
+    plate = _named_pos(obs, _PLATE_NEEDLES)
+    if bowl is None or plate is None or ee.size < 3:
+        return 0.0, False
+    grip = np.asarray(
+        obs.get("robot0_gripper_qpos", (0.04, 0.04)), dtype=np.float64
+    ).reshape(-1)
+    grasped = bool(
+        np.linalg.norm(ee - bowl) < float(grasp_dist)
+        and float(np.mean(np.abs(grip))) < float(gripper_closed)
+    )
+    if grasped:
+        return 1.0 - float(np.linalg.norm(bowl - plate)), True
+    return -float(np.linalg.norm(ee - bowl)), True
+
+
+def update_progress_intervene_state(
+    *,
+    best: np.ndarray,
+    stall: np.ndarray,
+    burst_left: np.ndarray,
+    initialized: np.ndarray,
+    progress: np.ndarray,
+    valid: np.ndarray,
+    success: np.ndarray,
+    done: np.ndarray,
+    min_delta: float,
+    stall_steps: int,
+    burst_steps: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Event-triggered short expert burst when bowl-place progress stalls.
+
+    Unlike a horizon clock, each env triggers only after ``stall_steps``
+    without improvement, then holds the expert for ``burst_steps`` and
+    releases so the residual can try again.
+
+    ``valid=False`` (missing / renamed object poses) still counts as a stall
+    so the expert returns after seed. Only a measured improvement resets it.
+    """
+    best = np.asarray(best, dtype=np.float64).copy()
+    stall = np.asarray(stall, dtype=np.int32).copy()
+    burst_left = np.asarray(burst_left, dtype=np.int32).copy()
+    initialized = np.asarray(initialized, dtype=bool).copy()
+    progress = np.asarray(progress, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    success = np.asarray(success, dtype=bool)
+    done = np.asarray(done, dtype=bool)
+
+    # Poses may be missing under LIBERO-PRO object perturbations. Keep
+    # watching those envs so ZAP can still take over after the seed quota.
+    active = (~success) & (~done)
+    in_burst = active & (burst_left > 0)
+    burst_left = np.where(in_burst, burst_left - 1, burst_left)
+
+    watch = active & (~in_burst)
+    improved = (
+        watch & initialized & valid & (progress > best + float(min_delta))
+    )
+    first = watch & (~initialized)
+    update_best = improved | (first & valid) | (in_burst & valid)
+    best = np.where(update_best, np.maximum(best, progress), best)
+    initialized = initialized | first | (in_burst & valid)
+
+    stalled_now = watch & initialized & (~improved) & (~first)
+    stall = np.where(stalled_now, stall + 1, stall)
+    stall = np.where(first | improved | in_burst | (~active), 0, stall)
+
+    trigger = watch & (stall >= int(stall_steps)) & (int(stall_steps) > 0)
+    burst_left = np.where(trigger, int(burst_steps), burst_left)
+    stall = np.where(trigger, 0, stall)
+
+    burst_left = np.where(success | done, 0, burst_left)
+    stall = np.where(success | done, 0, stall)
+    initialized = initialized & (~done)
+    best = np.where(done, np.full_like(best, -1.0e6), best)
+
+    intervene = (burst_left > 0) | trigger
+    intervene = intervene & (~success) & (~done)
+    return best, stall, burst_left, initialized, intervene.astype(bool)
+
+
 def record_completed_episode_task_stats(
     env_idx: np.ndarray,
     final_info: dict,
@@ -224,12 +438,16 @@ def record_completed_episode_task_stats(
     eval_seen_trials: set[tuple[int, int]],
     task_success_stats: dict[int, dict[str, int]],
     logger=None,
+    pert_folders: Optional[Sequence[str]] = None,
+    task_names: Optional[dict[int, str]] = None,
 ) -> np.ndarray:
     """Record per-task eval stats and return which envs count toward metrics.
 
     In eval mode each (task_id, trial_id) is counted at most once. Duplicate
     completions from auto_reset cycling are excluded so aggregated eval metrics
     match the benchmark suite size instead of counting every episode termination.
+
+    When ``pert_folders`` is set (LIBERO-Pro), each log line includes ``pert=``.
     """
     logger = logger or get_logger()
     count_mask = np.zeros(num_envs, dtype=bool)
@@ -247,6 +465,9 @@ def record_completed_episode_task_stats(
     for eid in env_idx:
         tid = int(task_ids[eid])
         trial_id = int(trial_ids[eid])
+        # Idle eval slots are padded with -1 when E does not divide S.
+        if tid < 0 or trial_id < 0:
+            continue
         ok = bool(success[eid])
         trial_key = (tid, trial_id)
         if trial_key in eval_seen_trials:
@@ -261,5 +482,15 @@ def record_completed_episode_task_stats(
             task_success_stats[tid] = {"success": 0, "total": 0}
         task_success_stats[tid]["total"] += 1
         task_success_stats[tid]["success"] += int(ok)
-        logger.info(f"[libero eval] task_id={tid}, trial_id={trial_id}, success={ok}")
+        pert = "orig"
+        if pert_folders is not None and eid < len(pert_folders):
+            pert = perturbation_label_from_folder(pert_folders[eid])
+        raw_name = ""
+        if task_names and tid in task_names:
+            raw_name = str(task_names[tid])
+        task_name = raw_name.replace("'", " ")
+        logger.info(
+            f"[libero eval] task_id={tid}, trial_id={trial_id}, "
+            f"pert={pert}, success={ok}, task='{task_name}'"
+        )
     return count_mask

@@ -123,6 +123,14 @@ class OpenPi0Config(Pi0Config):
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
     rlt_recon_topk_ratio: float = 1.0
+    # 0 = original append-token self-attention encoder (ManiSkill Stage-1).
+    # 1/2 = later cross-attention memory encoder. YAML ``rlt_encoder_type:
+    # append_self_attention`` also selects 0 when no memory window is set.
+    rlt_encoder_type: str = ""
+    rlt_mem_scheme: int = 1
+    rlt_mem_len_min: int = 1
+    rlt_mem_len_max: int = 1
+    rlt_return_prefix: bool = False
     state_indices: list[int] | None = None
 
 
@@ -226,7 +234,23 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             from rlinf.models.embodiment.modules.rlt_token_transformer import (
                 RLTTokenTransformer,
             )
+            from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
+                resolve_rlt_mem_scheme,
+            )
 
+            raw_scheme = getattr(self.config, "rlt_mem_scheme", 1)
+            raw_mem_len = getattr(self.config, "rlt_mem_len_max", 1)
+            rlt_mem_scheme = resolve_rlt_mem_scheme(
+                encoder_type=getattr(self.config, "rlt_encoder_type", "") or "",
+                mem_scheme=1 if raw_scheme is None else int(raw_scheme),
+                mem_len_max=1 if raw_mem_len is None else int(raw_mem_len),
+                return_prefix=bool(getattr(self.config, "rlt_return_prefix", False)),
+            )
+            self.logger.info(
+                "RLT encoder mem_scheme=%s encoder_type=%s",
+                rlt_mem_scheme,
+                getattr(self.config, "rlt_encoder_type", ""),
+            )
             self.rlt_module = RLTTokenTransformer(
                 input_dim=self.config.rlt_input_dim,
                 embed_dim=self.config.rlt_embed_dim,
@@ -234,6 +258,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 num_layers=self.config.rlt_num_layers,
                 num_heads=self.config.rlt_num_heads,
                 mlp_ratio=self.config.rlt_mlp_ratio,
+                mem_scheme=rlt_mem_scheme,
             ).to(dtype=torch.bfloat16)
 
         # ===== DSRL components initialization =====

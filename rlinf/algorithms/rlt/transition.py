@@ -23,22 +23,41 @@ RLT_OBS_KEYS = ("z_rl", "proprio", "ref_chunk")
 RLT_TRANSITION_PREFIX = "rlt_transition_"
 
 
+_SIMULATOR_TRANSITION_ENVS = frozenset(
+    {
+        SupportedEnvType.MANISKILL_RLT,
+        SupportedEnvType.ISAACLAB_RLT,
+        SupportedEnvType.CALVIN_RLT,
+        SupportedEnvType.LIBERO,
+        SupportedEnvType.METAWORLD,
+    }
+)
+
+
+def active_env_type(cfg: Any) -> SupportedEnvType | None:
+    """Resolve env type from ``env.train``, falling back to ``env.eval``.
+
+    Standalone eval configs (``only_eval: True``) often omit ``env.train``;
+    routing / replay decisions must still see the eval env type.
+    """
+    env_cfg = cfg.get("env", None)
+    if env_cfg is None:
+        return None
+    for split in ("train", "eval"):
+        split_cfg = env_cfg.get(split, None)
+        if split_cfg is None:
+            continue
+        try:
+            return SupportedEnvType(split_cfg.get("env_type", ""))
+        except ValueError:
+            continue
+    return None
+
+
 def use_simulator_transition_replay(cfg: Any) -> bool:
     """Return True for envs that store one replay row per env step."""
-    train_env_cfg = cfg.env.get("train", None)
-    if train_env_cfg is None:
-        return False
-    try:
-        env_type = SupportedEnvType(train_env_cfg.get("env_type", ""))
-        return env_type in {
-            SupportedEnvType.MANISKILL_RLT,
-            SupportedEnvType.ISAACLAB_RLT,
-            SupportedEnvType.CALVIN_RLT,
-            SupportedEnvType.LIBERO,
-            SupportedEnvType.METAWORLD,
-        }
-    except ValueError:
-        return False
+    env_type = active_env_type(cfg)
+    return env_type is not None and env_type in _SIMULATOR_TRANSITION_ENVS
 
 
 def extract_rlt_obs_from_forward_inputs(
@@ -67,34 +86,12 @@ def update_rlt_transitions(
     policy_output: Any,
     *,
     cache_current: bool,
-    intervene_actions: torch.Tensor | None = None,
-    intervene_flags: torch.Tensor | None = None,
-    replace_ref_on_intervene: bool = True,
 ) -> None:
     if pending_obs[stage_id] is not None:
-        # RLT replaces the stored proposal with the human action on intervention
-        # samples. Bee keeps the VLA proposal so the Correction Model can learn
-        # residuals Δ^H = a^H - ã (arXiv 2609.27450 §IV-B).
-        if (
-            replace_ref_on_intervene
-            and intervene_actions is not None
-            and intervene_flags is not None
-        ):
-            current_obs = pending_obs[stage_id]
-            ref_chunk = current_obs["ref_chunk"]
-            batch_size = ref_chunk.shape[0]
-            flags = intervene_flags.reshape(batch_size, -1, 1).to(
-                device=ref_chunk.device, dtype=torch.bool
-            )
-            human_actions = intervene_actions.reshape(batch_size, flags.shape[1], -1)
-            action_dim = human_actions.shape[-1]
-            ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
-            ref_actions[:, : flags.shape[1]] = torch.where(
-                flags,
-                human_actions.to(device=ref_chunk.device, dtype=ref_chunk.dtype),
-                ref_actions[:, : flags.shape[1]],
-            )
-            current_obs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)
+        # Keep the live VLA proposal ã as the actor input. Intervention only
+        # changes the executed action / BC target (a^H). Overwriting ã←a^H
+        # would train the identity π(s, a^H)→a^H and never teach
+        # π(s, ã_VLA)→a^H. Bee CM also needs the original ã for Δ^H=a^H-ã.
         next_obs = extract_rlt_obs_from_forward_inputs(
             policy_output.forward_inputs,
             transition=True,

@@ -82,12 +82,6 @@ class EnvWorker(Worker):
         self.enable_rlt = is_rlt_stage2_loss(
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
         )
-        bee_cfg = OmegaConf.select(self.cfg, "algorithm.bee", default={}) or {}
-        # Bee retains the VLA proposal on intervention samples (Eq. 5).
-        self.replace_ref_on_intervene = not bool(
-            bee_cfg.get("preserve_vla_proposal_on_intervene", False)
-        )
-
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
             "history_reward_assign", False
@@ -466,6 +460,26 @@ class EnvWorker(Worker):
         if get_env_attr(env, "wait_delay") is None:
             return
         await env.wait_delay()
+
+    def _bind_hitl_ref_chunk(self, env, policy_output) -> None:
+        """Pass VLA ã (π) and residual actor a into a HITL env for the console."""
+        setter = get_env_attr(env, "set_hitl_ref_chunk")
+        if setter is None:
+            return
+        forward_inputs = getattr(policy_output, "forward_inputs", None) or {}
+        if not isinstance(forward_inputs, dict):
+            setter(None)
+            return
+        flags = getattr(policy_output, "intervene_flags", None)
+        expert_chunk = False
+        if flags is not None:
+            flag_tensor = flags.detach() if torch.is_tensor(flags) else flags
+            expert_chunk = bool(torch.as_tensor(flag_tensor).reshape(-1)[0].item())
+        setter(
+            forward_inputs.get("ref_chunk"),
+            actor_chunk=forward_inputs.get("model_action"),
+            expert_chunk=expert_chunk,
+        )
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
@@ -924,7 +938,9 @@ class EnvWorker(Worker):
                 dones = get_zero_dones()
                 terminations = dones.clone()
                 truncations = dones.clone()
-
+                reset_intervene = None
+                if isinstance(infos, dict):
+                    reset_intervene = infos.get("intervene_flag", None)
                 env_output = EnvOutput(
                     obs=extracted_obs,
                     dones=dones,
@@ -937,7 +953,7 @@ class EnvWorker(Worker):
                     ),
                     env_infos=infos if isinstance(infos, dict) else None,
                     intervene_actions=None,
-                    intervene_flags=None,
+                    intervene_flags=reset_intervene,
                 )
                 env_outputs.append(env_output)
         else:
@@ -1101,10 +1117,18 @@ class EnvWorker(Worker):
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
                     if env_output.intervene_actions is not None:
-                        self.trajectory_builders[stage_id].update_last_actions(
-                            env_output.intervene_actions,
-                            env_output.intervene_flags,
-                        )
+                        builder = self.trajectory_builders[stage_id]
+                        last_actions = getattr(builder, "actions", None)
+                        intervene = env_output.intervene_actions
+                        if (
+                            last_actions
+                            and env_output.intervene_flags is not None
+                            and intervene.shape[-1] == last_actions[-1].shape[-1]
+                        ):
+                            builder.update_last_actions(
+                                intervene,
+                                env_output.intervene_flags,
+                            )
 
                     reward_model_output = None
                     if reward_channel is not None and chunk_step_idx != 0:
@@ -1184,11 +1208,9 @@ class EnvWorker(Worker):
                             self.trajectory_builders,
                             policy_output,
                             cache_current=True,
-                            intervene_actions=env_output.intervene_actions,
-                            intervene_flags=env_output.intervene_flags,
-                            replace_ref_on_intervene=self.replace_ref_on_intervene,
                         )
 
+                    self._bind_hitl_ref_chunk(self.env_list[stage_id], policy_output)
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         policy_output.actions,
                         stage_id,
@@ -1247,10 +1269,18 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
-                    self.trajectory_builders[stage_id].update_last_actions(
-                        env_output.intervene_actions,
-                        env_output.intervene_flags,
-                    )
+                    builder = self.trajectory_builders[stage_id]
+                    last_actions = getattr(builder, "actions", None)
+                    intervene = env_output.intervene_actions
+                    if (
+                        last_actions
+                        and env_output.intervene_flags is not None
+                        and intervene.shape[-1] == last_actions[-1].shape[-1]
+                    ):
+                        builder.update_last_actions(
+                            intervene,
+                            env_output.intervene_flags,
+                        )
 
                 reward_model_output = None
                 if reward_channel is not None:
@@ -1327,9 +1357,6 @@ class EnvWorker(Worker):
                         self.trajectory_builders,
                         policy_output,
                         cache_current=False,
-                        intervene_actions=env_output.intervene_actions,
-                        intervene_flags=env_output.intervene_flags,
-                        replace_ref_on_intervene=self.replace_ref_on_intervene,
                     )
 
             if self.use_training_pipeline and actor_channel is not None:
@@ -1435,6 +1462,9 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
+                    self._bind_hitl_ref_chunk(
+                        self.eval_env_list[stage_id], policy_output
+                    )
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )

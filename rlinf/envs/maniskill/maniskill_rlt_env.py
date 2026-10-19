@@ -30,6 +30,8 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.envs.maniskill.maniskill_env import ManiskillEnv
 from rlinf.envs.maniskill.peg_insertion_side_variants import (
     RLT_OPENPI_JOINT_WRAP_MODE,
+    cfg_task_instruction,
+    expand_task_instruction,
     init_peg_insertion_event_state,
     is_peg_insertion_side_env_id,
     maybe_augment_peg_insertion_info,
@@ -169,6 +171,9 @@ class ManiskillRLTEnv(ManiskillEnv):
 
     @property
     def instruction(self):
+        override = cfg_task_instruction(self.cfg)
+        if override is not None:
+            return expand_task_instruction(override, num_envs=self.num_envs)
         return resolve_maniskill_task_descriptions(
             self.env.unwrapped,
             num_envs=self.num_envs,
@@ -201,12 +206,6 @@ class ManiskillRLTEnv(ManiskillEnv):
                 start_active,
                 dtype=torch.bool,
             ),
-            "entered_actor_phase_once": torch.full(
-                (batch_size,),
-                start_active,
-                dtype=torch.bool,
-            ),
-            "actor_switch_step": torch.zeros(batch_size, dtype=torch.float32),
             "expert_takeover_active": torch.zeros(batch_size, dtype=torch.bool),
             "expert_progress_guard": torch.zeros(batch_size, dtype=torch.bool),
             "progress_initialized": torch.zeros(batch_size, dtype=torch.bool),
@@ -269,16 +268,6 @@ class ManiskillRLTEnv(ManiskillEnv):
         else:
             rlt_switch_flags = enter_actor
 
-        switched_now = (~previous_rlt_switch_flags) & rlt_switch_flags
-        elapsed_steps = self._rlt_elapsed_steps(infos, device)
-        state["actor_switch_step"] = torch.where(
-            switched_now,
-            elapsed_steps,
-            state["actor_switch_step"],
-        )
-        state["entered_actor_phase_once"] = (
-            state["entered_actor_phase_once"] | rlt_switch_flags | switched_now
-        )
         state["rlt_switch_flags"] = rlt_switch_flags
         self._update_rlt_expert_takeover_state(infos=infos, device=device)
 
@@ -308,13 +297,6 @@ class ManiskillRLTEnv(ManiskillEnv):
         return {
             "rlt_switch_flags": rlt_switch_flags[:, None],
             "intervene_flag": intervene_flag[:, None],
-            "entered_actor_phase_once": state["entered_actor_phase_once"][:, None],
-            "actor_switch_step": state["actor_switch_step"][:, None],
-            "actor_switch_step_nonzero": torch.where(
-                state["entered_actor_phase_once"],
-                state["actor_switch_step"],
-                torch.zeros_like(state["actor_switch_step"]),
-            )[:, None],
         }
 
     def _rlt_expert_takeover_mask(
@@ -687,23 +669,6 @@ class ManiskillRLTEnv(ManiskillEnv):
         fallback_hole_radius = auto_gate.get("fallback_hole_radius", 0.03)
         return torch.full_like(like, float(fallback_hole_radius))
 
-    def _rlt_elapsed_steps(
-        self,
-        infos: dict[str, Any],
-        device: torch.device,
-    ) -> torch.Tensor:
-        elapsed_steps = infos.get("elapsed_steps", infos.get("_elapsed_steps"))
-        if elapsed_steps is None:
-            return torch.zeros(self.num_envs, dtype=torch.float32, device=device)
-        elapsed_steps = torch.as_tensor(
-            elapsed_steps,
-            dtype=torch.float32,
-            device=device,
-        )
-        if elapsed_steps.numel() == 1:
-            return elapsed_steps.reshape(1).repeat(self.num_envs)
-        return elapsed_steps.reshape(self.num_envs, -1)[:, -1]
-
     def _rlt_switch_state_to(self, device: torch.device) -> dict[str, torch.Tensor]:
         for key, value in self._rlt_switch_state.items():
             self._rlt_switch_state[key] = value.to(device)
@@ -771,6 +736,7 @@ class ManiskillRLTEnv(ManiskillEnv):
                 num_envs=self.num_envs,
                 device=self.device,
                 is_peg_insertion_side=self._is_peg_insertion_side,
+                force_task_descriptions=cfg_task_instruction(self.cfg) is not None,
             )
         return super()._wrap_obs(raw_obs, infos=infos)
 
@@ -778,28 +744,6 @@ class ManiskillRLTEnv(ManiskillEnv):
         infos = super()._record_metrics(step_reward, infos)
         if not self.record_metrics or "episode" not in infos:
             return infos
-        # last version
-        # for key in (
-        #     "entered_actor_phase_once",
-        #     "actor_switch_step",
-        #     "actor_switch_step_nonzero",
-        # ):
-        #     if key in infos:
-        #         value = infos[key]
-        #         if isinstance(value, torch.Tensor):
-        #             infos["episode"][key] = value.reshape(self.num_envs, -1)[
-        #                 :, -1
-        #             ].clone()
-        # return infos
-        self._copy_scalar_info_to_episode(
-            infos,
-            (
-                "entered_actor_phase_once",
-                "actor_switch_step",
-                "actor_switch_step_nonzero",
-            ),
-        )
-
         if self.policy_mode == "eval":
             self._copy_scalar_info_to_episode(infos, self._RLT_EVAL_PEG_EPISODE_KEYS)
             if "success" in infos:
@@ -830,13 +774,6 @@ class ManiskillRLTEnv(ManiskillEnv):
         )
         for key in ("rlt_switch_flags", "intervene_flag"):
             infos[key] = switch_info[key]
-        for key in (
-            "entered_actor_phase_once",
-            "actor_switch_step",
-            "actor_switch_step_nonzero",
-        ):
-            if key in switch_info:
-                infos[key] = switch_info[key]
 
     def reset(
         self,
@@ -1049,13 +986,6 @@ class ManiskillRLTEnv(ManiskillEnv):
         )
         for key in ("rlt_switch_flags", "intervene_flag"):
             infos_last[key] = switch_info[key]
-        for key in (
-            "entered_actor_phase_once",
-            "actor_switch_step",
-            "actor_switch_step_nonzero",
-        ):
-            if key in switch_info:
-                infos_last[key] = switch_info[key]
         infos_list[-1] = infos_last
 
     def _stack_chunk_rlt_flags(self, infos_list: list[dict[str, Any]]) -> None:
@@ -1101,19 +1031,6 @@ class ManiskillRLTEnv(ManiskillEnv):
             if flag is not None:
                 infos[key] = flag
         return infos
-
-    def _sync_rlt_switch_episode_info(self, infos):
-        if not isinstance(infos, dict) or "episode" not in infos:
-            return
-        for key in (
-            "entered_actor_phase_once",
-            "actor_switch_step",
-            "actor_switch_step_nonzero",
-        ):
-            if key in infos:
-                infos["episode"][key] = (
-                    infos[key].reshape(self.num_envs, -1)[:, -1].clone()
-                )
 
     def chunk_step(self, chunk_actions):
         self._validate_chunk_actions(chunk_actions)
@@ -1211,7 +1128,6 @@ class ManiskillRLTEnv(ManiskillEnv):
             infos_list=infos_list,
             chunk_dones=policy_switch_chunk_dones,
         )
-        self._sync_rlt_switch_episode_info(infos_list[-1])
         self._stack_chunk_rlt_flags(infos_list)
 
         if past_dones.any() and self.auto_reset:

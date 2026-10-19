@@ -52,6 +52,32 @@ _BARE_PI0_PREFIXES = (
 _OLD_OPENPI_PREFIX = "paligemma_with_expert."
 
 
+_ORIGINAL_ENCODER_TYPES = frozenset(
+    {
+        "append_self_attention",
+        "token",
+        "original",
+        "self_attention",
+    }
+)
+_CROSS_ENCODER_TYPES = frozenset(
+    {
+        "cross_attention",
+        "cross",
+        "memory",
+        "mem",
+    }
+)
+_OLD_ENCODER_MARKERS = (
+    "encoder.rl_token_embed",
+    "encoder.rl_token_pos_enc",
+)
+_NEW_ENCODER_MARKERS = (
+    "encoder.z_init",
+    "encoder.out_norm",
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class OpenPiPytorchRLTConfig:
     """RLT-token knobs shared by the SFT and eval wrappers."""
@@ -70,12 +96,110 @@ class OpenPiPytorchRLTConfig:
     rlt_mem_len_min: int = 1
     rlt_mem_len_max: int = 1
     rlt_mem_scheme: int = 1
+    rlt_encoder_type: str = ""
+    rlt_return_prefix: bool = False
 
 
-def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
+def _collect_state_dict_keys(obj: Any, *, depth: int = 0) -> list[str]:
+    if not isinstance(obj, dict) or depth > 4:
+        return []
+    keys = [_normalize_wrapper_key(str(key)) for key in obj]
+    for value in obj.values():
+        if isinstance(value, dict):
+            keys.extend(_collect_state_dict_keys(value, depth=depth + 1))
+    return keys
+
+
+def infer_rlt_encoder_kind(state_dict: Any) -> str | None:
+    """Return ``token``, ``cross``, or ``None`` from checkpoint parameter names.
+
+    Pre-memory Stage-1 (ManiSkill 20260809) stores ``encoder.rl_token_embed``.
+    The later cross-attention encoder stores ``encoder.z_init`` / ``out_norm``.
+    """
+    keys = _collect_state_dict_keys(state_dict)
+    if not keys:
+        return None
+
+    def _has(marker: str) -> bool:
+        return any(marker in key for key in keys)
+
+    has_old = any(_has(marker) for marker in _OLD_ENCODER_MARKERS)
+    has_new = any(_has(marker) for marker in _NEW_ENCODER_MARKERS)
+    if has_old and not has_new:
+        return "token"
+    if has_new and not has_old:
+        return "cross"
+    return None
+
+
+def resolve_rlt_mem_scheme(
+    *,
+    encoder_type: str = "",
+    mem_scheme: int = 1,
+    mem_len_max: int = 1,
+    return_prefix: bool = False,
+    state_dict: Any = None,
+) -> int:
+    """Pick ``0`` (original token encoder) or ``1``/``2`` (cross-attention).
+
+    Checkpoint keys win so ManiSkill Stage-1 loads the old encoder even when
+    YAML still says ``append_self_attention``, and bowl Stage-1 stays on the
+    cross encoder even though that same unused YAML key is present.
+    """
+    yaml_scheme = int(mem_scheme)
+    kind = infer_rlt_encoder_kind(state_dict)
+    if kind == "token":
+        return 0
+    if kind == "cross":
+        return yaml_scheme if yaml_scheme in (1, 2) else 1
+
+    encoder_type = str(encoder_type or "").strip().lower()
+    if int(mem_len_max) > 1 or bool(return_prefix):
+        return yaml_scheme if yaml_scheme in (1, 2) else 1
+    if encoder_type in _CROSS_ENCODER_TYPES:
+        return yaml_scheme if yaml_scheme in (1, 2) else 1
+    if encoder_type in _ORIGINAL_ENCODER_TYPES or yaml_scheme == 0:
+        return 0
+    return yaml_scheme if yaml_scheme in (0, 1, 2) else 1
+
+
+def bind_rlt_mem_scheme(config_obj: Any, state_dict: Any = None) -> int:
+    """Write the resolved scheme onto a config object and return it."""
+    raw_scheme = getattr(config_obj, "rlt_mem_scheme", 1)
+    raw_mem_len = getattr(config_obj, "rlt_mem_len_max", 1)
+    scheme = resolve_rlt_mem_scheme(
+        encoder_type=getattr(config_obj, "rlt_encoder_type", "") or "",
+        mem_scheme=1 if raw_scheme is None else int(raw_scheme),
+        mem_len_max=1 if raw_mem_len is None else int(raw_mem_len),
+        return_prefix=bool(getattr(config_obj, "rlt_return_prefix", False)),
+        state_dict=state_dict,
+    )
+    encoder_type = "append_self_attention" if scheme == 0 else "cross_attention"
+    try:
+        config_obj.__dict__["rlt_mem_scheme"] = scheme
+        config_obj.__dict__["rlt_encoder_type"] = encoder_type
+    except Exception:
+        setattr(config_obj, "rlt_mem_scheme", scheme)
+        setattr(config_obj, "rlt_encoder_type", encoder_type)
+    return scheme
+
+
+def build_rlt_config(model_cfg: Any, state_dict: Any = None) -> OpenPiPytorchRLTConfig:
     """Build optional RLT-token config from ``actor.model.openpi``."""
     from omegaconf import OmegaConf
 
+    encoder_type = str(
+        OmegaConf.select(model_cfg, "rlt_encoder_type", default="") or ""
+    )
+    mem_scheme = resolve_rlt_mem_scheme(
+        encoder_type=encoder_type,
+        mem_scheme=int(OmegaConf.select(model_cfg, "rlt_mem_scheme", default=1)),
+        mem_len_max=int(OmegaConf.select(model_cfg, "rlt_mem_len_max", default=1)),
+        return_prefix=bool(
+            OmegaConf.select(model_cfg, "rlt_return_prefix", default=False)
+        ),
+        state_dict=state_dict,
+    )
     return OpenPiPytorchRLTConfig(
         use_rlt=bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
         rlt_alpha=float(OmegaConf.select(model_cfg, "rlt_alpha", default=1.0)),
@@ -100,8 +224,12 @@ def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
         rlt_mem_len_max=int(
             OmegaConf.select(model_cfg, "rlt_mem_len_max", default=1)
         ),
-        rlt_mem_scheme=int(
-            OmegaConf.select(model_cfg, "rlt_mem_scheme", default=1)
+        rlt_mem_scheme=mem_scheme,
+        rlt_encoder_type=(
+            "append_self_attention" if mem_scheme == 0 else "cross_attention"
+        ),
+        rlt_return_prefix=bool(
+            OmegaConf.select(model_cfg, "rlt_return_prefix", default=False)
         ),
     )
 
@@ -161,13 +289,16 @@ def _normalize_wrapper_state_dict(state_dict):
     return normalized
 
 
-def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> None:
+def load_full_wrapper_weights(
+    wrapper, weights_path, *, expect_rlt: bool, loaded: Any = None
+) -> None:
     """Load an RLinf full-wrapper checkpoint into an OpenPI_RLinf wrapper."""
     import torch
 
     from rlinf.utils.ckpt_convertor.openpi._core import as_state_dict
 
-    loaded = torch.load(str(weights_path), map_location="cpu", weights_only=False)
+    if loaded is None:
+        loaded = torch.load(str(weights_path), map_location="cpu", weights_only=False)
     state_dict = _normalize_wrapper_state_dict(as_state_dict(loaded))
     has_rlt = any(key.startswith("rlt_module.") for key in state_dict)
     has_mem = any(key.startswith("mem.") for key in state_dict)

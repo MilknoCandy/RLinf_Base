@@ -1,0 +1,9 @@
+frame_main.jpg
+frame_wrist.jpg
+frame_main_*.jpg
+frame_wrist_*.jpg
+state.json
+cmd.json
+episodes.jsonl
+.~*
+.tmp_*

@@ -17,6 +17,7 @@
 from rlinf.data.storage.lerobot.compat import (
     add_frame_to_dataset,
     episode_boundaries,
+    fix_lerobot_episode_data_index,
 )
 from rlinf.data.storage.lerobot.paths import (
     default_hf_lerobot_home,
@@ -29,6 +30,7 @@ __all__ = [
     "LeRobotDatasetWriter",
     "add_frame_to_dataset",
     "episode_boundaries",
+    "fix_lerobot_episode_data_index",
     "default_hf_lerobot_home",
     "resolve_lerobot_dataset_root",
     "resolve_lerobot_repo_id",

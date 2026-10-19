@@ -19,8 +19,10 @@ from typing import Any, Literal
 import torch
 
 from rlinf.algorithms.rlt.expert import predict_expert_actions
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
-from rlinf.algorithms.rlt.vlm_phase import VLMPhaseGate
+from rlinf.algorithms.rlt.transition import (
+    active_env_type,
+    use_simulator_transition_replay,
+)
 from rlinf.envs import SupportedEnvType
 
 
@@ -38,7 +40,6 @@ class RLTRouteContext:
     default_actor_switch: bool = False
     dones: torch.Tensor | None = None
     stage_id: int = 0
-    vlm_p_yes: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True)
@@ -97,6 +98,24 @@ def _normalize_rlt_switch_flags(
     if actions.shape[1] > 1:
         rlt_switch_flags = rlt_switch_flags.expand(-1, actions.shape[1])
     return rlt_switch_flags.reshape(actions.shape[0], actions.shape[1], 1)
+
+
+def expert_disagreement_mask(
+    student_actions: torch.Tensor,
+    expert_actions: torch.Tensor,
+    *,
+    l1_threshold: float,
+    ignore_dims: tuple[int, ...] = (),
+) -> torch.Tensor:
+    """Per-env mask: residual chunk is far from the teacher (pose L1)."""
+    delta = (student_actions - expert_actions).abs()
+    if ignore_dims:
+        keep = [idx for idx in range(delta.shape[-1]) if idx not in set(ignore_dims)]
+        if not keep:
+            return torch.zeros(delta.shape[0], dtype=torch.bool, device=delta.device)
+        delta = delta[..., keep]
+    mean_l1 = delta.reshape(delta.shape[0], -1).mean(dim=-1)
+    return mean_l1 > float(l1_threshold)
 
 
 def _base_ref_actions(
@@ -158,24 +177,26 @@ class SimulatorRLTRoute(RLTRoute):
         use_schedule: bool,
         warmup_updates: int,
         full_task: bool = False,
-        phase_gate: VLMPhaseGate | None = None,
-        preserve_vla_proposal_on_intervene: bool = False,
         simulate_intervention_prob: float = 0.0,
+        correct_when_disagree: bool = False,
+        correct_action_l1: float = 0.12,
+        correct_ignore_dims: tuple[int, ...] | list[int] | None = None,
     ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
         # Full-task mode (e.g. short bowl): missing switch flags mean the
-        # residual policy owns every chunk. A phase_gate overrides that.
+        # residual policy owns every chunk.
         self.full_task = bool(full_task)
-        self.phase_gate = phase_gate
-        # Alias used by predict_rlt_actions when scoring the VLM gate.
-        self.z_phase = phase_gate
-        # Bee keeps ã on intervention samples; RLT overwrites with a^H.
-        self.preserve_vla_proposal_on_intervene = bool(
-            preserve_vla_proposal_on_intervene
-        )
         # Headless LIBERO-PRO stand-in for SpaceMouse: Bernoulli expert takeover.
         self.simulate_intervention_prob = float(simulate_intervention_prob)
+        # Privileged-teacher correction: query ZAP every train chunk, take over
+        # only when ‖π-a^H‖ is large. Residual still acts when it is close.
+        self.correct_when_disagree = bool(correct_when_disagree)
+        self.correct_action_l1 = float(correct_action_l1)
+        if correct_ignore_dims is None:
+            self.correct_ignore_dims: tuple[int, ...] = ()
+        else:
+            self.correct_ignore_dims = tuple(int(dim) for dim in correct_ignore_dims)
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
@@ -193,20 +214,6 @@ class SimulatorRLTRoute(RLTRoute):
                 device=actions.device,
                 default=self.full_task,
             )
-        elif self.phase_gate is not None:
-            if ctx.vlm_p_yes is None:
-                raise RuntimeError(
-                    "VLM phase gate requires vlm_p_yes from the frozen VLM. "
-                    "Set algorithm.rlt_phase_gate.mode=none for full-task "
-                    "training without the gate."
-                )
-            critical_phase, metrics = self.phase_gate.update(
-                ctx.vlm_p_yes,
-                dones=ctx.dones,
-                stage_id=ctx.stage_id,
-            )
-            critical_phase = critical_phase.to(device=actions.device)
-            result["rlt_phase_metrics"] = metrics
         else:
             critical_phase = _last_info_bool(
                 None,
@@ -233,16 +240,46 @@ class SimulatorRLTRoute(RLTRoute):
             self.simulate_intervention_prob > 0.0
             and ctx.mode == "train"
             and ctx.expert_model is not None
-            and ready_for_online
         ):
             simulated = (
                 torch.rand((batch_size,), device=actions.device)
                 < self.simulate_intervention_prob
             )
             requested_expert_takeover = requested_expert_takeover | simulated
+        expert_actions = None
+        if (
+            self.correct_when_disagree
+            and ctx.mode == "train"
+            and ctx.expert_model is not None
+            and self.correct_action_l1 > 0.0
+        ):
+            expert_actions = predict_expert_actions(
+                ctx.expert_model,
+                ctx.env_obs,
+                chunk_len=chunk_len,
+                action_dim=action_dim,
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            disagree = expert_disagreement_mask(
+                actions,
+                expert_actions,
+                l1_threshold=self.correct_action_l1,
+                ignore_dims=self.correct_ignore_dims,
+            )
+            requested_expert_takeover = requested_expert_takeover | disagree
+            result["rlt_correct_metrics"] = {
+                "correct_disagree_rate": disagree.to(torch.float32).mean().item(),
+                "correct_action_l1": (actions - expert_actions)
+                .abs()
+                .mean()
+                .detach()
+                .item(),
+            }
+        # Human/expert monitoring is available from the first chunk. Residual
+        # handover still waits on warmup (Table III: 5 weight syncs).
         expert_takeover = (
             requested_expert_takeover
-            & ready_for_online
             & (ctx.mode == "train")
             & (ctx.expert_model is not None)
         )
@@ -272,29 +309,21 @@ class SimulatorRLTRoute(RLTRoute):
                     "ManiSkill RLT expert takeover was requested, but expert_model "
                     "is not configured."
                 )
-            expert_actions = predict_expert_actions(
-                ctx.expert_model,
-                ctx.env_obs,
-                chunk_len=chunk_len,
-                action_dim=action_dim,
-                device=actions.device,
-                dtype=actions.dtype,
-            )
+            if expert_actions is None:
+                expert_actions = predict_expert_actions(
+                    ctx.expert_model,
+                    ctx.env_obs,
+                    chunk_len=chunk_len,
+                    action_dim=action_dim,
+                    device=actions.device,
+                    dtype=actions.dtype,
+                )
             routed_actions = torch.where(
                 expert_takeover[:, None, None],
                 expert_actions,
                 routed_actions,
             ).contiguous()
             intervene_flags[expert_takeover] = True
-            if not self.preserve_vla_proposal_on_intervene:
-                ref_chunk = forward_inputs["ref_chunk"]
-                ref_actions = ref_chunk.reshape(batch_size, -1, action_dim).clone()
-                ref_actions[:, :chunk_len] = torch.where(
-                    expert_takeover[:, None, None],
-                    expert_actions,
-                    ref_actions[:, :chunk_len],
-                )
-                forward_inputs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)
 
         forward_inputs["action"] = _flatten_action_chunk(routed_actions).detach()
         forward_inputs["record_transition"] = critical_phase[:, None]
@@ -304,16 +333,6 @@ class SimulatorRLTRoute(RLTRoute):
             forward_inputs["rlt_switch_flags"] = critical_phase[:, None]
         result["intervene_flags"] = intervene_flags
         return RLTRouteOutput(actions=routed_actions, result=result)
-
-
-def _train_env_type(cfg: Any) -> SupportedEnvType | None:
-    train_env_cfg = cfg.env.get("train", None)
-    if train_env_cfg is None:
-        return None
-    try:
-        return SupportedEnvType(train_env_cfg.get("env_type", ""))
-    except ValueError:
-        return None
 
 
 # Envs without geometric switch flags: mode=none trains the residual all episode.
@@ -326,46 +345,39 @@ _FULL_TASK_DEFAULT_ENVS = frozenset(
 
 
 def _default_full_task(cfg: Any) -> bool:
-    return _train_env_type(cfg) in _FULL_TASK_DEFAULT_ENVS
+    return active_env_type(cfg) in _FULL_TASK_DEFAULT_ENVS
 
 
-def _resolve_phase_gate(cfg: Any) -> tuple[bool, VLMPhaseGate | None]:
-    """Return ``(full_task, phase_gate)`` from ``algorithm.rlt_phase_gate``.
+def _algorithm_cfg(cfg: Any) -> Any:
+    """Safe ``cfg.algorithm`` access for train and standalone-eval configs."""
+    algo = cfg.get("algorithm", None)
+    return algo if algo is not None else {}
 
-    Modes:
-      - ``none``: no VLM gate. On LIBERO / MetaWorld the residual owns the
-        whole episode (short single-task runs such as bowl).
-      - ``vlm``: frozen VLM yes/no decides the precision phase (Spatial / MT50).
-    """
-    gate_cfg = cfg.algorithm.get("rlt_phase_gate", {}) or {}
-    mode = str(gate_cfg.get("mode", "none")).lower()
-    default_full_task = _default_full_task(cfg)
-    if mode in {"none", "off", "full", ""}:
-        return default_full_task or bool(gate_cfg.get("full_task", False)), None
-    if mode == "vlm":
-        if not bool(gate_cfg.get("enable", True)):
-            return default_full_task or bool(gate_cfg.get("full_task", False)), None
-        return False, VLMPhaseGate.from_cfg(gate_cfg)
-    raise ValueError(
-        f"Unknown algorithm.rlt_phase_gate.mode={mode!r}. Use 'none' or 'vlm'."
-    )
+
+def _resolve_full_task(cfg: Any) -> bool:
+    """LIBERO / MetaWorld have no geometric switch flags: residual owns the episode."""
+    return _default_full_task(cfg)
 
 
 def build_rlt_route(cfg: Any) -> RLTRoute:
     if use_simulator_transition_replay(cfg):
-        schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
-        bee_cfg = cfg.algorithm.get("bee", {}) or {}
-        full_task, phase_gate = _resolve_phase_gate(cfg)
+        algo_cfg = _algorithm_cfg(cfg)
+        schedule_cfg = algo_cfg.get("rlt_schedule", {}) or {}
+        bee_cfg = algo_cfg.get("bee", {}) or {}
+        full_task = _resolve_full_task(cfg)
+        # Standalone eval has version=0; keep schedule off so full-task LIBERO
+        # actually executes the residual actor rather than the VLA ref.
+        only_eval = bool(cfg.get("runner", {}).get("only_eval", False))
+        use_schedule = bool(schedule_cfg.get("enable", False)) and not only_eval
         return SimulatorRLTRoute(
-            use_schedule=bool(schedule_cfg.get("enable", False)),
+            use_schedule=use_schedule,
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
             full_task=full_task,
-            phase_gate=phase_gate,
-            preserve_vla_proposal_on_intervene=bool(
-                bee_cfg.get("preserve_vla_proposal_on_intervene", False)
-            ),
             simulate_intervention_prob=float(
                 bee_cfg.get("simulate_intervention_prob", 0.0)
             ),
+            correct_when_disagree=bool(bee_cfg.get("correct_when_disagree", False)),
+            correct_action_l1=float(bee_cfg.get("correct_action_l1", 0.12)),
+            correct_ignore_dims=bee_cfg.get("correct_ignore_dims", None),
         )
     return RealworldRLTRoute()

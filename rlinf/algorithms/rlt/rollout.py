@@ -21,31 +21,6 @@ from rlinf.algorithms.rlt.route import RLTRoute, RLTRouteContext
 from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS, RLT_TRANSITION_PREFIX
 
 
-def _maybe_score_vlm_phase(
-    *,
-    feature_model: Any,
-    rlt_route: RLTRoute,
-    env_obs: dict[str, Any],
-    rlt_obs: dict[str, torch.Tensor],
-    rlt_switch_flags: torch.Tensor | None,
-    stage_id: int,
-) -> torch.Tensor | None:
-    gate = getattr(rlt_route, "phase_gate", None) or getattr(rlt_route, "z_phase", None)
-    if rlt_switch_flags is not None:
-        return None
-    if gate is None or not getattr(gate, "needs_vlm_score", False):
-        return None
-    batch_size = int(rlt_obs["z_rl"].shape[0])
-    device = rlt_obs["z_rl"].device
-    if gate.all_latched(stage_id, batch_size, device):
-        return torch.ones(batch_size, device=device, dtype=torch.float32)
-    if not hasattr(feature_model, "score_rlt_phase_yes"):
-        raise RuntimeError(
-            "VLM phase gate requires feature_model.score_rlt_phase_yes."
-        )
-    return feature_model.score_rlt_phase_yes(env_obs, question=gate.question)
-
-
 def _append_rlt_transition_obs(
     *,
     feature_model: Any,
@@ -93,16 +68,14 @@ def predict_rlt_actions(
         if rlt_switch_flags is not None and isinstance(
             result.get("forward_inputs"), dict
         ):
-            result["forward_inputs"]["rlt_switch_flags"] = rlt_switch_flags
-
-        vlm_p_yes = _maybe_score_vlm_phase(
-            feature_model=feature_model,
-            rlt_route=rlt_route,
-            env_obs=env_obs,
-            rlt_obs=rlt_obs,
-            rlt_switch_flags=rlt_switch_flags,
-            stage_id=stage_id,
-        )
+            # Env-provided flags may be per-step within the chunk
+            # ([B, chunk, ...] after chunk steps vs [B, 1] at reset). Keep
+            # only the last-step flag so the stored shape is stable across
+            # time steps and trajectory stacking does not fail.
+            flags = torch.as_tensor(rlt_switch_flags)
+            result["forward_inputs"]["rlt_switch_flags"] = flags.reshape(
+                flags.shape[0], -1
+            )[:, -1:]
 
         route_output = rlt_route.route(
             RLTRouteContext(
@@ -117,7 +90,6 @@ def predict_rlt_actions(
                 version=version,
                 dones=dones,
                 stage_id=stage_id,
-                vlm_p_yes=vlm_p_yes,
             )
         )
         actions = route_output.actions

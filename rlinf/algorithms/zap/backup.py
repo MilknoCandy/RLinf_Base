@@ -15,8 +15,9 @@
 """ZAP path backup: metric-gated n-step plus neighbor Q borrow.
 
 A path is a sequence of atoms $$(z_k, a_k, r_k, done_k)$$. The critic still
-evaluates $$Q(z, a)$$ on a single atom. Continuation uses $$(z, a)$$ kernels;
-truncation bootstrap optionally mixes neighbor $$Q$$ values.
+evaluates $$Q(z, a)$$ on a single atom. Continuation uses $$(z, a)$$ kernels.
+Neighbor mix matches a short history ending at truncation, not a single $$z$$,
+and borrows that neighbor's local bootstrap $$Q$$.
 """
 
 from __future__ import annotations
@@ -233,7 +234,9 @@ def neighbor_weights_batch(
     z_only = torch.softmax(z_scores, dim=-1)
     entropy = -(z_only * torch.log(z_only.clamp_min(1e-12))).sum(dim=-1)
     uniform = torch.log(n_eff.float())
-    fallback = entropy >= uniform * float(uniform_entropy_ratio)
+    # A single remaining neighbor has entropy 0 = log(1); that is a valid
+    # borrow, not a uniform soup.
+    fallback = (n_eff > 1) & (entropy >= uniform * float(uniform_entropy_ratio))
     weights = torch.where(fallback.unsqueeze(-1), torch.zeros_like(weights), weights)
     metrics = {
         "zap/neighbor_count": n_eff.float(),
@@ -335,15 +338,18 @@ def compute_zap_path_target(
     neighbor_z: torch.Tensor | None = None,
     neighbor_a: torch.Tensor | None = None,
     neighbor_q: torch.Tensor | None = None,
+    neighbor_query: torch.Tensor | None = None,
     local_bootstrap_q: torch.Tensor | None = None,
     neighbor_top_k: int | None = 32,
     uniform_entropy_ratio: float = 0.95,
+    neighbor_tau_z: float | None = None,
+    neighbor_tau_a: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Build one ZAP target along a stored path.
 
     Index 0 is the query atom. Continuations $$c_k$$ for $$k \\ge 1$$ compare
     $$z_0$$ to $$z_k$$ and $$a^\\pi_k$$ to $$a^{buf}_k$$. The query reward is
-    always included.
+    always included. Neighbor kernels default to the path ``tau_*``.
     """
     length = int(path_rewards.reshape(-1).numel())
     if path_horizons is None:
@@ -371,8 +377,11 @@ def compute_zap_path_target(
         neighbor_z=neighbor_z,
         neighbor_a=neighbor_a,
         neighbor_q=neighbor_q,
+        neighbor_query=neighbor_query,
         neighbor_top_k=neighbor_top_k,
         uniform_entropy_ratio=uniform_entropy_ratio,
+        neighbor_tau_z=neighbor_tau_z,
+        neighbor_tau_a=neighbor_tau_a,
     )
     return y.reshape(1), {key: float(value.mean()) for key, value in metrics.items()}
 
@@ -394,11 +403,19 @@ def compute_zap_path_targets_batch(
     neighbor_z: torch.Tensor | None = None,
     neighbor_a: torch.Tensor | None = None,
     neighbor_q: torch.Tensor | None = None,
+    neighbor_query: torch.Tensor | None = None,
     exclude_mask: torch.Tensor | None = None,
     neighbor_top_k: int | None = 32,
     uniform_entropy_ratio: float = 0.95,
+    neighbor_tau_z: float | None = None,
+    neighbor_tau_a: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Build ZAP targets for a batch of stored paths."""
+    """Build ZAP targets for a batch of stored paths.
+
+    ``neighbor_query`` is the matching feature for each row (short history by
+    default). ``None`` falls back to truncation $$z$$. ``neighbor_tau_z`` /
+    ``neighbor_tau_a`` override the path kernels only for in-batch mixing.
+    """
     z = path_z.float()
     a_pi = path_a_pi.float()
     rewards = path_rewards.reshape(path_rewards.shape[0], -1).float()
@@ -406,10 +423,10 @@ def compute_zap_path_targets_batch(
     horizons = path_horizons.reshape(path_horizons.shape[0], -1).float()
     batch, length = rewards.shape
     include, mean_c = select_zap_include_batch(
-        path_z=z,
-        path_a_buf=path_a_buf,
-        path_a_pi=a_pi,
-        path_dones=dones,
+        path_z=z[:, :length],
+        path_a_buf=path_a_buf[:, :length],
+        path_a_pi=a_pi[:, :length],
+        path_dones=dones[:, :length],
         path_len=path_len,
         tau_z=tau_z,
         tau_a=tau_a,
@@ -421,14 +438,9 @@ def compute_zap_path_targets_batch(
     boot_pos = (include - 1).clamp(min=0)
     ended = dones.gather(1, boot_pos.unsqueeze(1)).reshape(-1)
     bootstrapped = (~ended) & (bootstrap_discount > 0)
-    use_next = include < path_len.to(device=include.device)
-    trunc_idx = torch.where(use_next, include, (include - 1).clamp(min=0)).clamp(
-        max=length - 1
-    )
-    gather_z = trunc_idx.view(batch, 1, 1).expand(batch, 1, z.shape[-1])
-    gather_a = trunc_idx.view(batch, 1, 1).expand(batch, 1, a_pi.shape[-1])
-    trunc_z = z.gather(1, gather_z).reshape(batch, -1)
-    trunc_a_pi = a_pi.gather(1, gather_a).reshape(batch, -1)
+    trunc_idx = zap_bootstrap_index(include, z_len=int(z.shape[1]))
+    trunc_z = gather_path_atom(z, trunc_idx)
+    trunc_a_pi = gather_path_atom(a_pi, trunc_idx)
 
     local_q = torch.as_tensor(
         local_bootstrap_q, dtype=torch.float32, device=z.device
@@ -446,13 +458,14 @@ def compute_zap_path_targets_batch(
         and neighbor_q is not None
         and neighbor_z.shape[0] > 0
     ):
+        query = trunc_z if neighbor_query is None else neighbor_query
         weights, w_metrics = neighbor_weights_batch(
-            trunc_z,
+            query,
             trunc_a_pi,
             neighbor_z,
             neighbor_a,
-            tau_z=tau_z,
-            tau_a=tau_a,
+            tau_z=float(tau_z if neighbor_tau_z is None else neighbor_tau_z),
+            tau_a=float(tau_a if neighbor_tau_a is None else neighbor_tau_a),
             top_k=neighbor_top_k,
             uniform_entropy_ratio=uniform_entropy_ratio,
             exclude_mask=exclude_mask,
@@ -496,6 +509,115 @@ def reduce_zap_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, float]:
     return {key: float(value.float().mean().item()) for key, value in metrics.items()}
 
 
+def flatten_path_actor_obs(
+    path_z: torch.Tensor,
+    path_proprio: torch.Tensor,
+    path_ref: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Flatten path atoms to actor rows ``[B * L, ...]``.
+
+    Each atom keeps its own ``proprio`` and ``ref_chunk``. Do not broadcast the
+    query row across the path; residual ``π(ref, z, proprio)`` is step-local.
+    """
+    if (
+        path_z.shape[:2] != path_proprio.shape[:2]
+        or path_z.shape[:2] != path_ref.shape[:2]
+    ):
+        raise ValueError(
+            "path_z, path_proprio, and path_ref must share [B, L], got "
+            f"{tuple(path_z.shape[:2])}, {tuple(path_proprio.shape[:2])}, "
+            f"{tuple(path_ref.shape[:2])}."
+        )
+    batch, length = int(path_z.shape[0]), int(path_z.shape[1])
+    return {
+        "z_rl": path_z.reshape(batch * length, -1),
+        "proprio": path_proprio.reshape(batch * length, -1),
+        "ref_chunk": path_ref.reshape(batch * length, -1),
+    }
+
+
+def gather_path_atom(path: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Gather ``path[b, index[b]]`` from ``[B, L, D]``."""
+    if path.dim() != 3:
+        raise ValueError(f"path must be [B, L, D], got {tuple(path.shape)}.")
+    batch, _, dim = path.shape
+    idx = index.to(device=path.device, dtype=torch.long).reshape(batch, 1, 1)
+    idx = idx.expand(batch, 1, dim)
+    return path.gather(1, idx).reshape(batch, -1)
+
+
+def _unit_last(tensor: torch.Tensor) -> torch.Tensor:
+    denom = tensor.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    return tensor / denom
+
+
+def gather_path_history(
+    path_z: torch.Tensor,
+    path_proprio: torch.Tensor,
+    index: torch.Tensor,
+    *,
+    hist_len: int,
+) -> torch.Tensor:
+    """Flatten the last ``hist_len`` atoms ending at ``index``.
+
+    Each atom is unit-normalized ``(z, proprio, Δproprio)`` so a slowly
+    changing $$z$$ does not drown the proprio orbit. Positions before the
+    path start are left-padded with zeros.
+    """
+    if hist_len < 1:
+        raise ValueError(f"hist_len must be >= 1, got {hist_len}.")
+    z = path_z.float()
+    proprio = path_proprio.float()
+    if z.dim() == 2:
+        z = z.unsqueeze(-1)
+    if proprio.dim() == 2:
+        proprio = proprio.unsqueeze(-1)
+    if z.dim() != 3 or proprio.dim() != 3:
+        raise ValueError(
+            "path_z and path_proprio must be [B, L, D], got "
+            f"{tuple(z.shape)} and {tuple(proprio.shape)}."
+        )
+    if z.shape[:2] != proprio.shape[:2]:
+        raise ValueError(
+            "path_z and path_proprio must share [B, L], got "
+            f"{tuple(z.shape[:2])} vs {tuple(proprio.shape[:2])}."
+        )
+    batch, length, z_dim = int(z.shape[0]), int(z.shape[1]), int(z.shape[2])
+    p_dim = int(proprio.shape[2])
+    device = z.device
+    idx = index.to(device=device, dtype=torch.long).reshape(batch)
+    idx = idx.clamp(min=0, max=max(length - 1, 0))
+    offsets = torch.arange(hist_len, device=device) - (hist_len - 1)
+    pos = idx.unsqueeze(1) + offsets.unsqueeze(0)
+    valid = pos >= 0
+    pos = pos.clamp(min=0, max=max(length - 1, 0))
+    z_win = z.gather(1, pos.unsqueeze(-1).expand(batch, hist_len, z_dim))
+    p_win = proprio.gather(
+        1, pos.unsqueeze(-1).expand(batch, hist_len, p_dim)
+    )
+    valid_f = valid.unsqueeze(-1).to(dtype=z.dtype)
+    z_win = z_win * valid_f
+    p_win = p_win * valid_f
+    delta = torch.zeros_like(p_win)
+    if hist_len > 1:
+        step_valid = (valid[:, 1:] & valid[:, :-1]).unsqueeze(-1).to(dtype=z.dtype)
+        delta[:, 1:] = (p_win[:, 1:] - p_win[:, :-1]) * step_valid
+    feat = torch.cat([_unit_last(z_win), _unit_last(p_win), _unit_last(delta)], dim=-1)
+    return feat.reshape(batch, -1)
+
+
+def zap_bootstrap_index(include: torch.Tensor, *, z_len: int) -> torch.Tensor:
+    """State index after the included rewards: ``z[include]``.
+
+    ``include`` is the reward count. Packing stores one extra next-state atom so
+    ``include == path_len`` still bootstraps from ``s_{t+n}``, not the last
+    rewarded atom (which would add ``r+Q`` on the same state).
+    """
+    if z_len < 1:
+        raise ValueError(f"z_len must be >= 1, got {z_len}.")
+    return include.to(dtype=torch.long).clamp(min=0, max=z_len - 1)
+
+
 def attach_episode_zap_paths(
     transitions: list[Any],
     *,
@@ -512,18 +634,27 @@ def attach_episode_zap_paths(
         raise KeyError(f"ZAP path packing requires curr_obs['{z_key}'].")
     z_rows = []
     a_rows = []
+    proprio_rows = []
+    ref_rows = []
     r_rows = []
     h_rows = []
     d_rows = []
     for tr in transitions:
         if z_key not in tr.curr_obs:
             raise KeyError(f"ZAP path packing requires curr_obs['{z_key}'].")
+        if "proprio" not in tr.curr_obs or "ref_chunk" not in tr.curr_obs:
+            raise KeyError(
+                "ZAP path packing requires curr_obs['proprio'] and "
+                "curr_obs['ref_chunk'] so π along the path is step-local."
+            )
         if not isinstance(tr.actions, torch.Tensor):
             raise ValueError("ZAP paths require actions on every transition.")
         if not isinstance(tr.rewards, torch.Tensor):
             raise ValueError("ZAP paths require rewards on every transition.")
-        z_rows.append(tr.curr_obs[z_key].detach().float().reshape(-1))
+        z_rows.append(_obs_feature(tr.curr_obs, z_key))
         a_rows.append(tr.actions.detach().float().reshape(-1))
+        proprio_rows.append(_obs_feature(tr.curr_obs, "proprio"))
+        ref_rows.append(_obs_feature(tr.curr_obs, "ref_chunk"))
         rewards = tr.rewards.detach().float()
         r_rows.append(discounted_chunk_reward(rewards, gamma).reshape(()))
         h_rows.append(
@@ -537,10 +668,28 @@ def attach_episode_zap_paths(
         )
     z = torch.stack(z_rows, dim=0)
     a = torch.stack(a_rows, dim=0)
+    proprio = torch.stack(proprio_rows, dim=0)
+    ref = torch.stack(ref_rows, dim=0)
     r = torch.stack(r_rows, dim=0)
     h = torch.stack(h_rows, dim=0)
     d = torch.stack(d_rows, dim=0)
-    z_win = _forward_windows(z, max_atoms, pad_value=0.0)
+    last_next = getattr(transitions[-1], "next_obs", None)
+    if not isinstance(last_next, dict):
+        raise KeyError(
+            "ZAP path packing requires next_obs on the last transition so "
+            "n-step can bootstrap from s_{t+n} after a full window."
+        )
+    z_ext = torch.cat([z, _obs_feature(last_next, z_key).unsqueeze(0)], dim=0)
+    proprio_ext = torch.cat(
+        [proprio, _obs_feature(last_next, "proprio").unsqueeze(0)], dim=0
+    )
+    ref_ext = torch.cat(
+        [ref, _obs_feature(last_next, "ref_chunk").unsqueeze(0)], dim=0
+    )
+    state_atoms = max_atoms + 1
+    z_win = _forward_windows(z_ext, state_atoms, pad_value=0.0)[:n]
+    proprio_win = _forward_windows(proprio_ext, state_atoms, pad_value=0.0)[:n]
+    ref_win = _forward_windows(ref_ext, state_atoms, pad_value=0.0)[:n]
     a_win = _forward_windows(a, max_atoms, pad_value=0.0)
     r_win = _forward_windows(r, max_atoms, pad_value=0.0)
     h_win = _forward_windows(h, max_atoms, pad_value=1.0)
@@ -552,12 +701,26 @@ def attach_episode_zap_paths(
     )
     for start in range(n):
         # Shape [T=1, B=1, max_atoms, ...] so replay concat on dim=1 works.
+        # z/proprio/ref are max_atoms+1 so bootstrap can use s_{t+n}.
         transitions[start].zap_path_z = z_win[start].unsqueeze(0).unsqueeze(0)
         transitions[start].zap_path_a = a_win[start].unsqueeze(0).unsqueeze(0)
+        transitions[start].zap_path_proprio = (
+            proprio_win[start].unsqueeze(0).unsqueeze(0)
+        )
+        transitions[start].zap_path_ref = ref_win[start].unsqueeze(0).unsqueeze(0)
         transitions[start].zap_path_r = r_win[start].view(1, 1, max_atoms)
         transitions[start].zap_path_horizon = h_win[start].view(1, 1, max_atoms)
         transitions[start].zap_path_done = d_win[start].view(1, 1, max_atoms)
         transitions[start].zap_path_len = lengths[start].view(1, 1, 1)
+
+
+def _obs_feature(obs: dict[str, Any], key: str) -> torch.Tensor:
+    if key not in obs:
+        raise KeyError(f"ZAP path packing requires obs['{key}'].")
+    value = obs[key]
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"obs['{key}'] must be a tensor, got {type(value)}.")
+    return value.detach().float().reshape(-1)
 
 
 def _forward_windows(

@@ -17,7 +17,11 @@
 import pytest
 import torch
 
-from rlinf.data.storage.lerobot import add_frame_to_dataset, episode_boundaries
+from rlinf.data.storage.lerobot import (
+    add_frame_to_dataset,
+    episode_boundaries,
+    fix_lerobot_episode_data_index,
+)
 from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
 
 
@@ -174,6 +178,23 @@ class _V30Dataset:
     def __init__(self, starts, ends):
         self.episode_data_index = None
         self.meta = _V30Meta(starts, ends)
+
+
+def test_fix_lerobot_episode_data_index_maps_original_ids():
+    """Subset loaders keep original episode_index; index tensors must too."""
+    dataset = _V21Dataset([0, 12, 30], [12, 30, 44])
+    fix_lerobot_episode_data_index(dataset, [1290, 1355, 1690])
+    index = dataset.episode_data_index
+    assert index["from"].shape[0] == 1691
+    assert int(index["from"][1355]) == 12
+    assert int(index["to"][1355]) == 30
+    assert int(index["from"][0]) == -1
+
+
+def test_fix_lerobot_episode_data_index_skips_v30():
+    dataset = _V30Dataset([0], [1])
+    fix_lerobot_episode_data_index(dataset, [9])
+    assert dataset.episode_data_index is None
 
 
 @pytest.mark.parametrize("dataset_cls", [_V21Dataset, _V30Dataset])

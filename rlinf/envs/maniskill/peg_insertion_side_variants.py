@@ -88,6 +88,29 @@ def patch_rlt_openpi_joint_env_args(
     return env_args
 
 
+def cfg_task_instruction(cfg) -> str | None:
+    """Return a non-empty ``task_instruction`` override from env cfg, else None.
+
+    The override is used as-is: the peg ``into``→``in`` rewrite is not applied,
+    so eval can measure that lexical difference.
+    """
+    if cfg is None:
+        return None
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        raw = getter("task_instruction", None)
+    else:
+        raw = getattr(cfg, "task_instruction", None)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def expand_task_instruction(instruction: str, *, num_envs: int) -> list[str]:
+    return [instruction for _ in range(num_envs)]
+
+
 def normalize_peg_instruction(instruction):
     if isinstance(instruction, str) and instruction == _RLT_LEGACY_PEG_PROMPT:
         return _RLT_DEFAULT_PROMPT
@@ -157,6 +180,7 @@ def wrap_rlt_openpi_joint_obs(
     num_envs: int,
     device: torch.device,
     is_peg_insertion_side: bool,
+    force_task_descriptions: bool = False,
 ) -> dict[str, Any]:
     sensor_data = raw_obs.pop("sensor_data")
     raw_obs.pop("sensor_param")
@@ -164,7 +188,7 @@ def wrap_rlt_openpi_joint_obs(
     main_images = sensor_data[_RLT_MAIN_CAMERA_KEY]["rgb"]
     wrist_images = sensor_data[_RLT_WRIST_CAMERA_KEY]["rgb"]
 
-    if infos is not None and "prompt" in infos:
+    if not force_task_descriptions and infos is not None and "prompt" in infos:
         task_descriptions = infos["prompt"]
         if is_peg_insertion_side:
             task_descriptions = normalize_peg_instructions(

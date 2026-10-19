@@ -130,7 +130,15 @@ class RLTACLossMixin:
 
         bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
         bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
+        # Scale only the VLA-proposal term so a weak ã does not pin the actor
+        # after expert corrections. Human-step BC stays unscaled.
+        bc_ref_scale = float(self.cfg.algorithm.get("bc_ref_scale", 1.0))
+        bc_scale = torch.where(
+            human_mask,
+            torch.ones_like(bc_error),
+            bc_error.new_full((), bc_ref_scale),
+        )
+        bc_loss = torch.mean(bc_error * bc_scale)
 
         policy_mask = ~human_mask
         ref_error = torch.mean(torch.square(pi_chunk - bc_ref_chunk), dim=-1)
@@ -147,6 +155,7 @@ class RLTACLossMixin:
             "bc_loss": bc_loss.detach().item(),
             "bc_ref_loss": bc_ref.detach().item(),
             "bc_human_loss": bc_human.detach().item(),
+            "bc_ref_scale": bc_ref_scale,
             "human_mask_ratio": human_ratio,
             "policy_mask_ratio": 1.0 - human_ratio,
         }
@@ -657,6 +666,18 @@ class RLTACReplayMixin:
         return obs if obs else None
 
     @staticmethod
+    def _flat_dict_num_rows(flat: dict, dict_key: str) -> int:
+        value = flat.get(dict_key)
+        if not isinstance(value, dict):
+            return 0
+        rows = [
+            int(tensor.shape[0])
+            for tensor in value.values()
+            if isinstance(tensor, torch.Tensor)
+        ]
+        return max(rows) if rows else 0
+
+    @staticmethod
     def _flat_record_transition(flat: dict, idx: int) -> bool:
         forward_inputs = flat.get("forward_inputs")
         if not isinstance(forward_inputs, dict):
@@ -736,6 +757,13 @@ class RLTACReplayMixin:
 
                 curr_obs = self._rlt_obs_from_flat_dict(flat, "curr_obs", idx)
                 if curr_obs is None:
+                    obs_num_rows = self._flat_dict_num_rows(flat, "curr_obs")
+                    if 0 < obs_num_rows <= idx:
+                        # Each rollout epoch appends one trailing bootstrap
+                        # action row whose policy output is never stepped in
+                        # the env, so it has no transition obs. Rows past the
+                        # obs length are expected; stop ingesting this env.
+                        break
                     raise ValueError(
                         "RLT transition replay requires curr_obs. Ensure "
                         "update_rlt_transitions() populated transition obs "
@@ -996,7 +1024,11 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
         if self.use_rlt_schedule:
+            # RLT schedule gates on replay warmup_min_size. Do not also block the
+            # DataLoader on demo_buffer.min_buffer_size (HITL intervene-only
+            # demos often stay below 64 for a long time and would hang training).
             self.buffer_dataset.min_replay_buffer_size = 1
+            self.buffer_dataset.min_demo_buffer_size = 0
 
     @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel):

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>RLinf HITL</title>
+  <style>
+    body { font-family: sans-serif; margin: 12px; background: #111; color: #eee; }
+    #status { margin: 8px 0; font-family: monospace; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    img { background: #222; max-width: 420px; min-width: 240px; min-height: 180px; }
+    button#hold {
+      font-size: 20px; padding: 10px 24px; border: 0; border-radius: 8px; cursor: pointer;
+    }
+    button#hold.off { background: #444; color: #ccc; }
+    button#hold.on { background: #c0392b; color: #fff; }
+    button#controller.off { background: #2a4a6b; color: #fff; }
+    button#controller.on { background: #1a6b3c; color: #fff; }
+    label { display: block; margin: 4px 0; font-size: 13px; }
+    input[type=range] { width: 260px; }
+    kbd { background: #333; padding: 1px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h2>LIBERO HITL</h2>
+  <p>默认人类遥操作（xy / z / rpy；夹爪等轴可在 yaml 冻结）。点「切专家」后，接管改由 ZAP 调整（再点结束）。
+    人类模式按住 <kbd>Space</kbd>；专家模式 <kbd>Space</kbd> 开关接管。
+    <kbd>WASD</kbd> xy，<kbd>R/F</kbd> z，
+    <kbd>Q/E</kbd> 或 ←/→ yaw，<kbd>T/G</kbd> pitch，<kbd>Y/H</kbd> roll，
+    <kbd>Z/X</kbd> 夹爪。</p>
+  <button id="controller" class="off">当前：人类（点击切专家）</button>
+  <button id="hold" class="off">VLA（点击接管）</button>
+  <div id="status">connecting…</div>
+  <div class="row">
+    <div><div>agentview</div><img id="main" alt="main" /></div>
+    <div><div>wrist</div><img id="wrist" alt="wrist" /></div>
+  </div>
+  <div id="sliders"></div>
+  <script>
+    const KEYS = ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"];
+    const action = {dx:0, dy:0, dz:0, droll:0, dpitch:0, dyaw:0, gripper:-1};
+    let hold = false;
+    let controller = "human";
+    let seq = 0;
+    const keysDown = new Set();
+
+    function dirOf() {
+      const path = location.pathname;
+      return path.replace(/\/console\.html$/, "");
+    }
+    const filesDir = dirOf();
+    const apiFile = (name) => filesDir.replace("/files/", "/api/contents/") + "/" + name;
+
+    function xsrf() {
+      const m = document.cookie.match(/(?:^|; )_xsrf=([^;]+)/);
+      return m ? decodeURIComponent(m[1]) : "";
+    }
+
+    function sliderBox() {
+      const root = document.getElementById("sliders");
+      KEYS.forEach((k) => {
+        const lab = document.createElement("label");
+        lab.innerHTML = `${k} <input type="range" min="-1" max="1" step="0.02" value="${action[k]}" id="s_${k}"> <span id="v_${k}">${action[k]}</span>`;
+        root.appendChild(lab);
+        lab.querySelector("input").addEventListener("input", (e) => {
+          action[k] = parseFloat(e.target.value);
+          document.getElementById("v_" + k).textContent = action[k].toFixed(2);
+        });
+      });
+    }
+    sliderBox();
+
+    function isExpert() { return controller === "expert"; }
+    function holdLabel() {
+      if (isExpert()) return hold ? "EXPERT（ZAP接管中）" : "VLA（点击专家接管）";
+      return hold ? "HUMAN（接管中）" : "VLA（点击接管）";
+    }
+    function setHold(v) {
+      hold = v;
+      const b = document.getElementById("hold");
+      b.className = hold ? "on" : "off";
+      b.textContent = holdLabel();
+    }
+    function setController(v) {
+      const next = (v === "expert") ? "expert" : "human";
+      if (next !== controller) {
+        controller = next;
+        setHold(false);
+        keysDown.clear();
+      }
+      const b = document.getElementById("controller");
+      if (b) {
+        b.className = isExpert() ? "on" : "off";
+        b.textContent = isExpert()
+          ? "当前：专家 ZAP（点击切人类）"
+          : "当前：人类（点击切专家）";
+      }
+      const hb = document.getElementById("hold");
+      if (hb) hb.textContent = holdLabel();
+    }
+    document.getElementById("controller").onclick = () =>
+      setController(isExpert() ? "human" : "expert");
+    document.getElementById("hold").onclick = () => setHold(!hold);
+
+    const keyMap = {
+      KeyW: ["dx", 0.6], KeyS: ["dx", -0.6],
+      KeyA: ["dy", 0.6], KeyD: ["dy", -0.6],
+      KeyR: ["dz", 0.6], KeyF: ["dz", -0.6],
+      KeyY: ["droll", 0.5], KeyH: ["droll", -0.5],
+      KeyT: ["dpitch", 0.5], KeyG: ["dpitch", -0.5],
+      KeyQ: ["dyaw", 0.5], KeyE: ["dyaw", -0.5],
+      ArrowLeft: ["dyaw", 0.5], ArrowRight: ["dyaw", -0.5],
+      KeyZ: ["gripper", 1.0], KeyX: ["gripper", -1.0],
+    };
+    window.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (e.repeat) return;
+        if (isExpert()) { setHold(!hold); return; }
+        setHold(true);
+        return;
+      }
+      if (keyMap[e.code]) { e.preventDefault(); keysDown.add(e.code); }
+    });
+    window.addEventListener("keyup", (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (!isExpert()) setHold(false);
+        return;
+      }
+      if (keyMap[e.code]) e.preventDefault();
+      keysDown.delete(e.code);
+    });
+
+    function applyKeys() {
+      const live = {
+        dx: action.dx, dy: action.dy, dz: action.dz,
+        droll: action.droll, dpitch: action.dpitch, dyaw: action.dyaw,
+        gripper: action.gripper
+      };
+      keysDown.forEach((code) => {
+        const m = keyMap[code];
+        if (!m) return;
+        live[m[0]] = m[1];
+      });
+      return live;
+    }
+
+    async function putCmd(cur) {
+      const body = {
+        type: "file",
+        format: "text",
+        content: JSON.stringify({
+          seq: seq,
+          hold: hold,
+          controller: controller,
+          action: KEYS.map((k) => cur[k]),
+        }),
+      };
+      const token = xsrf();
+      await fetch(apiFile("cmd.json"), {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? {"X-XSRFToken": token} : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    }
+
+    async function pullState() {
+      try {
+        const r = await fetch(filesDir + "/state.json?t=" + Date.now(), {credentials: "same-origin"});
+        if (!r.ok) return;
+        const data = await r.json();
+        seq = data.seq || 0;
+      } catch (e) {}
+    }
+
+    function refreshImgs() {
+      const t = Date.now();
+      document.getElementById("main").src = filesDir + "/frame_main.jpg?t=" + t;
+      document.getElementById("wrist").src = filesDir + "/frame_wrist.jpg?t=" + t;
+    }
+
+    async function tick() {
+      await pullState();
+      const cur = applyKeys();
+      try { await putCmd(cur); } catch (e) {
+        document.getElementById("status").textContent = "write failed: " + e;
+        return;
+      }
+      refreshImgs();
+      document.getElementById("status").textContent =
+        `seq=${seq} controller=${controller} hold=${hold} action=[${KEYS.map((k) => cur[k].toFixed(2)).join(", ")}]`;
+    }
+    setInterval(tick, 80);
+    tick();
+  </script>
+</body>
+</html>

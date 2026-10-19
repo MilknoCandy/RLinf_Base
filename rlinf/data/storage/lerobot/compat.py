@@ -31,9 +31,16 @@ what removed ``LeRobotDataset.episode_data_index``.
 
 import functools
 import inspect
+from collections.abc import Sequence
 from typing import Any, Callable
 
-__all__ = ["add_frame_to_dataset", "episode_boundaries"]
+import torch
+
+__all__ = [
+    "add_frame_to_dataset",
+    "episode_boundaries",
+    "fix_lerobot_episode_data_index",
+]
 
 
 @functools.lru_cache(maxsize=None)
@@ -87,6 +94,37 @@ def add_frame_to_dataset(dataset: Any, frame_data: dict[str, Any]) -> None:
         dataset.add_frame(frame, task=task)
     else:
         dataset.add_frame(frame)
+
+
+def fix_lerobot_episode_data_index(dataset: Any, episodes: Sequence[int]) -> None:
+    """Reindex ``episode_data_index`` so original episode ids still look up.
+
+    Opening ``LeRobotDataset(..., episodes=[...])`` rebuilds
+    ``episode_data_index`` with length ``len(episodes)``, but parquet rows keep
+    the original ``episode_index``. ``__getitem__`` then does
+    ``episode_data_index["from"][ep_idx]`` and raises IndexError (e.g. index
+    1355 with size 44).
+
+    Dataset format v3.0 (lerobot >= 0.4) dropped ``episode_data_index``, so
+    this is a no-op there.
+    """
+    index = getattr(dataset, "episode_data_index", None)
+    if index is None:
+        return
+    if not episodes:
+        raise ValueError("episodes must be non-empty to fix episode_data_index.")
+
+    ep_idx_mapping = {int(ep): i for i, ep in enumerate(sorted(episodes))}
+    max_ep_idx = max(ep_idx_mapping) + 1
+    old_from = index["from"]
+    old_to = index["to"]
+    new_from = torch.full((max_ep_idx,), -1, dtype=old_from.dtype)
+    new_to = torch.full((max_ep_idx,), -1, dtype=old_to.dtype)
+    for orig_ep, new_idx in ep_idx_mapping.items():
+        new_from[orig_ep] = old_from[new_idx]
+        new_to[orig_ep] = old_to[new_idx]
+    index["from"] = new_from
+    index["to"] = new_to
 
 
 def episode_boundaries(dataset: Any) -> tuple[list[int], list[int]]:

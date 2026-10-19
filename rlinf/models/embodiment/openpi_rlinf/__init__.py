@@ -23,6 +23,7 @@ from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
     load_full_wrapper_weights,
     resolve_full_weights,
     resolve_model_safetensors,
+    resolve_rlt_mem_scheme,
 )
 from rlinf.utils.logging import get_logger
 
@@ -63,6 +64,35 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     model_path = pathlib.Path(cfg.model_path).expanduser()
     safetensors_path = resolve_model_safetensors(model_path)
     full_weights_path = resolve_full_weights(model_path)
+    peeked_full_weights = None
+    if full_weights_path is not None:
+        import torch
+
+        from omegaconf import open_dict
+
+        peeked_full_weights = torch.load(
+            str(full_weights_path), map_location="cpu", weights_only=False
+        )
+        scheme = resolve_rlt_mem_scheme(
+            encoder_type=str(
+                OmegaConf.select(model_cfg, "rlt_encoder_type", default="") or ""
+            ),
+            mem_scheme=int(OmegaConf.select(model_cfg, "rlt_mem_scheme", default=1)),
+            mem_len_max=int(OmegaConf.select(model_cfg, "rlt_mem_len_max", default=1)),
+            return_prefix=bool(
+                OmegaConf.select(model_cfg, "rlt_return_prefix", default=False)
+            ),
+            state_dict=peeked_full_weights,
+        )
+        with open_dict(model_cfg):
+            model_cfg.rlt_mem_scheme = scheme
+            model_cfg.rlt_encoder_type = (
+                "append_self_attention" if scheme == 0 else "cross_attention"
+            )
+        logger.info(
+            "openpi_rlinf: RLT encoder mem_scheme=%s from checkpoint keys",
+            scheme,
+        )
     if safetensors_path is None and full_weights_path is None:
         raise FileNotFoundError(
             "openpi_rlinf checkpoint not found. Expected either "
@@ -146,6 +176,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             wrapper,
             full_weights_path,
             expect_rlt=bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
+            loaded=peeked_full_weights,
         )
 
     source = full_weights_path if full_weights_path is not None else safetensors_path

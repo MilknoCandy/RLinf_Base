@@ -25,15 +25,35 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.libero.human_mailbox import (
+    HumanMailbox,
+    apply_human_override,
+    consume_human_skip,
+    is_chunk_wide_intervene_action,
+    mailbox_applies_wasd,
+    mailbox_expert_hold,
+    normalize_hitl_controller,
+    env0_action_chunk,
+    first_env_obs,
+    format_hitl_chunk,
+    format_hitl_chunk_text,
+    stack_chunk_intervene,
+)
+from rlinf.envs.libero.pro_pert import choose_pro_candidate
 from rlinf.envs.libero.utils import (
+    bowl_place_progress_from_obs,
     build_interleaved_eval_reset_state_ids,
+    count_new_episode_dones,
     distribute_reset_state_ids_round_robin,
     get_benchmark_overridden,
     get_libero_image,
     get_libero_type,
     get_libero_wrist_image,
+    merge_expert_intervene_flags,
     quat2axisangle,
     record_completed_episode_task_stats,
+    resolve_libero_pro_init_states,
+    update_progress_intervene_state,
 )
 from rlinf.envs.libero.venv import ReconfigureSubprocEnv
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
@@ -153,6 +173,7 @@ class LiberoEnv(gym.Env):
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
         self.start_idx = 0
+        self._train_episodes_started = 0
 
         self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
 
@@ -170,6 +191,82 @@ class LiberoEnv(gym.Env):
         self.prev_step_reward = np.zeros(self.num_envs)
         self.use_rel_reward = cfg.use_rel_reward
         self.use_step_penalty = getattr(cfg, "use_step_penalty", False)
+        # Appendix D seed-correction episodes, then optional progress-stall bursts.
+        raw_seed_episodes = int(cfg.get("expert_seed_episodes", 0))
+        n_workers = max(int(total_num_processes), 1)
+        self._expert_seed_quota = (
+            max(1, (raw_seed_episodes + n_workers - 1) // n_workers)
+            if raw_seed_episodes > 0 and (not self.is_eval)
+            else 0
+        )
+        self._expert_seed_completed = 0
+        self._expert_progress_intervene = bool(
+            cfg.get("expert_progress_intervene", False)
+        ) and (not self.is_eval)
+        self._expert_progress_min_delta = float(
+            cfg.get("expert_progress_min_delta", 0.008)
+        )
+        self._expert_progress_stall_steps = int(
+            cfg.get("expert_progress_stall_steps", 20)
+        )
+        self._expert_progress_burst_steps = int(
+            cfg.get("expert_progress_burst_steps", 30)
+        )
+        # Time-based fallback: residual failure (no success) also calls ZAP.
+        # Progress poses are often missing under LIBERO-PRO object perts.
+        self._expert_idle_intervene_steps = int(
+            cfg.get("expert_idle_intervene_steps", 0)
+        )
+        # Optional 100% expert collect (distill). Default off: residual acts,
+        # ZAP only via seed / stall / idle. Eval never has an expert.
+        self._expert_always_intervene = bool(
+            cfg.get("expert_always_intervene", False)
+        ) and (not self.is_eval)
+        self._expert_grasp_dist = float(cfg.get("expert_grasp_dist", 0.07))
+        self._expert_gripper_closed = float(cfg.get("expert_gripper_closed", 0.045))
+        mailbox_cfg = cfg.get("human_mailbox", None)
+        if mailbox_cfg is not None and not hasattr(mailbox_cfg, "get"):
+            mailbox_cfg = None
+        self._human_mailbox = HumanMailbox.from_cfg(mailbox_cfg)
+        if self._human_mailbox is not None and self.is_eval:
+            self._human_mailbox = None
+        # BEE Appendix A bowl: human / residual edit pose only; gripper stays
+        # on the VLA proposal. Keyboard Z/X must not rewrite a^H[..., 6].
+        self._hitl_freeze_gripper = True
+        if mailbox_cfg is not None and hasattr(mailbox_cfg, "get"):
+            self._hitl_freeze_gripper = bool(mailbox_cfg.get("freeze_gripper", True))
+        action_dim = int(cfg.get("action_dim", 7))
+        self._human_hold = False
+        self._human_action = np.zeros((self.num_envs, action_dim), dtype=np.float32)
+        self._last_step_actions = np.zeros((self.num_envs, action_dim), dtype=np.float32)
+        # Gripper command latched at hold start; kept until the UI opts out.
+        self._human_gripper_latch = -1.0
+        # Per-episode HITL outcome bookkeeping (env0 only; mailbox is 1-env).
+        self._hitl_intervened_ep = False
+        self._hitl_skipped_ep = False
+        self._hitl_skip_id_consumed = 0
+        self._hitl_outcome_recorded = False
+        self._hitl_last_outcome: dict | None = None
+        self._hitl_history: list[dict] = []
+        self._hitl_counts = {
+            "vla_success": 0,
+            "vla_fail": 0,
+            "hitl_success": 0,
+            "hitl_fail": 0,
+        }
+        self._hitl_chunk_id = 0
+        self._hitl_chunk_i = 0
+        self._hitl_chunk_policy: np.ndarray | None = None
+        self._hitl_chunk_ref: np.ndarray | None = None
+        self._hitl_pending_ref = None
+        self._hitl_pending_actor = None
+        self._hitl_pending_expert = False
+        self._hitl_chunk_expert = False
+        self._hitl_chunk_exec: np.ndarray | None = None
+        self._hitl_chunk_cmd: np.ndarray | None = None
+        self._hitl_chunk_flags: np.ndarray | None = None
+        self._hitl_chunk_expert_flags: np.ndarray | None = None
+        self._hitl_last_chunk: dict | None = None
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
@@ -247,6 +344,27 @@ class LiberoEnv(gym.Env):
 
             env_fns.append(env_fn)
         return env_fns
+
+    def _active_pro_pert_weights(self) -> dict[str, float] | None:
+        """Seed-phase weights, then online ``perturbation_weights``."""
+        seed_n = int(self.cfg.get("seed_pert_episodes", 0) or 0)
+        seed_raw = self.cfg.get("seed_perturbation_weights", None)
+        online_raw = self.cfg.get("perturbation_weights", None)
+
+        def _as_weights(raw) -> dict[str, float] | None:
+            if raw is None:
+                return None
+            if OmegaConf.is_config(raw):
+                raw = OmegaConf.to_container(raw, resolve=True)
+            if not isinstance(raw, dict) or not raw:
+                return None
+            return {str(key).lstrip("_"): float(value) for key, value in raw.items()}
+
+        if seed_n > 0 and self._train_episodes_started < seed_n:
+            seed_w = _as_weights(seed_raw)
+            if seed_w:
+                return seed_w
+        return _as_weights(online_raw)
 
     def get_env_fn_params(self, env_idx=None):
         env_fn_params = []
@@ -364,7 +482,12 @@ class LiberoEnv(gym.Env):
                                 (self.seed + idx_offset) % len(all_candidates)
                             ]
                         else:
-                            final_path = self._generator.choice(all_candidates)
+                            final_path = choose_pro_candidate(
+                                all_candidates,
+                                self._active_pro_pert_weights(),
+                                self._generator,
+                            )
+                            self._train_episodes_started += 1
 
             elif variant == "plus":
                 plus_suffix = raw_suffix.replace(".bddl", "") if raw_suffix else None
@@ -612,10 +735,12 @@ class LiberoEnv(gym.Env):
                 trial_ids.append(-1)
 
         # return np.array(task_ids), np.array(trial_ids)    # rlinf ver
-        return np.asarray(task_ids, dtype=np.int64), np.asarray(trial_ids, dtype=np.int64)
+        return np.asarray(task_ids, dtype=np.int64), np.asarray(
+            trial_ids, dtype=np.int64
+        )
 
     def _fallback_task_id(self):
-        """Pick a real suite task id for constructing idle (-1) eval env slots. """
+        """Pick a real suite task id for constructing idle (-1) eval env slots."""
         valid = (
             self.task_ids[self.task_ids >= 0]
             if getattr(self, "task_ids", None) is not None
@@ -645,39 +770,27 @@ class LiberoEnv(gym.Env):
             init_root = l_pro.get_libero_path("init_states")
             init_state = []
             for env_id in env_idx:
-                # task = self.task_suite.get_task(self.task_ids[env_id])    # rlinf ver
                 tid = int(self.task_ids[env_id])
                 if tid < 0:
                     tid = self._fallback_task_id()
                 task = self.task_suite.get_task(tid)
                 folder = self._pert_init_folders[env_id] or task.problem_folder
-                pert_init_path = os.path.join(init_root, folder, task.init_states_file)
-                states = None
-                init_path = None
-                used_folder = folder
-                if os.path.exists(pert_init_path):
-                    loaded = torch.load(pert_init_path, weights_only=False)
-                    n = len(loaded) if hasattr(loaded, "__len__") else 0
-                    if n == 0:
-                        if self.is_eval:
-                            logger.warning(
-                                "[LIBERO-PRO init] empty pruned_init, skip: %s",
-                                pert_init_path,
-                            )
-                    else:
-                        states = loaded
-                        init_path = pert_init_path
-                if states is None:
+                try:
+                    states, init_path, used_folder = resolve_libero_pro_init_states(
+                        init_root=init_root,
+                        pert_folder=folder,
+                        suite_folder=task.problem_folder,
+                        init_states_file=task.init_states_file,
+                    )
+                except FileNotFoundError as exc:
                     msg = (
                         "[LIBERO-PRO init] perturbation init missing or empty; "
-                        "suite fallback is invalid for eval "
                         f"env={env_id} wanted_folder={folder} "
-                        f"file={task.init_states_file} path={pert_init_path}"
+                        f"file={task.init_states_file}: {exc}"
                     )
                     if self.is_eval:
                         logger.error(msg)
-                        raise RuntimeError(msg)
-                    # states = self.task_suite.get_task_init_states(self.task_ids[env_id])   # rlinf ver
+                        raise RuntimeError(msg) from exc
                     states = self.task_suite.get_task_init_states(tid)
                     init_path = f"<suite:{task.problem_folder}/{task.init_states_file}>"
                     used_folder = task.problem_folder
@@ -687,6 +800,19 @@ class LiberoEnv(gym.Env):
                         init_path,
                         len(states),
                     )
+                else:
+                    if used_folder != folder:
+                        logger.warning(
+                            "[LIBERO-PRO init] empty or missing pert init; "
+                            "using original-suite init env=%s wanted=%s used=%s "
+                            "file=%s path=%s n=%s",
+                            env_id,
+                            folder,
+                            used_folder,
+                            task.init_states_file,
+                            init_path,
+                            len(states),
+                        )
                 trial = int(self.trial_ids[env_id])
                 if trial < 0:
                     trial = 0
@@ -730,7 +856,21 @@ class LiberoEnv(gym.Env):
 
     @property
     def info_logging_keys(self):
-        return []
+        keys = []
+        if self._expert_progress_intervene or self._expert_seed_quota > 0:
+            keys.extend(
+                [
+                    "rlt_progress",
+                    "rlt_progress_stall",
+                    "rlt_progress_valid",
+                    "rlt_expert_burst",
+                    "rlt_expert_idle",
+                    "intervene_flag",
+                ]
+            )
+        if self._human_mailbox is not None and "intervene_flag" not in keys:
+            keys.append("intervene_flag")
+        return keys
 
     @property
     def is_start(self):
@@ -747,6 +887,15 @@ class LiberoEnv(gym.Env):
         self.success_episode_len = np.zeros(self.num_envs, dtype=np.int32)
         self._task_success_stats: dict[int, dict[str, int]] = {}
         self._eval_seen_trials: set[tuple[int, int]] = set()
+        self._progress_best = np.full(self.num_envs, -1.0e6, dtype=np.float64)
+        self._progress_stall = np.zeros(self.num_envs, dtype=np.int32)
+        self._progress_burst_left = np.zeros(self.num_envs, dtype=np.int32)
+        self._progress_initialized = np.zeros(self.num_envs, dtype=bool)
+        self._progress_value = np.zeros(self.num_envs, dtype=np.float64)
+        self._progress_valid = np.zeros(self.num_envs, dtype=bool)
+        self._idle_count = np.zeros(self.num_envs, dtype=np.int32)
+        self._prev_dones = np.zeros(self.num_envs, dtype=bool)
+        self._sim_done = np.zeros(self.num_envs, dtype=bool)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -758,6 +907,19 @@ class LiberoEnv(gym.Env):
             self.returns[mask] = 0
             self.success_episode_len[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            self._progress_best[mask] = -1.0e6
+            self._progress_stall[mask] = 0
+            self._progress_burst_left[mask] = 0
+            self._progress_initialized[mask] = False
+            self._progress_value[mask] = 0.0
+            self._progress_valid[mask] = False
+            self._idle_count[mask] = 0
+            self._prev_dones[mask] = False
+            self._sim_done[mask] = False
+            if mask[0]:
+                self._hitl_intervened_ep = False
+                self._hitl_skipped_ep = False
+                self._hitl_outcome_recorded = False
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
@@ -765,6 +927,29 @@ class LiberoEnv(gym.Env):
             self.returns[:] = 0.0
             self.success_episode_len[:] = 0
             self._elapsed_steps[:] = 0
+            self._progress_best[:] = -1.0e6
+            self._progress_stall[:] = 0
+            self._progress_burst_left[:] = 0
+            self._progress_initialized[:] = False
+            self._progress_value[:] = 0.0
+            self._progress_valid[:] = False
+            self._idle_count[:] = 0
+            self._prev_dones[:] = False
+            self._sim_done[:] = False
+            self._hitl_intervened_ep = False
+            self._hitl_skipped_ep = False
+            self._hitl_outcome_recorded = False
+
+    def _steppable_env_idx(self, env_idx=None) -> np.ndarray:
+        """Env ids that can take a robosuite step without hitting a done sim."""
+        if env_idx is None:
+            env_idx = np.arange(self.num_envs)
+        env_idx = np.asarray(env_idx, dtype=np.int64).reshape(-1)
+        mask = ~self._sim_done[env_idx]
+        task_ids = getattr(self, "task_ids", None)
+        if self.is_eval and task_ids is not None:
+            mask = mask & (np.asarray(task_ids)[env_idx] >= 0)
+        return env_idx[mask]
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
@@ -897,21 +1082,34 @@ class LiberoEnv(gym.Env):
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
         self._reconfigure(reset_state_ids, env_idx)
-        for _ in range(15):
-            zero_actions = np.zeros((len(env_idx), 7))
-            if self.cfg.reset_gripper_open:
-                zero_actions[:, -1] = -1
-            raw_obs, _reward, terminations, info_lists = self.env.step(
-                zero_actions, env_idx
-            )
+        settle_idx = np.asarray(env_idx, dtype=np.int64).reshape(-1)
+        task_ids = getattr(self, "task_ids", None)
+        if self.is_eval and task_ids is not None:
+            settle_idx = settle_idx[np.asarray(task_ids)[settle_idx] >= 0]
         if self.current_raw_obs is None:
             self.current_raw_obs = [None] * self.num_envs
-        for i, idx in enumerate(env_idx):
-            self.current_raw_obs[idx] = raw_obs[i]
+        if settle_idx.size:
+            for _ in range(15):
+                zero_actions = np.zeros((len(settle_idx), 7))
+                if self.cfg.reset_gripper_open:
+                    zero_actions[:, -1] = -1
+                raw_obs, _reward, terminations, info_lists = self.env.step(
+                    zero_actions, settle_idx
+                )
+            for i, idx in enumerate(settle_idx):
+                self.current_raw_obs[idx] = raw_obs[i]
 
         obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
         infos = {}
+        infos = self._human_mailbox_publish_and_wait(infos)
+        if self._needs_expert_refresh():
+            infos = self._refresh_expert_intervene(
+                infos,
+                self.current_raw_obs,
+                np.zeros(self.num_envs, dtype=bool),
+            )
+            infos = self._stamp_human_intervene(infos)
         return obs, infos
 
     def get_camera_meta(
@@ -951,12 +1149,51 @@ class LiberoEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+        # Same order as standalone teleop: show the current frame, wait for
+        # this step's command, then step. Waiting after env.step made WASD
+        # apply only on the next chunk, after a long OpenPI pause.
+        policy_actions = np.asarray(actions, dtype=np.float32).copy()
+        if self._human_mailbox is not None:
+            self._human_mailbox_publish_and_wait({})
+            actions = self._human_mailbox_override_actions(actions)
+        self._last_step_actions = np.asarray(actions, dtype=np.float32)
+        if self._last_step_actions.ndim == 1:
+            self._last_step_actions = self._last_step_actions.reshape(1, -1)
+        self._hitl_note_executed_step(policy_actions, actions)
 
         self._elapsed_steps += 1
-        raw_obs, _reward, terminations, info_lists = self.env.step(actions)
-        self.current_raw_obs = raw_obs
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.ndim == 1:
+            actions = actions.reshape(1, -1)
+        if self.current_raw_obs is None:
+            self.current_raw_obs = [None] * self.num_envs
+        if not hasattr(self, "_last_info_lists") or self._last_info_lists is None:
+            self._last_info_lists = [{} for _ in range(self.num_envs)]
+        terminations = np.zeros(self.num_envs, dtype=bool)
+        info_lists = list(self._last_info_lists)
+        live_idx = self._steppable_env_idx(np.arange(self.num_envs))
+        if live_idx.size:
+            raw_obs_live, _reward, term_live, info_live = self.env.step(
+                actions[live_idx], live_idx
+            )
+            term_live = np.asarray(term_live).reshape(-1)
+            for i, idx in enumerate(live_idx):
+                self.current_raw_obs[idx] = raw_obs_live[i]
+                terminations[idx] = bool(term_live[i])
+                info_lists[idx] = info_live[i]
+        raw_obs = self.current_raw_obs
+        self._sim_done = np.logical_or(self._sim_done, terminations)
+        self._last_info_lists = info_lists
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+        if self._human_mailbox is not None:
+            skipped, self._hitl_skip_id_consumed = consume_human_skip(
+                self._human_mailbox.last_cmd, self._hitl_skip_id_consumed
+            )
+            if skipped:
+                truncations = np.asarray(truncations, dtype=bool).copy()
+                truncations.reshape(-1)[0] = True
+                self._hitl_skipped_ep = True
         obs = self._wrap_obs(raw_obs)
 
         step_reward = self._calc_step_reward(terminations)
@@ -967,9 +1204,27 @@ class LiberoEnv(gym.Env):
             terminations[:] = False
 
         dones = terminations | truncations
+        if self._needs_expert_refresh():
+            infos = self._refresh_expert_intervene(infos, raw_obs, dones)
+            if self._expert_seed_quota > 0:
+                self._prev_dones, new_done = count_new_episode_dones(
+                    self._prev_dones, dones
+                )
+                self._expert_seed_completed += new_done
+        self._stamp_human_intervene(infos)
+        if self._human_mailbox is not None:
+            # Use dones (after ignore_terminations) so outcome matches auto_reset.
+            self._hitl_note_episode_end(dones)
+            self._human_mailbox_publish_frame()
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
             obs, infos, _ = self._handle_auto_reset(dones, obs, infos)
+            if self._needs_expert_refresh():
+                infos = self._refresh_expert_intervene(
+                    infos, self.current_raw_obs, np.zeros(self.num_envs, dtype=bool)
+                )
+            self._human_mailbox_publish_and_wait(infos)
+            infos = self._stamp_human_intervene(infos)
         return (
             obs,
             to_tensor(step_reward),
@@ -980,6 +1235,7 @@ class LiberoEnv(gym.Env):
 
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
+        self._hitl_begin_chunk(chunk_actions)
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -1000,6 +1256,12 @@ class LiberoEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
+        action_dim = int(np.asarray(chunk_actions).shape[-1])
+        stacked_intervene = stack_chunk_intervene(infos_list, self.num_envs)
+        if stacked_intervene is not None:
+            infos_list[-1]["intervene_action"] = stacked_intervene["intervene_action"]
+            infos_list[-1]["intervene_flag"] = stacked_intervene["intervene_flag"]
+
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
             raw_chunk_terminations, dim=1
@@ -1015,9 +1277,26 @@ class LiberoEnv(gym.Env):
         # eval_count_mask: per-env bool, True if this completion counts toward eval metrics.
         eval_count_mask = None
         if past_dones.any() and self.auto_reset:
+            saved_action = infos_list[-1].get("intervene_action")
+            saved_flag = infos_list[-1].get("intervene_flag")
             obs_list[-1], infos_list[-1], eval_count_mask = self._handle_auto_reset(
                 past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
             )
+            if self._needs_expert_refresh():
+                infos_list[-1] = self._refresh_expert_intervene(
+                    infos_list[-1],
+                    self.current_raw_obs,
+                    np.zeros(self.num_envs, dtype=bool),
+                )
+            infos_list[-1] = self._stamp_human_intervene(infos_list[-1])
+            # Keep the completed chunk's [B, T*A] labels. A fresh per-step
+            # stamp is [B, A] and would crash update_last_actions (7 vs 35).
+            if is_chunk_wide_intervene_action(
+                saved_action, self.num_envs, chunk_size, action_dim
+            ):
+                infos_list[-1]["intervene_action"] = saved_action
+                if saved_flag is not None:
+                    infos_list[-1]["intervene_flag"] = saved_flag
 
         if self.auto_reset or self.ignore_terminations:
             chunk_terminations = torch.zeros_like(raw_chunk_terminations)
@@ -1051,6 +1330,19 @@ class LiberoEnv(gym.Env):
         obs, infos = self._handle_train_auto_reset(dones, _final_obs, infos)
         return obs, infos, None
 
+    def _eval_task_names(self, env_idx: np.ndarray) -> dict[int, str]:
+        """Map completed task_ids to original suite language instructions."""
+        names: dict[int, str] = {}
+        for eid in env_idx:
+            tid = int(self.task_ids[eid])
+            if tid < 0 or tid in names:
+                continue
+            try:
+                names[tid] = self.task_suite.get_task(tid).language
+            except (IndexError, AttributeError, TypeError):
+                names[tid] = ""
+        return names
+
     def _handle_eval_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
         env_idx = np.arange(0, self.num_envs)[dones]
@@ -1064,11 +1356,16 @@ class LiberoEnv(gym.Env):
             self.num_envs,
             self._eval_seen_trials,
             self._task_success_stats,
+            pert_folders=getattr(self, "_pert_init_folders", None),
+            task_names=self._eval_task_names(env_idx),
         )
 
         new_reset_state_ids = self._get_ordered_reset_state_ids(len(env_idx))
         valid_mask = new_reset_state_ids >= 0
         env_to_reset = env_idx[valid_mask]
+        idle_idx = env_idx[~valid_mask]
+        if idle_idx.size:
+            self._sim_done[idle_idx] = True
         if len(env_to_reset) > 0:
             self.reset_state_ids[env_to_reset] = new_reset_state_ids[valid_mask]
             obs, infos = self.reset(
@@ -1106,6 +1403,465 @@ class LiberoEnv(gym.Env):
         infos["_final_observation"] = dones
         infos["_elapsed_steps"] = dones
         return obs, infos
+
+    def _hitl_gripper_from_obs(self, fallback: float) -> float:
+        """Map current finger aperture to a binary gripper command.
+
+        Robosuite/LIBERO: +1 close, -1 open. Prefer physical state over the
+        policy command so Space/WASD takeover does not force-open a grasp.
+        """
+        obs0 = first_env_obs(self.current_raw_obs)
+        if obs0 is None:
+            return float(fallback)
+        grip = np.asarray(
+            obs0.get("robot0_gripper_qpos", ()), dtype=np.float64
+        ).reshape(-1)
+        if grip.size == 0:
+            return float(fallback)
+        # Open fingers are ~0.04; a firm grasp is clearly smaller.
+        aperture = float(np.mean(np.abs(grip)))
+        if aperture < 0.03:
+            return 1.0
+        if aperture > 0.035:
+            return -1.0
+        return float(fallback)
+
+    def _needs_expert_refresh(self) -> bool:
+        if (
+            self._expert_seed_quota > 0
+            or self._expert_progress_intervene
+            or self._expert_always_intervene
+            or self._expert_idle_intervene_steps > 0
+        ):
+            return True
+        if self._human_mailbox is None:
+            return False
+        return mailbox_expert_hold(self._human_mailbox.last_cmd)
+
+    def _hitl_controller(self) -> str:
+        if self._human_mailbox is None or self._human_mailbox.last_cmd is None:
+            return "human"
+        return normalize_hitl_controller(self._human_mailbox.last_cmd.controller)
+
+    def _human_mailbox_override_actions(self, actions):
+        if self._human_mailbox is None:
+            return actions
+        cmd = self._human_mailbox.last_cmd
+        if cmd is None:
+            self._human_hold = False
+            return actions
+        if mailbox_expert_hold(cmd):
+            self._human_hold = True
+            self._hitl_intervened_ep = True
+            return actions
+        if not mailbox_applies_wasd(cmd):
+            self._human_hold = False
+            return actions
+        if actions.ndim == 1:
+            policy_grip = float(actions[-1]) if np.asarray(actions).size else -1.0
+        else:
+            policy_grip = (
+                float(np.asarray(actions)[0, -1]) if np.asarray(actions).size else -1.0
+            )
+        latch_src = (
+            self._hitl_gripper_from_obs(policy_grip)
+            if not self._human_hold
+            else self._human_gripper_latch
+        )
+        overridden, now_hold, latch = apply_human_override(
+            actions,
+            cmd.action,
+            hold=bool(cmd.hold),
+            freeze_gripper=self._hitl_freeze_gripper,
+            inherit_gripper=bool(cmd.inherit_gripper),
+            already_holding=self._human_hold,
+            gripper_latch=latch_src,
+        )
+        self._human_gripper_latch = latch
+        if overridden is None:
+            self._human_hold = False
+            return actions
+        self._human_hold = now_hold
+        self._hitl_intervened_ep = True
+        human = np.asarray(overridden[0] if overridden.ndim > 1 else overridden)
+        self._human_action = np.broadcast_to(
+            human, (self.num_envs, human.size)
+        ).copy()
+        return overridden
+
+    def _human_mailbox_images(self):
+        obs0 = first_env_obs(self.current_raw_obs)
+        if obs0 is None or "agentview_image" not in obs0:
+            return None, None
+        return get_libero_image(obs0), get_libero_wrist_image(obs0)
+
+    def _hitl_env0_action(self, actions) -> np.ndarray:
+        array = np.asarray(actions, dtype=np.float32)
+        if array.ndim == 2:
+            return array[0].reshape(-1)
+        return array.reshape(-1)
+
+    def _hitl_snapshot_chunk(self) -> dict | None:
+        return format_hitl_chunk(
+            self._hitl_chunk_policy,
+            self._hitl_chunk_exec,
+            self._hitl_chunk_flags,
+            chunk_id=self._hitl_chunk_id,
+            step_i=self._hitl_chunk_i,
+            cmd=self._hitl_chunk_cmd,
+            ref=self._hitl_chunk_ref,
+            expert=self._hitl_chunk_expert_flags,
+        )
+
+    def _hitl_begin_chunk(self, chunk_actions) -> None:
+        if self._hitl_chunk_policy is not None and self._hitl_chunk_i > 0:
+            self._hitl_last_chunk = self._hitl_snapshot_chunk()
+        if torch.is_tensor(chunk_actions):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+        array = np.asarray(chunk_actions, dtype=np.float32)
+        if array.ndim == 3:
+            fallback_actor = array[0]
+        elif array.ndim == 2:
+            fallback_actor = array
+        else:
+            fallback_actor = array.reshape(1, -1)
+        fallback_actor = np.asarray(fallback_actor, dtype=np.float32)
+        chunk_len, action_dim = fallback_actor.shape
+        actor_src = (
+            self._hitl_pending_actor
+            if self._hitl_pending_actor is not None
+            else fallback_actor
+        )
+        self._hitl_chunk_id += 1
+        self._hitl_chunk_policy = env0_action_chunk(actor_src, chunk_len, action_dim)
+        self._hitl_chunk_ref = env0_action_chunk(
+            self._hitl_pending_ref, chunk_len, action_dim
+        )
+        self._hitl_chunk_exec = np.full_like(self._hitl_chunk_policy, np.nan)
+        self._hitl_chunk_cmd = np.full_like(self._hitl_chunk_policy, np.nan)
+        self._hitl_chunk_flags = np.zeros((chunk_len,), dtype=bool)
+        self._hitl_chunk_expert_flags = np.zeros((chunk_len,), dtype=bool)
+        self._hitl_chunk_expert = bool(self._hitl_pending_expert)
+        self._hitl_chunk_i = 0
+
+    def set_hitl_ref_chunk(
+        self, ref_chunk, actor_chunk=None, expert_chunk: bool = False
+    ) -> None:
+        """Store VLA ã (π), residual actor a, and whether this chunk is ZAP."""
+        self._hitl_pending_ref = ref_chunk
+        self._hitl_pending_actor = actor_chunk
+        self._hitl_pending_expert = bool(expert_chunk)
+
+    def _hitl_note_executed_step(self, policy_actions, exec_actions) -> None:
+        policy = self._hitl_env0_action(policy_actions)
+        executed = self._hitl_env0_action(exec_actions)
+        if self._hitl_chunk_policy is None:
+            self._hitl_begin_chunk(policy.reshape(1, -1))
+        index = self._hitl_chunk_i
+        action_dim = int(self._hitl_chunk_policy.shape[-1])
+        if index < self._hitl_chunk_policy.shape[0]:
+            self._hitl_chunk_exec[index] = executed[:action_dim]
+            last = (
+                None
+                if self._human_mailbox is None
+                else self._human_mailbox.last_cmd
+            )
+            human_cmd = mailbox_applies_wasd(last)
+            expert_cmd = mailbox_expert_hold(last)
+            self._hitl_chunk_flags[index] = bool(human_cmd)
+            if self._hitl_chunk_expert_flags is not None:
+                self._hitl_chunk_expert_flags[index] = bool(expert_cmd)
+            cmd = None
+            if human_cmd:
+                cmd = np.asarray(last.action, dtype=np.float32).reshape(-1)
+            elif expert_cmd and self._hitl_chunk_expert:
+                # This chunk was already routed as ZAP; exec is a^ZAP.
+                cmd = executed[:action_dim]
+            if cmd is not None and self._hitl_chunk_cmd is not None:
+                self._hitl_chunk_cmd[index] = cmd[:action_dim]
+        self._hitl_chunk_i = index + 1
+
+    def _hitl_prompt(self) -> str:
+        if getattr(self, "task_descriptions", None):
+            return str(self.task_descriptions[0] or "")
+        return ""
+
+    def _hitl_note_episode_end(self, dones) -> None:
+        """Record env0 outcome before auto_reset clears metrics."""
+        if self._human_mailbox is None or self._hitl_outcome_recorded:
+            return
+        done = np.asarray(dones).reshape(-1)
+        if not bool(done[0]):
+            return
+        success = bool(self.success_once[0])
+        intervened = bool(self._hitl_intervened_ep)
+        skipped = bool(self._hitl_skipped_ep)
+        if skipped:
+            result = "skipped"
+        elif success:
+            result = "success"
+        else:
+            result = "fail"
+        outcome = {
+            "success": success,
+            "intervened": intervened,
+            "skipped": skipped,
+            "elapsed": int(self._elapsed_steps[0]),
+            "max_episode_steps": int(self.cfg.max_episode_steps),
+            "prompt": self._hitl_prompt(),
+            "task_id": int(self.task_ids[0]) if self.num_envs else -1,
+            "mode": "hitl" if intervened else "vla",
+            "result": result,
+        }
+        self._hitl_last_outcome = outcome
+        self._hitl_history.append(outcome)
+        if len(self._hitl_history) > 32:
+            self._hitl_history = self._hitl_history[-32:]
+        key = ("hitl_" if intervened else "vla_") + (
+            "success" if success else "fail"
+        )
+        self._hitl_counts[key] = int(self._hitl_counts.get(key, 0)) + 1
+        self._hitl_outcome_recorded = True
+        self._human_mailbox.append_episode(outcome)
+
+    def _human_mailbox_extra(self) -> dict:
+        action = np.asarray(self._human_action[0], dtype=np.float32).reshape(-1)
+        obs0 = first_env_obs(self.current_raw_obs)
+        prompt = self._hitl_prompt()
+        task_id = int(self.task_ids[0]) if self.num_envs else -1
+        success = bool(self.success_once[0]) if self.num_envs else False
+        elapsed = int(self._elapsed_steps[0]) if self.num_envs else 0
+        max_steps = int(self.cfg.max_episode_steps)
+        if self._hitl_outcome_recorded and self._hitl_last_outcome is not None:
+            episode_status = self._hitl_last_outcome["result"]
+        elif self._hitl_skipped_ep:
+            episode_status = "skipped"
+        elif success:
+            episode_status = "success"
+        elif elapsed >= max_steps:
+            episode_status = "fail"
+        else:
+            episode_status = "running"
+        chunk = self._hitl_snapshot_chunk()
+        exec_list = [round(float(x), 3) for x in action.tolist()]
+        if self._hitl_chunk_exec is not None and self._hitl_chunk_i > 0:
+            row = self._hitl_chunk_exec[
+                min(self._hitl_chunk_i, self._hitl_chunk_exec.shape[0]) - 1
+            ]
+            if np.isfinite(row).all():
+                exec_list = [round(float(x), 3) for x in row.tolist()]
+        return {
+            "elapsed": elapsed,
+            "max_episode_steps": max_steps,
+            "success": success,
+            "episode_status": episode_status,
+            "intervened": bool(self._hitl_intervened_ep),
+            "skipped": bool(self._hitl_skipped_ep),
+            "skip_id_consumed": int(self._hitl_skip_id_consumed),
+            "hold": bool(self._human_hold),
+            "controller": self._hitl_controller(),
+            "expert_hold": mailbox_expert_hold(self._human_mailbox.last_cmd),
+            "paused": bool(
+                self._human_mailbox.last_cmd is not None
+                and self._human_mailbox.last_cmd.pause
+            ),
+            "gripper_latch": round(float(self._human_gripper_latch), 3),
+            "image_ok": bool(obs0 is not None and "agentview_image" in obs0),
+            "prompt": prompt,
+            "task_id": task_id,
+            "last_outcome": self._hitl_last_outcome,
+            "counts": dict(self._hitl_counts),
+            "history": list(self._hitl_history[-8:]),
+            "action": exec_list,
+            "chunk": chunk,
+            "chunk_text": format_hitl_chunk_text(chunk),
+            "last_chunk": self._hitl_last_chunk,
+            "last_chunk_text": (
+                format_hitl_chunk_text(self._hitl_last_chunk)
+                if self._hitl_last_chunk
+                else None
+            ),
+        }
+
+    def _human_mailbox_publish_frame(self):
+        if self._human_mailbox is None:
+            return
+        main_image, wrist_image = self._human_mailbox_images()
+        self._human_mailbox.publish(
+            main_image, wrist_image, self._human_mailbox_extra()
+        )
+
+    def _human_mailbox_publish_and_wait(self, infos):
+        if self._human_mailbox is None:
+            return infos
+        main_image, wrist_image = self._human_mailbox_images()
+        seq = self._human_mailbox.publish(
+            main_image, wrist_image, self._human_mailbox_extra()
+        )
+        if self._human_mailbox.block:
+            self._human_mailbox.wait_command(seq)
+        self._stamp_human_intervene(infos)
+        return infos
+
+    def _stamp_human_intervene(self, infos):
+        if self._human_mailbox is None:
+            return infos
+        cmd = self._human_mailbox.last_cmd
+        flags = np.zeros((self.num_envs, 1), dtype=bool)
+        if mailbox_expert_hold(cmd):
+            # Request ZAP on the next chunk. Write the executed action so
+            # stack_chunk_intervene can build [B, T*A]; update_last_actions
+            # is then an identity copy instead of a 7-vs-35 crash.
+            flags[0, 0] = True
+            if "intervene_flag" in infos:
+                prev = infos["intervene_flag"]
+                if torch.is_tensor(prev):
+                    prev = prev.detach().cpu().numpy()
+                flags = np.asarray(prev, dtype=bool).reshape(self.num_envs, -1) | flags
+            infos["intervene_flag"] = to_tensor(flags)
+            exec_a = np.asarray(self._last_step_actions, dtype=np.float32)
+            if exec_a.ndim == 1:
+                exec_a = exec_a.reshape(1, -1)
+            if exec_a.shape[0] != self.num_envs:
+                exec_a = np.broadcast_to(
+                    exec_a[0], (self.num_envs, exec_a.shape[-1])
+                ).copy()
+            infos["intervene_action"] = to_tensor(exec_a)
+            return infos
+        # Label the step that actually replaced the VLA, not mailbox hold
+        # (idle hold is ignored by the override and must not write zero a^H).
+        hold = bool(self._human_hold)
+        flags[0, 0] = hold
+        if "intervene_flag" in infos:
+            prev = infos["intervene_flag"]
+            if torch.is_tensor(prev):
+                prev = prev.detach().cpu().numpy()
+            flags = np.asarray(prev, dtype=bool).reshape(self.num_envs, -1) | flags
+        infos["intervene_flag"] = to_tensor(flags)
+        action_dim = int(self._human_action.shape[-1])
+        human = (
+            self._human_action
+            if hold
+            else np.zeros((self.num_envs, action_dim), dtype=np.float32)
+        )
+        infos["intervene_action"] = to_tensor(human)
+        return infos
+
+    def _refresh_expert_intervene(self, infos, raw_obs, dones):
+        seed_active = self._expert_seed_completed < self._expert_seed_quota
+        flags = merge_expert_intervene_flags(
+            self.num_envs,
+            seed_active=seed_active,
+            always=self._expert_always_intervene,
+        )
+        done_arr = np.asarray(dones, dtype=bool).reshape(-1)
+        if self._expert_progress_intervene:
+            progress, valid = self._bowl_place_progress_batch(raw_obs)
+            (
+                self._progress_best,
+                self._progress_stall,
+                self._progress_burst_left,
+                self._progress_initialized,
+                progress_flags,
+            ) = update_progress_intervene_state(
+                best=self._progress_best,
+                stall=self._progress_stall,
+                burst_left=self._progress_burst_left,
+                initialized=self._progress_initialized,
+                progress=progress,
+                valid=valid,
+                success=self.success_once,
+                done=done_arr,
+                min_delta=self._expert_progress_min_delta,
+                stall_steps=self._expert_progress_stall_steps,
+                burst_steps=self._expert_progress_burst_steps,
+            )
+            self._progress_value = progress
+            self._progress_valid = valid
+            if not self._expert_always_intervene:
+                flags = flags | progress_flags
+            infos["rlt_progress"] = to_tensor(progress.reshape(-1, 1))
+            infos["rlt_progress_stall"] = to_tensor(
+                self._progress_stall.reshape(-1, 1).astype(np.float32)
+            )
+            infos["rlt_progress_valid"] = to_tensor(valid.reshape(-1, 1))
+            infos["rlt_expert_burst"] = to_tensor(
+                (self._progress_burst_left > 0).reshape(-1, 1)
+            )
+        if self._expert_idle_intervene_steps > 0 and not seed_active:
+            watching = (
+                (~self.success_once) & (~done_arr) & (self._progress_burst_left <= 0)
+            )
+            self._idle_count = np.where(
+                watching, self._idle_count + 1, self._idle_count
+            )
+            idle_trigger = watching & (
+                self._idle_count >= self._expert_idle_intervene_steps
+            )
+            if idle_trigger.any():
+                self._progress_burst_left = np.where(
+                    idle_trigger,
+                    self._expert_progress_burst_steps,
+                    self._progress_burst_left,
+                )
+                flags = flags | (self._progress_burst_left > 0)
+            self._idle_count = np.where(
+                idle_trigger | self.success_once | done_arr,
+                0,
+                self._idle_count,
+            )
+            infos["rlt_expert_idle"] = to_tensor(
+                self._idle_count.reshape(-1, 1).astype(np.float32)
+            )
+        elif self._expert_idle_intervene_steps > 0:
+            infos["rlt_expert_idle"] = to_tensor(
+                self._idle_count.reshape(-1, 1).astype(np.float32)
+            )
+        if mailbox_expert_hold(
+            None if self._human_mailbox is None else self._human_mailbox.last_cmd
+        ):
+            flags = np.asarray(flags, dtype=bool).reshape(self.num_envs)
+            flags[0] = True
+        infos["intervene_flag"] = to_tensor(flags.reshape(-1, 1))
+        return infos
+
+    def _bowl_place_progress_batch(self, raw_obs):
+        if isinstance(raw_obs, (list, tuple)):
+            obs_list = list(raw_obs)
+        elif isinstance(raw_obs, dict):
+            sample = next(iter(raw_obs.values()), None)
+            stacked = (
+                sample is not None
+                and np.asarray(sample).ndim >= 1
+                and int(np.asarray(sample).shape[0]) == self.num_envs
+            )
+            if stacked:
+                obs_list = []
+                for i in range(self.num_envs):
+                    env_obs = {}
+                    for key, value in raw_obs.items():
+                        arr = np.asarray(value)
+                        env_obs[key] = (
+                            arr[i] if arr.ndim >= 1 and arr.shape[0] > i else value
+                        )
+                    obs_list.append(env_obs)
+            else:
+                obs_list = [raw_obs]
+        else:
+            obs_list = [raw_obs]
+        progress = np.zeros(self.num_envs, dtype=np.float64)
+        valid = np.zeros(self.num_envs, dtype=bool)
+        for i, obs in enumerate(obs_list[: self.num_envs]):
+            if not isinstance(obs, dict):
+                continue
+            score, ok = bowl_place_progress_from_obs(
+                obs,
+                grasp_dist=self._expert_grasp_dist,
+                gripper_closed=self._expert_gripper_closed,
+            )
+            progress[i] = score
+            valid[i] = ok
+        return progress, valid
 
     def _calc_step_reward(self, terminations):
         step_penalty = -1 if self.use_step_penalty else 0

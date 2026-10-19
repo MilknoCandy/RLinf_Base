@@ -33,6 +33,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         OpenPi0Config,
         OpenPi0ForRLActionPrediction,
     )
+    from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
+        bind_rlt_mem_scheme,
+    )
 
     # config
     config_name = getattr(cfg.openpi, "config_name", None)
@@ -60,6 +63,14 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         checkpoint_dir, "actor", "model_state_dict", "full_weights.pt"
     )
 
+    model_state_dict = None
+    if os.path.exists(full_weights_path):
+        model_state_dict = torch.load(full_weights_path, map_location="cpu")
+    elif os.path.exists(actor_full_weights_path):
+        model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
+    if getattr(actor_model_config, "use_rlt", False):
+        bind_rlt_mem_scheme(actor_model_config, model_state_dict)
+
     model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
         actor_model_config
     )
@@ -68,13 +79,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         model.freeze_vlm()
 
     # Load weights from checkpoint if it's a checkpoint directory, otherwise load from safetensors
-    if os.path.exists(full_weights_path):
-        # Direct checkpoint directory
-        model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
-    elif os.path.exists(actor_full_weights_path):
-        # Checkpoint directory from runner
-        model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
+    if model_state_dict is not None:
         model.load_state_dict(model_state_dict, strict=False)
     else:
         # Original model directory with safetensors files

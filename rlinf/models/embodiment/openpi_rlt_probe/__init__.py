@@ -1,4 +1,4 @@
-﻿# Copyright 2026 The RLinf Authors.
+﻿﻿# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@ import pathlib
 import torch
 from omegaconf import DictConfig
 
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
+
 
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
@@ -40,6 +44,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
     from rlinf.models.embodiment.openpi.openpi_action_model import (
         OpenPi0Config,
+    )
+    from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
+        bind_rlt_mem_scheme,
     )
     from rlinf.models.embodiment.openpi_rlt_probe.openpi_probe_model import (
         OpenPiProbeForRLActionPrediction,
@@ -71,6 +78,19 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         checkpoint_dir, "actor", "model_state_dict", "full_weights.pt"
     )
 
+    model_state_dict = None
+    if os.path.exists(full_weights_path):
+        model_state_dict = torch.load(full_weights_path, map_location="cpu")
+    elif os.path.exists(actor_full_weights_path):
+        model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
+
+    rlt_scheme = bind_rlt_mem_scheme(actor_model_config, model_state_dict)
+    logger.info(
+        "openpi_rlt_probe: RLT encoder mem_scheme=%s encoder_type=%s",
+        rlt_scheme,
+        getattr(actor_model_config, "rlt_encoder_type", ""),
+    )
+
     model: OpenPiProbeForRLActionPrediction = OpenPiProbeForRLActionPrediction(
         actor_model_config,
         feature_source=rlt_feature_source,
@@ -79,12 +99,25 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if actor_model_config.train_expert_only:
         model.freeze_vlm()
 
-    if os.path.exists(full_weights_path):
-        model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
-    elif os.path.exists(actor_full_weights_path):
-        model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+    if model_state_dict is not None:
+        incompatible = model.load_state_dict(model_state_dict, strict=False)
+        missing_rlt = [
+            key
+            for key in incompatible.missing_keys
+            if key.startswith("rlt_module.")
+        ]
+        unexpected_rlt = [
+            key
+            for key in incompatible.unexpected_keys
+            if key.startswith("rlt_module.")
+        ]
+        if missing_rlt or unexpected_rlt:
+            logger.warning(
+                "openpi_rlt_probe: rlt_module load mismatch "
+                "missing=%s unexpected=%s",
+                missing_rlt[:8],
+                unexpected_rlt[:8],
+            )
     else:
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
         if not weight_paths:

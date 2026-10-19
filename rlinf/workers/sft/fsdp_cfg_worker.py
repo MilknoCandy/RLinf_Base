@@ -38,6 +38,7 @@ from rlinf.data.datasets.recap.cfg_model import (
 from rlinf.data.datasets.recap.utils import (
     cast_image_features,
 )
+from rlinf.data.storage.lerobot import fix_lerobot_episode_data_index
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.distributed import all_reduce_dict
@@ -192,7 +193,7 @@ class FSDPCfgWorker(FSDPSftWorker):
             base_dataset.hf_dataset = cast_image_features(base_dataset.hf_dataset)
 
             if episodes is not None:
-                self._fix_episode_data_index(base_dataset, episodes)
+                fix_lerobot_episode_data_index(base_dataset, episodes)
 
             if data_config.prompt_from_task:
                 base_dataset = openpi_data_loader.TransformedDataset(
@@ -278,34 +279,6 @@ class FSDPCfgWorker(FSDPSftWorker):
                 model_transforms.append(t)
 
         return model_transforms
-
-    def _fix_episode_data_index(self, dataset: Any, episodes: list) -> None:
-        """Fix LeRobotDataset episode_data_index when using specific episodes.
-
-        LeRobotDataset has a bug where episode_data_index doesn't match the
-        original episode indices when filtering by episodes. This fixes that.
-
-        Dataset format v3.0 (lerobot >= 0.4) dropped ``episode_data_index``
-        along with the bug, so there is nothing to patch there.
-        """
-        if getattr(dataset, "episode_data_index", None) is None:
-            return
-
-        ep_idx_mapping = {ep: i for i, ep in enumerate(sorted(episodes))}
-        max_ep_idx = max(episodes) + 1
-
-        old_from = dataset.episode_data_index["from"]
-        old_to = dataset.episode_data_index["to"]
-
-        new_from = torch.full((max_ep_idx,), -1, dtype=old_from.dtype)
-        new_to = torch.full((max_ep_idx,), -1, dtype=old_to.dtype)
-
-        for orig_ep, new_idx in ep_idx_mapping.items():
-            new_from[orig_ep] = old_from[new_idx]
-            new_to[orig_ep] = old_to[new_idx]
-
-        dataset.episode_data_index["from"] = new_from
-        dataset.episode_data_index["to"] = new_to
 
     def _create_torch_dataloader(
         self,

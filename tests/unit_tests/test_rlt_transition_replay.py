@@ -19,6 +19,10 @@ class _ReplayHarness(RLTACReplayMixin):
         )
         self.replay_buffer = SimpleNamespace(_flatten_trajectory=lambda _traj: flat)
 
+    def _use_tsac_critic(self) -> bool:
+        # Mixin postprocess calls the host worker API; stub for unit tests.
+        return False
+
 
 def _flat_row(*, t: int, b: int, record: bool) -> dict:
     z = torch.zeros(t, b, 4)
@@ -47,6 +51,49 @@ def _flat_row(*, t: int, b: int, record: bool) -> dict:
         },
     }
     return flat
+
+
+def _transition_pending(*, ref_value: float = 0.25):
+    from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS
+
+    pending = [
+        {
+            "z_rl": torch.zeros(2, 4),
+            "proprio": torch.zeros(2, 3),
+            "ref_chunk": torch.full((2, 6), ref_value),
+        }
+    ]
+    assert set(pending[0]) >= set(RLT_OBS_KEYS)
+    stored = {}
+
+    class _Builder:
+        def append_transitions(self, obs, next_obs):
+            stored["obs"] = obs
+            stored["next_obs"] = next_obs
+
+    forward = {
+        "rlt_transition_z_rl": torch.ones(2, 4),
+        "rlt_transition_proprio": torch.ones(2, 3),
+        "rlt_transition_ref_chunk": torch.ones(2, 6),
+        "z_rl": torch.ones(2, 4),
+        "proprio": torch.ones(2, 3),
+        "ref_chunk": torch.ones(2, 6),
+    }
+    return pending, [_Builder()], stored, SimpleNamespace(forward_inputs=forward)
+
+
+def test_update_rlt_transitions_keeps_vla_proposal():
+    from rlinf.algorithms.rlt.transition import update_rlt_transitions
+
+    pending, builders, stored, policy_output = _transition_pending()
+    update_rlt_transitions(
+        0,
+        pending,
+        builders,
+        policy_output,
+        cache_current=False,
+    )
+    assert torch.allclose(stored["obs"]["ref_chunk"], torch.full((2, 6), 0.25))
 
 
 def test_ingest_skips_bootstrap_row_without_curr_obs():
