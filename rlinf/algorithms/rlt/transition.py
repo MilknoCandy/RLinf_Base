@@ -67,7 +67,9 @@ def extract_rlt_obs_from_forward_inputs(
 ) -> dict[str, Any]:
     prefix = RLT_TRANSITION_PREFIX if transition else ""
     missing = [
-        f"{prefix}{key}" for key in RLT_OBS_KEYS if f"{prefix}{key}" not in forward_inputs
+        f"{prefix}{key}"
+        for key in RLT_OBS_KEYS
+        if f"{prefix}{key}" not in forward_inputs
     ]
     if missing:
         raise ValueError(
@@ -75,8 +77,9 @@ def extract_rlt_obs_from_forward_inputs(
             "rollout.rlt_feature_model is configured and the rollout worker "
             "populates RLT features."
         )
-    out = {key: forward_inputs[f"{prefix}{key}"] for key in RLT_OBS_KEYS}
-    return copy_dict_tensor(out)
+    return copy_dict_tensor(
+        {key: forward_inputs[f"{prefix}{key}"] for key in RLT_OBS_KEYS}
+    )
 
 
 def update_rlt_transitions(
@@ -88,10 +91,11 @@ def update_rlt_transitions(
     cache_current: bool,
 ) -> None:
     if pending_obs[stage_id] is not None:
-        # Keep the live VLA proposal ã as the actor input. Intervention only
-        # changes the executed action / BC target (a^H). Overwriting ã←a^H
-        # would train the identity π(s, a^H)→a^H and never teach
-        # π(s, ã_VLA)→a^H. Bee CM also needs the original ã for Δ^H=a^H-ã.
+        # Keep the live VLA proposal as the actor input. Intervention only
+        # changes the executed action / BC target (a^H). Overwriting the
+        # proposal with a^H would train the identity and never teach
+        # correcting away from the VLA proposal. Bee CM also needs the
+        # original proposal for residual targets.
         next_obs = extract_rlt_obs_from_forward_inputs(
             policy_output.forward_inputs,
             transition=True,
@@ -106,3 +110,29 @@ def update_rlt_transitions(
         pending_obs[stage_id] = extract_rlt_obs_from_forward_inputs(
             policy_output.forward_inputs
         )
+
+
+def apply_rlt_interventions(
+    obs: dict[str, Any],
+    actions: torch.Tensor | None,
+    flags: torch.Tensor | None,
+) -> None:
+    """Replace reference actions with interventions executed by the environment."""
+    if actions is None or flags is None:
+        return
+
+    ref_chunk = obs["ref_chunk"]
+    batch_size = ref_chunk.shape[0]
+    flags = flags.reshape(batch_size, -1, 1).to(
+        device=ref_chunk.device, dtype=torch.bool
+    )
+    actions = actions.reshape(batch_size, flags.shape[1], -1).to(
+        device=ref_chunk.device, dtype=ref_chunk.dtype
+    )
+    ref_actions = ref_chunk.reshape(batch_size, -1, actions.shape[-1]).clone()
+    ref_actions[:, : flags.shape[1]] = torch.where(
+        flags,
+        actions,
+        ref_actions[:, : flags.shape[1]],
+    )
+    obs["ref_chunk"] = ref_actions.reshape_as(ref_chunk)

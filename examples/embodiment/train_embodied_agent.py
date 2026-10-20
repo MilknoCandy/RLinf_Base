@@ -138,7 +138,7 @@ def main(cfg) -> None:
 
             actor_worker_cls = PipelineEmbodiedFSDPActor
         else:
-            from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+            from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
             actor_worker_cls = EmbodiedFSDPActor
 
@@ -214,9 +214,9 @@ def main(cfg) -> None:
     if reward_group is not None:
         reward_group.stop().wait()
     if router_group is not None:
-        router_group.shutdown().wait()
+        router_group.stop().wait()
     if server_group is not None:
-        server_group.shutdown().wait()
+        server_group.stop().wait()
 
 
 if __name__ == "__main__":
