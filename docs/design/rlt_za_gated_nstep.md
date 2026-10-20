@@ -1,6 +1,6 @@
 # ZAP：(Z, A) Path 度量门控 n-step
 
-谱系（RLT → BEE / eRLT → T-SAC / QC / AQC / DQC → ZAP）见 [`rlt_improvements_and_zap.md`](rlt_improvements_and_zap.md)。下文是 ZAP 的公式与落地清单。
+谱系（RLT → T-SAC / QC / AQC / DQC → ZAP）见 [`rlt_improvements_and_zap.md`](rlt_improvements_and_zap.md)。下文是 ZAP 的公式与落地清单。
 
 **方法名：ZAP**（**(Z, A) Path**）。
 

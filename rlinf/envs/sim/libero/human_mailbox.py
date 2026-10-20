@@ -123,7 +123,7 @@ def apply_human_override(
     ``_POSE_IDLE_ABS`` inherit the current π/actor command so an unpressed
     keyboard axis does not write 0 and freeze that DoF. All-idle pose skips
     the override. Bowl (``freeze_gripper=True``) keeps the gripper on the
-    policy/VLA command, matching BEE Appendix A.
+    policy/VLA command (bowl HITL freezes gripper).
     """
     if not hold:
         return None, False, float(gripper_latch)

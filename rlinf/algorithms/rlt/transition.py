@@ -94,8 +94,7 @@ def update_rlt_transitions(
         # Keep the live VLA proposal as the actor input. Intervention only
         # changes the executed action / BC target (a^H). Overwriting the
         # proposal with a^H would train the identity and never teach
-        # correcting away from the VLA proposal. Bee CM also needs the
-        # original proposal for residual targets.
+        # correcting away from the VLA proposal.
         next_obs = extract_rlt_obs_from_forward_inputs(
             policy_output.forward_inputs,
             transition=True,

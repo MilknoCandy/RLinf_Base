@@ -363,7 +363,6 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
     if use_simulator_transition_replay(cfg):
         algo_cfg = _algorithm_cfg(cfg)
         schedule_cfg = algo_cfg.get("rlt_schedule", {}) or {}
-        bee_cfg = algo_cfg.get("bee", {}) or {}
         full_task = _resolve_full_task(cfg)
         # Standalone eval has version=0; keep schedule off so full-task LIBERO
         # actually executes the residual actor rather than the VLA ref.
@@ -373,11 +372,5 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
             use_schedule=use_schedule,
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
             full_task=full_task,
-            simulate_intervention_prob=float(
-                bee_cfg.get("simulate_intervention_prob", 0.0)
-            ),
-            correct_when_disagree=bool(bee_cfg.get("correct_when_disagree", False)),
-            correct_action_l1=float(bee_cfg.get("correct_action_l1", 0.12)),
-            correct_ignore_dims=bee_cfg.get("correct_ignore_dims", None),
         )
     return RealworldRLTRoute()

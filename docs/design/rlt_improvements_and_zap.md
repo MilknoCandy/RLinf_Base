@@ -1,18 +1,17 @@
 # RLT 谱系：表示改进、Chunk 价值，以及 ZAP
 
-本文从 **RL Token (RLT)** 出发，按两条改进轴整理仓库里已经落地的方法，最后落到 **ZAP**。
+本文从 **RL Token (RLT)** 出发，整理仓库里已经落地的改进，最后落到 **ZAP**。
 
-- **轴 A：针对 RLT 本身。** 不改 $Q$ 的动作定义域，改 residual 约束或 $z$ 怎么从冻结 VLA 里取出来。对应 **BEE**、**eRLT**。
-- **轴 B：针对 action chunk 的价值估计。** 承认 VLA 按 chunk 执行，把一段时间动作写进 $Q$ 或序列头，换更快、更无偏的 backup。对应 **T-SAC**、**Q-chunking (QC)**、**Adaptive QC (AQC)**、**Decoupled QC (DQC)**。
-- **ZAP** 不走轴 B 的「动作进 $Q$」，也不重做轴 A 的表示。它改的是 **backup 沿哪条路径走、停下来向谁借 $Q$**。
+论文侧曾探索过 residual 约束（如 Bee）与 token / 层路由（如 eRLT）等表示思路；那些路径**不在本仓库实现**，下文只作背景提及。仓库主线是：
+
+- **针对 action chunk 的价值估计。** 承认 VLA 按 chunk 执行，把一段时间动作写进 $Q$ 或序列头，换更快、更无偏的 backup。对应 **T-SAC**、**Q-chunking (QC)**、**Adaptive QC (AQC)**、**Decoupled QC (DQC)**。
+- **ZAP** 不走「动作进 $Q$」，也不重做表示。它改的是 **backup 沿哪条路径走、停下来向谁借 $Q$**。
 
 仓库对照（同一 $\pi_{0.5}$ Stage-1，Stage-2 只跑 online）：
 
 | 方法 | `loss_type` | 配置示例 | 代码 |
 |---|---|---|---|
 | RLT AC / TD3 | `rlt_ac` / `rlt_td3` | `*_rlt_stage2_ac_mlp.yaml` | `fsdp_rlt_ac_policy_worker.py` |
-| BEE | `bee` | `libero_pro_bowl_bee.yaml` | `rlinf/algorithms/bee/` |
-| eRLT | `embodied_sac` + `use_erlt` | `libero_pro_bowl_erlt_*.yaml` | `rlinf/models/embodiment/modules/erlt.py` |
 | T-SAC | `rlt_ac` + TSAC critic | `libero_pro_bowl_rlt_stage2_ac_tsac.yaml` | `tsac_transformer_critic.py` |
 | QC / AQC / DQC | `rlt_qc` / `rlt_aqc` / `rlt_dqc` | `*_rlt_stage2_{qc,aqc,dqc}.yaml` | `rlinf/algorithms/qc/` |
 | ZAP | `rlt_zap` | `*_rlt_stage2_zap.yaml` | `rlinf/algorithms/zap/` |
@@ -66,81 +65,15 @@ $z$ **不注回 VLA**。VLA 只提供先验动作和语义嵌入。
 4. **朴素 n-step 在 off-policy replay 上有偏。** 中间动作来自旧 $\pi_\beta$，不是当前 $\pi$。RLT 的 $\pi$ 又近确定（`fixed_std ≈ 0.002`），密度比 $\pi/\pi_\beta$ 退化成 0/1，Retrace 几乎失效。
 5. **Chunk 只是执行方式。** 环境按 chunk 步进，但标准 RLT 的 $Q$ 并不为「这段动作作为整体」负责，也不处理 chunk 内依赖。
 
-轴 A 针对 1–2，轴 B 针对 3–5。ZAP 针对 3–4，且明确拒绝用轴 B 的「把 $a_{t:t+h}$ 写进 $Q$」来消偏。
+论文侧曾针对 1–2 讨论过介入自适应 residual、动作相关 token 路由等（不在本仓）。仓库里的改进针对 3–5：chunk 价值家族改估计器定义域；ZAP 改 backup 路径，且明确拒绝用「把 $a_{t:t+h}$ 写进 $Q$」来消偏。
 
 ---
 
-## 2. 针对 RLT 的改进：BEE 与 eRLT
+## 2. 针对 Chunk 的改进：T-SAC、QC、AQC、DQC
 
-这两条都不改 n-step 理论。BEE 改 **actor 被允许离 $a^{\mathrm{ref}}$ 多远**；eRLT 改 **$z$ 从 VLA 哪一层、哪些 token 聚合而来**。
+VLA 一次出一段动作再开环执行。共同判断是：若 $Q$ 只看见当前一步 / 当前短 chunk，backup 地平太短，稀疏成功传不回来；若强行做固定 n-step 又不把中间动作写进估计器，off-policy 有偏。
 
-### 2.1 BEE：介入自适应的 residual
-
-论文：*Bee*（arXiv 2609.27450）。配置：`loss_type: bee`。
-
-**动机。** 标准 RLT 用固定 BC 锚在 VLA 提案 $\tilde a$ 上。人介入时，真正该学的是 $\Delta^H = a^H-\tilde a$，而且不同状态上「能偏多远」不一样：对齐阶段要严，自由空间可以松。固定 $\eta\|a-\tilde a\|^2$ 无法表达这条约束。
-
-**思路。** 额外训一个 Correction Model，在 $(s,\tilde a)$ 上预测人残差的对角高斯 $(\mu_\phi,\sigma_\phi)$。用马氏距离
-
-$$\rho = \tfrac{1}{D}(a_\theta-\hat a^H)^\top\Sigma^{-1}(a_\theta-\hat a^H)$$
-
-衡量策略是否还落在人可接受的修正椭球里。状态相关乘子 $\lambda_\omega(s)\ge 0$ 把 $\rho\le\varepsilon$ 做成原-对偶：
-
-$$L_\pi = \mathbb{E}\Big[\big(-Q + \eta\|a-\tilde a\|^2 + \lambda\rho\big)/(1+\lambda)\Big]$$
-
-人残差 buffer $\mathcal{B}_H$ 周期性更新 Correction Model；$\lambda$ 对 $\rho-\varepsilon$ 做对偶上升。VLA 仍然冻结。
-
-**优势。**
-
-- 约束随状态变：人常改的维度 $\sigma$ 大，$\rho$ 更松；人几乎不改的维度钉死。
-- 人介入直接进椭球，而不是和匿名 BC 混在一起。
-- 仍是 residual online RL，不碰 VLA 权重。
-
-**劣势。**
-
-- 依赖介入或种子修正；纯自主、无人数据时椭球退化。
-- 不加速稀疏奖励的信用分配，也不消 off-policy n-step 偏置。
-- $z$ 仍按 RLT 方式取，表示质量原样继承。
-
-### 2.2 eRLT：动作相关的 token / 层路由
-
-论文：*eRLT: Efficient VLA Reinforcement Learning via Action-Relevant Token Routing*。配置：`openpi.use_erlt: True`。
-
-**动机。** RLT 把 **最后一层、固定 token 集** 重建压缩成 $z$。激励实验表明：对 online RL 最有用的层和 token **随任务变**。固定压缩会丢掉「动作修正和价值估计真正需要的」内部特征；在 VLA 外另训视觉编码器（DSRL）则完全不用这些内部特征。
-
-**思路。** 冻结 VLA。另开一条前向：在 prefix 后追加 $K$ 个 routing token（默认 $K=1$），在选定层 $\{0,3,6,9,12,15,18\}$ 读这些位置并均值池化，再用任务级 softmax 层权重合成
-
-$$z_t = \sum_i \alpha_i\, u_t^{(i)},\qquad \alpha=\mathrm{softmax}(\eta_{\mathrm{lay}}/\tau)$$
-
-两阶段监督：
-
-1. **离线初始化。** 临时 action probe 从 $z$ 回归专家动作 chunk（MSE）。probe 只看见 $z$，所以路由必须留下「能区分不同专家动作」的信息。按验证 MSE 选 $\eta$，丢掉 probe。
-2. **Online。** critic 的 Bellman 误差回传到 routing；actor 用 detach 的 $z$。每 $U=200$ 步才开一次路由梯度，避免表示抖得太快。Replay 存原观测，路由更新时重算 $z$。
-
-仿真里 actor 走 DSRL 式 latent-noise；真机走 RLT residual。主指标是归一化学习曲线 AUC，不是最终 SR。
-
-**优势。**
-
-- $z$ 按任务选层和 token，比最终层重建更贴动作 / 价值。
-- 参数极少（约 $KD+m$），VLA 始终冻。
-- 离线动作预测给出可学起点，online critic 再按成败微调。
-
-**劣势。**
-
-- 多一层 VLM 前向，算力和显存高于固定最终层 $z$。
-- $z$ 仍然是 **状态摘要**，不是可选技能；不能像换 prompt 那样换 VLA 行为。
-- 不处理 chunk backup / off-policy n-step。信用分配还是标准 SAC/DSRL TD。
-- 受冻结 VLA 内部信息上限约束；路由学错层会引入噪声。
-
-BEE 和 eRLT 互补：一个管「离提案多远」，一个管「$z$ 里留什么」。两者都默认 $Q$ 仍吃当前原子（或当前 latent），把「值如何沿时间走」留给下一节。
-
----
-
-## 3. 针对 Chunk 的改进：T-SAC、QC、AQC、DQC
-
-VLA 一次出一段动作再开环执行。轴 B 的共同判断是：若 $Q$ 只看见当前一步 / 当前短 chunk，backup 地平太短，稀疏成功传不回来；若强行做固定 n-step 又不把中间动作写进估计器，off-policy 有偏。
-
-### 3.1 T-SAC：序列 $Q$ 头
+### 2.1 T-SAC：序列 $Q$ 头
 
 配置：RLT actor + `TSACTransformerQHead`。
 
@@ -161,7 +94,7 @@ VLA 一次出一段动作再开环执行。轴 B 的共同判断是：若 $Q$ �
 
 T-SAC 改的是 **$Q$ 网络形状**，不是 backup 测度。
 
-### 3.2 Q-chunking（QC）
+### 2.2 Q-chunking（QC）
 
 配置：`loss_type: rlt_qc`。论文构造的 online 适配：无单独 offline critic 预训练，冻结 VLA + residual 当行为先验。
 
@@ -186,7 +119,7 @@ $$Q(s,a_{t:t+h}),\qquad y = R^{(h)}+\gamma^h Q(s',a'),\qquad R^{(h)}=\sum_{k=0}^
 - 不跨轨迹传播已经学到的格点价值。
 - 仓库约定：这是对照方法，ZAP **不允许**照搬「中间动作进 $Q$」。
 
-### 3.3 Adaptive QC（AQC）
+### 2.3 Adaptive QC（AQC）
 
 配置：`loss_type: rlt_aqc`。
 
@@ -211,7 +144,7 @@ $$A^k = (Q^k-V^k)/\gamma^k$$
 - 环境一步仍执行完整 policy chunk，自适应发生在 **选哪条候选**，不是真退缩地平控制。
 - 同样不跨轨迹借 $Q$。
 
-### 3.4 Decoupled QC（DQC）
+### 2.4 Decoupled QC（DQC）
 
 配置：`loss_type: rlt_dqc`。
 
@@ -236,17 +169,17 @@ Rollout 的 Best-of-N 打在 $Q^k$ 上。没有 offline critic 预训练。
 - 长窗打包（`pack_dqc_windows`）要求 replay 里有连续 chunk；边界和 done 要小心。
 - 本质仍是「动作进 $Q$」家族；$z$ 当 $s$、不跨轨迹借值，与 QC 相同。
 
-轴 B 四条共享一句话：**用估计器内部的一段时间动作，换无偏（或近似无偏）的多步信用。** 代价是 $Q$ 的定义域变大，并且都默认 $z$ 可以当 $s'$。
+四条共享一句话：**用估计器内部的一段时间动作，换无偏（或近似无偏）的多步信用。** 代价是 $Q$ 的定义域变大，并且都默认 $z$ 可以当 $s'$。
 
 ---
 
-## 4. ZAP：不扩 $Q$，改 backup 路径
+## 3. ZAP：不扩 $Q$，改 backup 路径
 
 **ZAP** = **(Z, A) Path**。`loss_type: rlt_zap`。
 
 精度阶段门控（`rlt_phase_gate.mode: vlm | none`）与 ZAP **正交**：前者是工程上的 residual 开关，不是方法主体。
 
-### 4.1 在谱系里要解决什么
+### 3.1 在谱系里要解决什么
 
 Stage 2 仍是冻结 $\varphi$、residual $\pi(\mathrm{ref},z,x)$、评论家
 
@@ -256,14 +189,14 @@ $$Q_\theta(z,a)$$
 
 此时同时成立：
 
-- 稀疏成功在末尾，一步 TD 太慢（RLT / eRLT / BEE 都没修）。
+- 稀疏成功在末尾，一步 TD 太慢（标准 RLT 没修）。
 - 朴素 n-step off-policy 有偏。
 - Retrace 的 $\pi/\pi_\beta$ 在近确定连续动作上退化。
 - T-SAC 只改网络形状，不回答「这段 backup 还能不能往前走」。
 
 因此需要第三条路：**$Q$ 的形状不变；用 $(z,a)$ 决定路径还能走多远，停下后再向同类格点借当前 $\pi$ 的 $Q$。**
 
-### 4.2 实现思想
+### 3.2 实现思想
 
 Q-chunking 可借的问题：产生这段 backup 的变量，不能待在估计器外面。
 
@@ -315,7 +248,7 @@ $$L_Q=\bigl(Q_\theta(z_t,a_t)-y_t\bigr)^2$$
 
 Actor 与 RLT 相同：最大化 $Q$ + BC。同一 chunk 内 $z$ 可复制，$k_z=1$，续步只由 $k_a$ 决定；跨 chunk 后 $z$ 更新，$k_z$ 开始起作用。
 
-### 4.3 路线（实现顺序）
+### 3.3 路线（实现顺序）
 
 与「先扩 $Q$ 再蒸馏」相反。路线是 **先让路径可索引，再开门控，最后才借邻居**。
 
@@ -340,7 +273,7 @@ Actor 与 RLT 相同：最大化 $Q$ + BC。同一 chunk 内 $z$ 可复制，$k_
 
 关键配置：`za_tau_z`、`za_tau_a`、`za_truncate_eps`、`za_max_horizon`、`za_neighbor_k`、`za_enable_neighbors`。$\tau_z,\tau_a$ 过大等于关掉门控，退化成固定 n-step。
 
-### 4.4 解决了什么，没解决什么
+### 3.4 解决了什么，没解决什么
 
 **解决了。**
 
@@ -355,21 +288,21 @@ Actor 与 RLT 相同：最大化 $Q$ + BC。同一 chunk 内 $z$ 可复制，$k_
 - 对 $(z,a)$ 对序列再套一遍 QC 定理（同一构造换原子）。
 - in-batch softmax 平均 TD 目标或平均 $G$。
 - 把 $\mathrm{cosine}(z,z_0)$ 或 VLM yes/no 当方法主体（`rlt_phase_gate` 只是工程过滤）。
-- InfoNCE / 双线性头去改冻结 $\varphi$（那是 Stage-1 / eRLT 的事）。
+- InfoNCE / 双线性头去改冻结 $\varphi$（那是 Stage-1 表示学习的事）。
 - 核平均整段回报 $G$（无 TD 链，消不掉 off-policy MC 偏置）。
 
 **没解决、也不声称。**
 
 - QC 的定理：无偏多 action MDP $Q(s,a_{1:h})$。
 - Stage 1 的 $z$ 质量。核是坏度量时 $c$ 和 $w_j$ 会传错奖励或错 $Q$——这是主风险。
-- BEE 式介入椭球、eRLT 式路由。ZAP 吃现成 $z$。
+- 介入自适应椭球、动作相关 token 路由等表示侧改动。ZAP 吃现成 $z$。
 - 多样 / 合适的技能 $z$（那是另一条表示问题，见 Stage-1 讨论）。
 
-### 4.5 和前面方法怎么对齐
+### 3.5 和前面方法怎么对齐
 
-| | RLT / eRLT / BEE | T-SAC | QC / AQC / DQC | **ZAP** |
+| | RLT | T-SAC | QC / AQC / DQC | **ZAP** |
 |---|---|---|---|---|
-| 改的是什么 | 约束或 $z$ 来源 | $Q$ 网络形状 | $Q$ 的动作定义域 | **backup 路径 + 借值** |
+| 改的是什么 | Stage-2 底座 | $Q$ 网络形状 | $Q$ 的动作定义域 | **backup 路径 + 借值** |
 | $Q$ 输入 | $(z,a)$ 或 $(z,a_{\mathrm{chunk}})$ | 序列 $[z,a_{0:T})$ | $(s\text{ 或 }z,\,a_{t:t+h})$ | 当前 $(z,a_t)$ |
 | n-step | 无，或有偏 | 不负责 | 无偏，靠动作进 $Q$ | 门控续步，靠 $(z,a)$ 度量 |
 | 沿时间 | 一步爬 | 不负责 | 每次跳固定 / 多尺度 $h$ | $C_k$ 大时跳 $\tau$ 步 |
@@ -381,12 +314,10 @@ Actor 与 RLT 相同：最大化 $Q$ + BC。同一 chunk 内 $z$ 可复制，$k_
 
 ---
 
-## 5. 怎么读这条谱系
+## 4. 怎么读这条谱系
 
-若问题是 **VLA 提案不能乱离、人在纠偏**：BEE。  
-若问题是 **固定最终层 $z$ 丢掉了动作相关特征**：eRLT。  
 若问题是 **chunk 内部谁先谁后**：T-SAC。  
 若问题是 **要无偏多步、且接受改 $Q$ 定义域**：QC；地平要自适应则 AQC；价值地平要长、策略地平要短则 DQC。  
 若问题是 **不能扩 $Q$、Retrace 又废、还要把稀疏成功沿本轨迹和跨轨迹传开**：ZAP。
 
-ZAP 默认站在 RLT Stage-2 底座上：冻结 $\varphi$、residual actor、$Q(z,a)$、BC。eRLT 换 $\varphi$、BEE 换约束，都可以和 ZAP 的 backup **正交组合**；QC 家族与 ZAP **互斥**（同一套 $Q$ 不能既吃 $a_{1:h}$ 又声称只吃当前原子）。
+ZAP 默认站在 RLT Stage-2 底座上：冻结 $\varphi$、residual actor、$Q(z,a)$、BC。QC 家族与 ZAP **互斥**（同一套 $Q$ 不能既吃 $a_{1:h}$ 又声称只吃当前原子）。

@@ -234,8 +234,8 @@ class LiberoEnv(gym.Env):
         self._human_mailbox = HumanMailbox.from_cfg(mailbox_cfg)
         if self._human_mailbox is not None and self.is_eval:
             self._human_mailbox = None
-        # BEE Appendix A bowl: human / residual edit pose only; gripper stays
-        # on the VLA proposal. Keyboard Z/X must not rewrite a^H[..., 6].
+        # Bowl HITL: human / residual edit pose only; gripper stays on the
+        # VLA proposal. Keyboard Z/X must not rewrite a^H[..., 6].
         self._hitl_freeze_gripper = True
         if mailbox_cfg is not None and hasattr(mailbox_cfg, "get"):
             self._hitl_freeze_gripper = bool(mailbox_cfg.get("freeze_gripper", True))

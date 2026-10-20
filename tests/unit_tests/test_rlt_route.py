@@ -203,21 +203,15 @@ def test_correct_when_disagree_skipped_in_eval():
     assert not out.result["intervene_flags"].any()
 
 
-def test_build_route_reads_correct_when_disagree():
+def test_build_route_uses_default_correct_when_disagree():
     cfg = OmegaConf.create(
         {
             "env": {"train": {"env_type": "libero"}},
             "algorithm": {
                 "rlt_schedule": {"enable": True, "warmup_post_collect_updates": 5},
-                "bee": {
-                    "correct_when_disagree": True,
-                    "correct_action_l1": 0.2,
-                    "correct_ignore_dims": [6],
-                },
             },
         }
     )
     route = build_rlt_route(cfg)
-    assert route.correct_when_disagree is True
-    assert route.correct_action_l1 == 0.2
-    assert route.correct_ignore_dims == (6,)
+    assert route.correct_when_disagree is False
+    assert route.simulate_intervention_prob == 0.0

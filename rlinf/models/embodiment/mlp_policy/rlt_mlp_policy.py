@@ -138,7 +138,7 @@ class RLTMLPPolicy(MLPPolicy):
         self.qc_include_ref_chunk = bool(qc_include_ref_chunk)
         self.qc_include_actor_mean = bool(qc_include_actor_mean)
         self.aqc_gamma = float(aqc_gamma)
-        # Bee: a_θ = ã + Δ_θ(s, ã). Exploration noise stays fixed_std at sample.
+        # Residual: a_θ = ã + Δ_θ(s, ã). Exploration noise stays fixed_std at sample.
         self.residual_actor = bool(residual_actor)
         hidden_dims = [int(mlp_hidden_dim)] * int(mlp_num_hidden_layers)
 
