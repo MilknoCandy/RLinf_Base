@@ -27,6 +27,7 @@ The converted weights are written as fp32 ``model.safetensors`` while the emitte
 from __future__ import annotations
 
 import pathlib
+from typing import Any
 
 import numpy as np
 import torch
@@ -41,6 +42,30 @@ from rlinf.utils.ckpt_convertor.openpi._core import (
 _SIGLIP_WIDTH = 1152
 _PALIGEMMA_WIDTH = 2048
 _ACTION_WIDTH = 1024
+
+
+def _unwrap_flax_values(tree: Any) -> Any:
+    """Peel Flax ``{value: array}`` leaves.
+
+    Official OpenPI ``restore_params`` strips this wrapper. The older
+    ``convert_openpi_jax_to_python`` path used a ``/value`` key suffix. Newer
+    Orbax dumps (including the RoboTwin JAX co-train) keep the wrapper on
+    every array; ``convert_projections`` already handled it, SigLIP/LLM did
+    not. Attention's ``mha['value']`` dict (V projection: ``kernel``/``bias``)
+    is not a wrapper and is left intact.
+    """
+    if isinstance(tree, dict):
+        # Only peel array leaves. ``mha["value"]`` is the V projection (a
+        # dict of kernel/bias) and must not be treated as a Flax wrapper.
+        inner = tree.get("value") if set(tree.keys()) == {"value"} else None
+        if inner is not None and not isinstance(inner, dict):
+            return _unwrap_flax_values(inner)
+        return {key: _unwrap_flax_values(val) for key, val in tree.items()}
+    if isinstance(tree, list):
+        return [_unwrap_flax_values(val) for val in tree]
+    if isinstance(tree, tuple):
+        return tuple(_unwrap_flax_values(val) for val in tree)
+    return tree
 
 
 def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
@@ -75,7 +100,7 @@ def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     # peel a single ``params`` wrapper when present.
     if "PaliGemma" not in restored and isinstance(restored.get("params"), dict):
         restored = restored["params"]
-    return restored
+    return _unwrap_flax_values(restored)
 
 
 def convert_siglip(params: dict) -> dict:

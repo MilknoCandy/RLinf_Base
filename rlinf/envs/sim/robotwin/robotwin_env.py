@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import ctypes
-import json
 import os
 from typing import Optional, Union
 
@@ -24,7 +23,10 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 from PIL import Image
 
-from rlinf.envs.sim.robotwin.seed_utils import partition_success_seeds
+from rlinf.envs.sim.robotwin.seed_utils import (
+    load_task_success_seeds,
+    partition_success_seeds,
+)
 from rlinf.envs.utils import (
     center_crop_image,
     list_of_dict_to_dict_of_list,
@@ -90,7 +92,16 @@ class RoboTwinEnv(gym.Env):
         mp.set_start_method("spawn", force=True)
         os.environ["ASSETS_PATH"] = self.cfg.assets_path
 
+        from rlinf.envs.sim.robotwin.eval_compat import (
+            apply_robotwin_eval_patches,
+            ensure_robotwin_assets,
+        )
+
+        ensure_robotwin_assets(self.cfg.assets_path)
+
         from robotwin.envs.vector_env import VectorEnv
+
+        apply_robotwin_eval_patches()
 
         env_seeds = self.reset_state_ids.tolist()
 
@@ -123,6 +134,12 @@ class RoboTwinEnv(gym.Env):
         self.fail_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.reach_critical_once = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.critical_gate = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
@@ -135,6 +152,7 @@ class RoboTwinEnv(gym.Env):
             if self.record_metrics:
                 self.success_once[mask] = False
                 self.fail_once[mask] = False
+                self.reach_critical_once[mask] = False
                 self.returns[mask] = 0
                 self._elapsed_steps[env_idx] = 0
         else:
@@ -142,19 +160,40 @@ class RoboTwinEnv(gym.Env):
             if self.record_metrics:
                 self.success_once[:] = False
                 self.fail_once[:] = False
+                self.reach_critical_once[:] = False
                 self.returns[:] = 0.0
                 self._elapsed_steps[:] = 0
+
+    def _as_bool_tensor(self, value):
+        if isinstance(value, list):
+            value = np.array(value, dtype=bool).reshape(-1)
+        tensor = torch.as_tensor(value, device=self.device, dtype=torch.bool).reshape(-1)
+        if tensor.numel() == 1 and self.num_envs > 1:
+            tensor = tensor.expand(self.num_envs).clone()
+        return tensor
 
     def _record_metrics(self, step_reward, infos):
         episode_info = {}
         self.returns += step_reward
         if "success" in infos:
-            if isinstance(infos["success"], list):
-                infos["success"] = torch.as_tensor(
-                    np.array(infos["success"]).reshape(-1), device=self.device
-                )
+            infos["success"] = self._as_bool_tensor(infos["success"])
             self.success_once = self.success_once | infos["success"]
             episode_info["success_once"] = self.success_once.clone()
+        if "critical_gate" in infos:
+            self.critical_gate = self._as_bool_tensor(infos["critical_gate"])
+        if "in_critical" in infos:
+            in_critical = self._as_bool_tensor(infos["in_critical"])
+            reached = in_critical
+            if "success" in infos:
+                reached = reached | infos["success"]
+            self.reach_critical_once = self.reach_critical_once | (
+                reached & self.critical_gate
+            )
+        if "in_critical" in infos:
+            episode_info["reach_critical_once"] = self.reach_critical_once.clone()
+            episode_info["fail_in_critical"] = (
+                self.reach_critical_once & (~self.success_once)
+            )
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
@@ -447,28 +486,22 @@ class RoboTwinEnv(gym.Env):
         return np.random.randn(self.num_envs, self.horizon, 14)
 
     def _init_reset_state_ids(self):
-        if self.cfg.get("seeds_path", None) is not None and os.path.exists(
-            self.cfg.seeds_path
-        ):
-            with open(self.cfg.seeds_path, "r") as f:
-                data = json.load(f)
-            success_seeds = data[self.task_name].get("success_seeds", None)
-            if success_seeds is not None:
-                success_seeds = torch.as_tensor(success_seeds, dtype=torch.long)
-                self.success_seeds = partition_success_seeds(
-                    success_seeds,
-                    base_seed=self.base_seed,
-                    seed_offset=self.seed_offset,
-                    total_num_processes=self.total_num_processes,
-                    num_group=self.num_group,
-                )
-                self._current_seed_index = 0
-            else:
-                self.success_seeds = None
-                self._current_seed_index = 0
+        raw_seeds = load_task_success_seeds(
+            self.cfg.get("seeds_path", None), self.task_name
+        )
+        if raw_seeds is not None:
+            success_seeds = torch.as_tensor(raw_seeds, dtype=torch.long)
+            worker_seeds = partition_success_seeds(
+                success_seeds,
+                base_seed=self.base_seed,
+                seed_offset=self.seed_offset,
+                total_num_processes=self.total_num_processes,
+                num_group=self.num_group,
+            )
+            self.success_seeds = worker_seeds if worker_seeds.numel() > 0 else None
         else:
             self.success_seeds = None
-            self._current_seed_index = 0
+        self._current_seed_index = 0
 
         if not hasattr(self, "_generator"):
             self._generator = torch.Generator()

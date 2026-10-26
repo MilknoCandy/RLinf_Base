@@ -65,3 +65,29 @@ def resolve_lerobot_dataset_root(data_path: str) -> Path:
         return cached.resolve()
 
     return path.resolve()
+
+
+def find_lerobot_dataset_roots(path: str | Path) -> list[Path]:
+    """Return every LeRobot dataset root under ``path`` (including ``path`` itself)."""
+    root = Path(path).expanduser()
+    if not root.exists():
+        return []
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def _walk(candidate: Path) -> None:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        if (candidate / "meta" / "info.json").is_file():
+            found.append(resolved)
+            return
+        if not candidate.is_dir():
+            return
+        for child in sorted(candidate.iterdir()):
+            if child.is_dir() and child.name not in {".cache", "__MACOSX"}:
+                _walk(child)
+
+    _walk(root)
+    return found

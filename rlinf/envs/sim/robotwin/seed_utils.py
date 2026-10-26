@@ -12,7 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from typing import Optional
+
 import torch
+
+
+def load_task_success_seeds(
+    seeds_path: Optional[str], task_name: str
+) -> Optional[list[int]]:
+    """Return ``success_seeds`` for ``task_name``, or ``None`` if missing.
+
+    Tasks outside ``eval_seeds.json`` must not crash eval: the env falls back
+    to random reset seeds so a 50-task sweep can still run.
+    """
+    if not seeds_path or not os.path.exists(seeds_path):
+        return None
+    with open(seeds_path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        return None
+    task = data.get(task_name)
+    if not isinstance(task, dict):
+        return None
+    seeds = task.get("success_seeds")
+    if not seeds:
+        return None
+    return [int(seed) for seed in seeds]
 
 
 def partition_success_seeds(

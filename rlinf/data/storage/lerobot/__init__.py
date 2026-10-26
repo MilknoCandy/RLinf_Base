@@ -21,6 +21,7 @@ from rlinf.data.storage.lerobot.compat import (
 )
 from rlinf.data.storage.lerobot.paths import (
     default_hf_lerobot_home,
+    find_lerobot_dataset_roots,
     resolve_lerobot_dataset_root,
     resolve_lerobot_repo_id,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "episode_boundaries",
     "fix_lerobot_episode_data_index",
     "default_hf_lerobot_home",
+    "find_lerobot_dataset_roots",
     "resolve_lerobot_dataset_root",
     "resolve_lerobot_repo_id",
 ]
